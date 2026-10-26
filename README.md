@@ -26,7 +26,7 @@ Notion 문서에 혼용된 `main`과 `master`는 이 저장소의 운영 브랜�
 {type}/{scope}/{description}
 ```
 
-- `type`: `feature`, `release`, `hotfix`
+- `type`: `feature`, `release`, `hotfix`.
 - `scope`: 아래 작업 영역 표를 사용합니다.
 - 배포 브랜치는 `release/{version}` 형식을 사용합니다.
 
