@@ -1,1 +1,94 @@
 # DevLink
+
+## Git Flow
+
+[Notion Git Flow 전략](https://www.notion.so/fdd35a4f3ca6837fb6ef8101afa7fb68)을 기준으로 브랜치를 관리합니다.
+Notion 문서에 혼용된 `main`과 `master`는 이 저장소의 운영 브랜치인 `master`로 통일합니다.
+
+### 브랜치 역할
+
+| 브랜치 | 역할 |
+| --- | --- |
+| `master` | 배포 가능한 운영 버전 |
+| `develop` | 다음 배포를 위한 개발 통합 |
+| `feature/*` | 기능 개발 |
+| `release/*` | 배포 준비 및 최종 수정 |
+| `hotfix/*` | 운영 환경 긴급 수정 |
+
+- `master`, `develop`에는 직접 푸시하지 않고 Pull Request(PR)를 통해 반영합니다.
+- `feature/*`는 `develop`에서 분기하고, 하나의 기능이 완성되면 `develop`으로 PR을 생성합니다.
+- `release/*`는 `develop`에 배포할 기능이 모이면 생성합니다. 배포 준비 중 발생한 버그는 해당 브랜치에서 수정하고 `develop`에도 반영합니다. 배포 가능한 상태가 되면 `master`와 `develop` 양쪽으로 PR을 생성합니다.
+- `hotfix/*`는 `master`에서 분기해 긴급 버그를 수정합니다. 수정이 완료되면 `master`와 `develop` 양쪽으로 PR을 생성합니다.
+
+### 브랜치 명명 규칙
+
+```text
+{type}/{scope}/{description}
+```
+
+- `type`: `feature`, `release`, `hotfix`
+- `scope`: 아래 작업 영역 표를 사용합니다.
+- 배포 브랜치는 `release/{version}` 형식을 사용합니다.
+
+| Scope | 대상 |
+| --- | --- |
+| `front` | Frontend |
+| `back` | Backend |
+| `ai` | AI / ML |
+| `data` | 데이터 수집 / 전처리 / ETL |
+| `bigdata` | 대용량 데이터 처리 |
+| `spark` | Spark / 분산 처리 |
+| `kafka` | Kafka / 분산 처리 |
+| `infra` | Docker / 서버 / 배포 환경 |
+| `common` | 공통 작업 |
+
+```text
+feature/front/login
+feature/back/auth-api
+feature/ai/recommendation
+release/1.0.0
+hotfix/back/auth-error
+```
+
+### 커밋 규칙
+
+```text
+type(scope): message
+```
+
+커밋의 `scope`는 브랜치 명명 규칙의 작업 영역과 동일하게 사용합니다.
+
+| Type | 설명 |
+| --- | --- |
+| `feat` | 기능 추가 |
+| `fix` | 버그 수정 |
+| `refactor` | 코드 구조 개선 |
+| `perf` | 성능 개선 |
+| `docs` | 문서 수정 |
+| `test` | 테스트 추가 / 수정 |
+| `style` | 동작에 영향을 주지 않는 코드 수정 |
+| `chore` | 설정 / 패키지 / 빌드 / 기타 작업 |
+| `data` | 데이터셋 / 전처리 변경 |
+
+### Pull Request 규칙
+
+PR은 하나의 기능 또는 작업 단위로 생성하고, 제목은 커밋과 동일한 `type(scope): message` 형식을 사용합니다.
+
+```text
+feature/front/login → develop
+feature/ai/recommendation → develop
+
+release/1.0.0 → master
+release/1.0.0 → develop
+
+hotfix/back/auth-error → master
+hotfix/back/auth-error → develop
+```
+
+PR 제목 예시:
+
+```text
+feat(front): 로그인 페이지 구현
+feat(ai): 추천 모델 구현
+perf(bigdata): 데이터 처리 성능 개선
+```
