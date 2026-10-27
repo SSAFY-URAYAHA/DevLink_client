@@ -29,12 +29,22 @@ pub const MAX_CREDENTIALS_SIZE: u64 = 16_384;
 ///   "localToken": "<secret-token>"
 /// }
 /// ```
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpCredentials {
     pub schema_version: u32,
     pub broker_url: String,
     pub local_token: String,
+}
+
+impl std::fmt::Debug for McpCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpCredentials")
+            .field("schema_version", &self.schema_version)
+            .field("broker_url", &self.broker_url)
+            .field("local_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// 설정 파일 경로에 대응하는 MCP 자격 파일의 절대 경로를 반환합니다.
@@ -108,16 +118,79 @@ pub fn verify_path_safety(file_path: &Path) -> Result<()> {
     let parent = file_path
         .parent()
         .context("Credential file has no parent directory")?;
-    let parent_meta =
-        fs::symlink_metadata(parent).context("Cannot inspect credential parent directory")?;
+    verify_parent_safety(parent)?;
+    Ok(())
+}
+
+/// 부모 디렉터리 경로의 안전성을 검증합니다.
+/// - 일반 디렉터리 여부 확인
+/// - 심볼릭 링크 거부
+/// - Windows junction 등 reparse point 거부
+/// - 메타데이터 조회 오류를 경로 없음으로 간주하지 않고 즉시 반환
+pub fn verify_parent_safety(parent: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(parent).with_context(|| {
+        format!(
+            "Cannot inspect credential parent directory at '{}'",
+            parent.display()
+        )
+    })?;
+
     ensure!(
-        !parent_meta.is_symlink(),
-        "Credential parent directory must not be a symbolic link"
+        !meta.is_symlink(),
+        "Credential parent directory must not be a symbolic link: '{}'",
+        parent.display()
     );
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+        ensure!(
+            (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+            "Credential parent directory must not be a reparse point or junction: '{}'",
+            parent.display()
+        );
+    }
+
     ensure!(
-        parent_meta.is_dir(),
-        "Credential parent path must be a directory"
+        meta.is_dir(),
+        "Credential parent path must be a directory: '{}'",
+        parent.display()
     );
+
+    Ok(())
+}
+
+/// 부모 디렉터리를 안전하게 준비하고 검증합니다.
+/// - 존재하는 부모는 생성/권한 변경/기존 자격 읽기 전에 검사합니다.
+/// - 부모를 새로 만들었다면 사용 전에 다시 검사합니다.
+/// - 검사 오류를 경로 없음으로 간주하지 않고 즉시 반환합니다.
+pub fn ensure_safe_parent_directory(parent: &Path) -> Result<()> {
+    match fs::symlink_metadata(parent) {
+        Ok(_) => {
+            // 이미 존재하는 부모 경로는 생성·권한 변경·기존 자격 읽기 전에 검사
+            verify_parent_safety(parent)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 부모 디렉터리가 없으면 생성 후 사용 전에 다시 검사
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Cannot create credential parent directory at '{}'",
+                    parent.display()
+                )
+            })?;
+            verify_parent_safety(parent)?;
+        }
+        Err(e) => {
+            // 검사 오류를 경로 없음으로 간주하지 않음
+            return Err(e).with_context(|| {
+                format!(
+                    "Cannot inspect credential parent directory at '{}'",
+                    parent.display()
+                )
+            });
+        }
+    }
     Ok(())
 }
 
@@ -130,8 +203,6 @@ pub fn current_user_sid() -> Result<String> {
     if let Some(sid) = CACHED_SID.get() {
         return Ok(sid.clone());
     }
-    crate::diag::diag("CRED_WHOAMI", "whoami /user start");
-    let t0 = std::time::Instant::now();
     let mut cmd = std::process::Command::new("whoami");
     cmd.args(["/user", "/fo", "csv", "/nh"])
         .stdin(Stdio::null())
@@ -139,14 +210,6 @@ pub fn current_user_sid() -> Result<String> {
     let output = cmd
         .output()
         .context("Failed to execute whoami to get user SID")?;
-    crate::diag::diag(
-        "CRED_WHOAMI",
-        &format!(
-            "whoami /user finished in {}ms, code={:?}",
-            t0.elapsed().as_millis(),
-            output.status.code()
-        ),
-    );
     let text = String::from_utf8_lossy(&output.stdout);
     for part in text.split(',') {
         let trimmed = part.trim().trim_matches('"');
@@ -168,11 +231,6 @@ pub fn set_private_permissions(path: &Path) -> Result<()> {
     let is_dir = path.is_dir();
     let perm = if is_dir { "(OI)(CI)(F)" } else { "(F)" };
     let grant = format!("*{sid}:{perm}");
-    crate::diag::diag(
-        "CRED_ICACLS",
-        &format!("icacls set_private start: target={}", path.display()),
-    );
-    let t0 = std::time::Instant::now();
     let mut cmd = std::process::Command::new("icacls.exe");
     cmd.arg(path)
         .arg("/inheritance:r")
@@ -183,14 +241,6 @@ pub fn set_private_permissions(path: &Path) -> Result<()> {
     let output = cmd
         .output()
         .context("Failed to execute icacls to set private permissions")?;
-    crate::diag::diag(
-        "CRED_ICACLS",
-        &format!(
-            "icacls set_private finished in {}ms, code={:?}",
-            t0.elapsed().as_millis(),
-            output.status.code()
-        ),
-    );
     if !output.status.success() {
         bail!(
             "Failed to set private Windows ACL on path: {}",
@@ -239,9 +289,12 @@ foreach ($target in @($p, [System.IO.Path]::GetDirectoryName($p))) {
         .stderr(Stdio::null())
         .creation_flags(0x08000000); // CREATE_NO_WINDOW: 콘솔 창 없이 실행
 
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to spawn powershell for ACL verification on {}", path.display()))?;
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to spawn powershell for ACL verification on {}",
+            path.display()
+        )
+    })?;
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
@@ -254,10 +307,7 @@ foreach ($target in @($p, [System.IO.Path]::GetDirectoryName($p))) {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!(
-                "Windows ACL verification timed out on {}",
-                path.display()
-            );
+            bail!("Windows ACL verification timed out on {}", path.display());
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -321,7 +371,7 @@ pub fn write_atomic_private(target: &Path, creds: &McpCredentials) -> Result<()>
     let parent = target
         .parent()
         .context("Target path has no parent directory")?;
-    fs::create_dir_all(parent).context("Cannot create parent directory for credentials")?;
+    ensure_safe_parent_directory(parent)?;
     set_private_permissions(parent)?;
 
     let json_bytes = serde_json::to_vec_pretty(creds)?;
@@ -383,23 +433,17 @@ pub fn load(config_path: &Path) -> Result<McpCredentials> {
 /// - 자격 파일이 없으면 새로 생성합니다.
 /// - 기존 파일이 손상되었거나 권한이 불안전한 경우 조용히 덮어쓰지 않고 명시적 복구 안내와 함께 오류를 반환합니다.
 pub fn publish(config_path: &Path, broker_url: &str) -> Result<McpCredentials> {
-    crate::diag::diag("CRED_PUB", "publish enter");
-    let t_pub = std::time::Instant::now();
     let cred_path = path(config_path);
     let parent = cred_path
         .parent()
         .context("Credential path has no parent")?;
-    fs::create_dir_all(parent)?;
+    ensure_safe_parent_directory(parent)?;
     set_private_permissions(parent)?;
 
     let local_token = if cred_path.exists() {
         match load(config_path) {
             Ok(existing) => {
                 if existing.broker_url == broker_url {
-                    crate::diag::diag(
-                        "CRED_PUB",
-                        &format!("publish reuse existing in {}ms", t_pub.elapsed().as_millis()),
-                    );
                     return Ok(existing);
                 }
                 existing.local_token
@@ -423,10 +467,6 @@ pub fn publish(config_path: &Path, broker_url: &str) -> Result<McpCredentials> {
     };
     validate(&creds)?;
     write_atomic_private(&cred_path, &creds)?;
-    crate::diag::diag(
-        "CRED_PUB",
-        &format!("publish complete in {}ms", t_pub.elapsed().as_millis()),
-    );
     Ok(creds)
 }
 
@@ -435,7 +475,8 @@ pub fn publish(config_path: &Path, broker_url: &str) -> Result<McpCredentials> {
 /// 브로커가 실행 중인 경우에는 상태 일관성을 위해 회전을 거부합니다.
 pub fn rotate(config_path: &Path) -> Result<McpCredentials> {
     let state_dir = crate::config::state_directory(config_path);
-    fs::create_dir_all(&state_dir)?;
+    ensure_safe_parent_directory(&state_dir)?;
+    set_private_permissions(&state_dir)?;
 
     // start/stop과 충돌을 방지하기 위해 control.lock 획득
     let _control_guard = crate::config::lock(&state_dir.join("control.lock"))?;
@@ -496,6 +537,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debug_redacts_local_token() {
+        let secret = "test-secret-token-do-not-leak";
+        let creds = McpCredentials {
+            schema_version: 1,
+            broker_url: "http://127.0.0.1:43127".to_string(),
+            local_token: secret.to_string(),
+        };
+
+        let compact = format!("{:?}", creds);
+        let pretty = format!("{:#?}", creds);
+
+        assert!(
+            !compact.contains(secret),
+            "compact debug output must not contain secret token"
+        );
+        assert!(
+            !pretty.contains(secret),
+            "pretty debug output must not contain secret token"
+        );
+        assert!(
+            compact.contains("[REDACTED]"),
+            "compact debug output must contain [REDACTED]"
+        );
+        assert!(
+            pretty.contains("[REDACTED]"),
+            "pretty debug output must contain [REDACTED]"
+        );
+        assert!(
+            compact.contains("schema_version"),
+            "compact debug output must contain schema_version"
+        );
+        assert!(
+            compact.contains("broker_url"),
+            "compact debug output must contain broker_url"
+        );
+        assert!(
+            pretty.contains("schema_version"),
+            "pretty debug output must contain schema_version"
+        );
+        assert!(
+            pretty.contains("broker_url"),
+            "pretty debug output must contain broker_url"
+        );
+    }
+
+    #[test]
     fn test_publish_and_load() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.json");
@@ -517,7 +604,6 @@ mod tests {
         set_private_permissions(dir1.path()).unwrap();
         set_private_permissions(&file1).unwrap();
         let res1 = verify_private_permissions(&file1);
-        println!("Case 1 Result: {:?}", res1);
         assert!(res1.is_ok(), "Case 1 failed: {:?}", res1.err());
 
         // Case 2: 파일에 Everyone 읽기 Allow 추가 → 거부
@@ -529,7 +615,6 @@ mod tests {
             .unwrap();
         assert!(status2.success());
         let res2 = verify_private_permissions(&file1);
-        println!("Case 2 Result: {:?}", res2);
         assert!(res2.is_err(), "Case 2 expected error, got Ok");
 
         // Case 3: 부모에 Everyone 쓰기 Allow 추가 → 거부
@@ -548,8 +633,105 @@ mod tests {
             .unwrap();
         assert!(status3.success());
         let res3 = verify_private_permissions(&file3);
-        println!("Case 3 Result: {:?}", res3);
         assert!(res3.is_err(), "Case 3 expected error, got Ok");
     }
-}
 
+    #[cfg(windows)]
+    fn get_sddl(path: &Path) -> String {
+        use std::os::windows::process::CommandExt;
+        let script = format!("(Get-Acl -LiteralPath '{}').Sddl", path.display());
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(std::process::Stdio::null())
+            .creation_flags(0x08000000)
+            .output()
+            .expect("Failed to get SDDL");
+        assert!(output.status.success(), "powershell Get-Acl failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_publish_rejects_junction_parent_and_preserves_target() {
+        use std::os::windows::process::CommandExt;
+
+        let temp_root = tempfile::tempdir().unwrap();
+        let target_dir = temp_root.path().join("target_dir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        let sentinel_file = target_dir.join("sentinel.txt");
+        std::fs::write(&sentinel_file, b"original-content").unwrap();
+
+        // target_dir 및 기존 파일의 초기 권한(SDDL) 기록
+        let target_dir_sddl_before = get_sddl(&target_dir);
+        let sentinel_sddl_before = get_sddl(&sentinel_file);
+
+        let config_dir = temp_root.path().join("config_dir");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+
+        // config_dir/.devlink-runtime을 target_dir을 가리키는 junction으로 생성
+        let junction_path = crate::config::state_directory(&config_path);
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                junction_path.to_str().unwrap(),
+                target_dir.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .creation_flags(0x08000000)
+            .status()
+            .expect("mklink /J execution failed");
+        assert!(status.success(), "Failed to create directory junction");
+
+        // 정리 시 링크 대상을 재귀 삭제하지 않도록 junction을 먼저 분리/삭제하는 RAII 가드
+        struct JunctionCleanup<'a>(&'a Path);
+        impl Drop for JunctionCleanup<'_> {
+            fn drop(&mut self) {
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("cmd")
+                    .args(["/c", "rmdir", self.0.to_str().unwrap()])
+                    .stdin(std::process::Stdio::null())
+                    .creation_flags(0x08000000)
+                    .status();
+            }
+        }
+        let _cleanup = JunctionCleanup(&junction_path);
+
+        // publish 호출: junction 부모 경로로 인해 거부되어야 함
+        let res = publish(&config_path, "http://127.0.0.1:43127");
+        assert!(
+            res.is_err(),
+            "publish must return Err when parent directory is a junction"
+        );
+
+        // 링크 대상에 자격 파일이 생성되지 않았는지 확인
+        let leaked_file = target_dir.join(CREDENTIALS_FILE_NAME);
+        assert!(
+            !leaked_file.exists(),
+            "credentials file must not be created in junction target directory"
+        );
+
+        // 링크 대상의 기존 파일 내용 보존 확인
+        let sentinel_content = std::fs::read(&sentinel_file).unwrap();
+        assert_eq!(
+            sentinel_content, b"original-content",
+            "existing file in target must be preserved"
+        );
+
+        // 링크 대상 디렉터리 및 기존 파일의 권한(SDDL)이 변경되지 않았는지 확인
+        let target_dir_sddl_after = get_sddl(&target_dir);
+        let sentinel_sddl_after = get_sddl(&sentinel_file);
+        assert_eq!(
+            target_dir_sddl_before, target_dir_sddl_after,
+            "target directory permissions must remain untouched"
+        );
+        assert_eq!(
+            sentinel_sddl_before, sentinel_sddl_after,
+            "existing file permissions must remain untouched"
+        );
+    }
+}

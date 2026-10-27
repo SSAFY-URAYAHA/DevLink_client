@@ -509,3 +509,270 @@ async fn unreachable_server_and_stop_during_backoff() {
     f.ok(&["stop"]);
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_local_token_survives_normal_restart() {
+    // 1. 기존 테스트 fixture를 활용해 임시 설정을 만든다.
+    let f = Fixture::new();
+
+    // 2. 사용 가능한 포트를 선택해 두 번의 실행에 동일하게 사용한다.
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+
+    f.configure(|config| {
+        config.local_port = port;
+    });
+
+    // 3. 실제 CLI start로 브로커를 시작한다.
+    f.ok(&["start"]);
+
+    // 4. Rust가 발행한 MCP 자격에서 brokerUrl/localToken을 메모리에 보관한다.
+    //    runtime의 instanceId도 보관한다.
+    let creds1 = devlink_broker::credentials::load(&f.path).unwrap();
+    let token1 = creds1.local_token;
+    let broker_url1 = creds1.broker_url;
+
+    let runtime1 = Runtime::load(&f.path).unwrap();
+    let instance_id1 = runtime1.instance_id;
+
+    // 5. 실제 CLI stop으로 종료한다.
+    f.ok(&["stop"]);
+
+    // 6. MCP 자격 파일이 남아 있고 토큰이 유지되는지 확인한다.
+    let cred_path = devlink_broker::credentials::path(&f.path);
+    assert!(
+        cred_path.exists(),
+        "MCP credential file must remain after stop"
+    );
+    let creds_after_stop = devlink_broker::credentials::load(&f.path).unwrap();
+    assert!(
+        creds_after_stop.local_token == token1,
+        "MCP token changed after stop"
+    );
+
+    // 7. 같은 설정으로 다시 start한다.
+    f.ok(&["start"]);
+
+    // 8. 다음을 확인한다.
+    let creds2 = devlink_broker::credentials::load(&f.path).unwrap();
+    // - localToken 동일 (비밀값 노출 방지를 위해 assert! 사용)
+    assert!(
+        creds2.local_token == token1,
+        "MCP token changed after restart"
+    );
+    // - brokerUrl 동일
+    assert!(
+        creds2.broker_url == broker_url1,
+        "MCP brokerUrl changed after restart"
+    );
+    // - runtime instanceId 변경
+    let runtime2 = Runtime::load(&f.path).unwrap();
+    assert!(
+        runtime2.instance_id != instance_id1,
+        "Runtime instanceId must change after restart"
+    );
+
+    // 9. stop으로 종료하고 테스트 프로세스를 정리한다.
+    f.ok(&["stop"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_local_token_survives_crash_restart() {
+    // 1. 기존 Fixture와 OwnedProcess를 사용한다.
+    let f = Fixture::new();
+
+    // 2. 임시 설정에 사용 가능한 고정 포트를 지정한다.
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+
+    f.configure(|config| {
+        config.local_port = port;
+    });
+
+    // 3. broker를 직접 자식 프로세스로 실행하고 Health 준비를 기다린다.
+    let mut child = OwnedProcess(f.command(&["broker"]).spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Ok(runtime) = Runtime::load(&f.path)
+            && runtime.health().await.is_ok()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Broker failed to become healthy before deadline"
+        );
+        sleep(Duration::from_millis(30)).await;
+    }
+
+    // 4. MCP 자격의 localToken·brokerUrl과 runtime instanceId를 보관한다.
+    let creds1 = devlink_broker::credentials::load(&f.path).unwrap();
+    let token1 = creds1.local_token;
+    let broker_url1 = creds1.broker_url;
+
+    let runtime1 = Runtime::load(&f.path).unwrap();
+    let instance_id1 = runtime1.instance_id;
+
+    // 5. 자신이 생성한 자식 프로세스를 kill 후 wait한다. (stop 호출 없음)
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+
+    // 6. 강제 종료 직후 MCP 자격 파일과 토큰이 유지되는지 확인한다.
+    let cred_path = devlink_broker::credentials::path(&f.path);
+    assert!(
+        cred_path.exists(),
+        "MCP credential file must remain after crash"
+    );
+    let creds_after_crash = devlink_broker::credentials::load(&f.path).unwrap();
+    assert!(
+        creds_after_crash.local_token == token1,
+        "MCP token changed after crash"
+    );
+
+    // 7. 같은 설정으로 실제 CLI start를 실행한다.
+    f.ok(&["start"]);
+
+    // 8. localToken·brokerUrl은 동일하고 instanceId는 변경됐는지 확인한다.
+    let creds2 = devlink_broker::credentials::load(&f.path).unwrap();
+    assert!(
+        creds2.local_token == token1,
+        "MCP token changed after crash restart"
+    );
+    assert!(
+        creds2.broker_url == broker_url1,
+        "MCP brokerUrl changed after crash restart"
+    );
+    let runtime2 = Runtime::load(&f.path).unwrap();
+    assert!(
+        runtime2.instance_id != instance_id1,
+        "Runtime instanceId must change after crash restart"
+    );
+
+    // 9. CLI stop으로 종료한다.
+    f.ok(&["stop"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_token_allows_health_but_denies_shutdown() {
+    // 1. 기존 Fixture로 임시 브로커를 start한다.
+    let f = Fixture::new();
+    f.ok(&["start"]);
+
+    // 2. 실제 MCP 자격 파일에서 localToken을 읽는다.
+    let creds = devlink_broker::credentials::load(&f.path).unwrap();
+    let local_token = creds.local_token;
+
+    // 3. localToken과 runtime.controlToken이 서로 다른지 확인한다.
+    let runtime = Runtime::load(&f.path).unwrap();
+    assert!(
+        local_token != runtime.control_token,
+        "MCP token and control token must differ"
+    );
+
+    let client = runtime.client().unwrap();
+
+    // 4. MCP 토큰으로 GET /health → 200 확인.
+    let health_res = client
+        .get(runtime.url("/health"))
+        .bearer_auth(&local_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health_res.status(), 200);
+
+    // 5. MCP 토큰으로 POST /shutdown → 현재 구현 기준 401 확인.
+    let shutdown_res = client
+        .post(runtime.url("/shutdown"))
+        .bearer_auth(&local_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shutdown_res.status(), 401);
+
+    // 6. 종료 거부 후 Health를 다시 확인해 같은 instanceId의 브로커가 계속 실행 중인지 확인한다.
+    let current_health = f.health().await;
+    assert_eq!(current_health.instance_id, runtime.instance_id);
+
+    // 7. MCP 토큰과 Origin 헤더로 GET /health → 401 확인.
+    let origin_health_res = client
+        .get(runtime.url("/health"))
+        .bearer_auth(&local_token)
+        .header("Origin", "https://example.org")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(origin_health_res.status(), 401);
+
+    // 8. 실제 CLI stop으로 정상 종료한다.
+    f.ok(&["stop"]);
+    assert!(!Runtime::path(&f.path).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_token_rotation_requires_stopped_broker() {
+    // 1. 임시 브로커를 start하고 MCP 토큰과 instanceId를 보관한다.
+    let f = Fixture::new();
+    f.ok(&["start"]);
+    let creds1 = devlink_broker::credentials::load(&f.path).unwrap();
+    let initial_token = creds1.local_token;
+    let initial_instance_id = f.health().await.instance_id;
+
+    // 2. 실행 중 CLI의 mcp rotate를 호출한다.
+    //    실패 종료 코드, 기존 토큰 유지, 같은 브로커의 정상 Health를 확인한다.
+    let rotate_running = f.run(&["mcp", "rotate"]);
+    assert!(!rotate_running.status.success());
+    let creds_after_failed_rotate = devlink_broker::credentials::load(&f.path).unwrap();
+    assert!(
+        creds_after_failed_rotate.local_token == initial_token,
+        "Token must remain unchanged when rotation is rejected"
+    );
+    let health_after_failed_rotate = f.health().await;
+    assert_eq!(health_after_failed_rotate.instance_id, initial_instance_id);
+
+    // 3. CLI stop으로 종료한다.
+    f.ok(&["stop"]);
+
+    // 4. CLI mcp rotate를 호출해 성공과 토큰 변경을 확인한다.
+    f.ok(&["mcp", "rotate"]);
+    let creds_rotated = devlink_broker::credentials::load(&f.path).unwrap();
+    let rotated_token = creds_rotated.local_token;
+    assert!(
+        rotated_token != initial_token,
+        "Token must change after rotation"
+    );
+
+    // 5. 다시 start하고 회전한 토큰이 유지되는지 확인한다.
+    f.ok(&["start"]);
+    let creds_restarted = devlink_broker::credentials::load(&f.path).unwrap();
+    assert!(
+        creds_restarted.local_token == rotated_token,
+        "Rotated token must survive restart"
+    );
+
+    // 6. /health에 회전한 토큰으로 요청하면 200,
+    //    이전 토큰으로 요청하면 401인지 확인한다.
+    let runtime = Runtime::load(&f.path).unwrap();
+    let client = runtime.client().unwrap();
+
+    let res_rotated = client
+        .get(runtime.url("/health"))
+        .bearer_auth(&rotated_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_rotated.status(), 200);
+
+    let res_initial = client
+        .get(runtime.url("/health"))
+        .bearer_auth(&initial_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_initial.status(), 401);
+
+    // 7. CLI stop으로 종료한다.
+    f.ok(&["stop"]);
+    assert!(!Runtime::path(&f.path).exists());
+}
