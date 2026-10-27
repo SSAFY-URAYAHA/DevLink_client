@@ -19,7 +19,9 @@ cargo build --release --locked --workspace
 .\target\release\devlink.exe --help
 ```
 
-`rust-toolchain.toml`은 stable, rustfmt, clippy를 선택합니다. 의존성 버전은 이 디렉터리의 `Cargo.lock`으로 고정하며 공통 의존성은 workspace의 `Cargo.toml`에서 관리합니다. 빌드 산출물은 `rust/target/`에 생성됩니다. Windows MSVC에서 검증하며 CI는 Windows와 Ubuntu에서 같은 검사를 수행합니다. Linux에서도 stable Rust로 빌드할 수 있습니다.
+`rust-toolchain.toml`은 stable, rustfmt, clippy를 선택합니다. 의존성 버전은 이 디렉터리의 `Cargo.lock`으로 고정하며 공통 의존성은 workspace의 `Cargo.toml`에서 관리합니다. 빌드 산출물은 `rust/target/`에 생성됩니다. Windows MSVC에서 일반·릴리스 빌드, 단위 테스트 1개와 통합 테스트 15개, 포맷·Clippy 검사를 통과했습니다. 현재 저장소에는 CI 워크플로가 없으며 Ubuntu 실행은 검증하지 않았습니다. 실행 환경과 명령은 [로컬 검증 기록](docs/verification.md)을 참고하세요.
+
+통합 테스트는 로컬 TCP 연결을 사용합니다. 네트워크가 제한된 샌드박스에서 Windows 오류 `10013` 또는 브로커 시작 시간 초과가 발생하면 로컬 통신이 허용된 일반 PowerShell이나 승인된 샌드박스 외부 실행으로 검증하세요.
 
 ## 빠른 실행
 
