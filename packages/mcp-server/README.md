@@ -1,8 +1,10 @@
 # DevLink MCP 실행 기반
 
-S15P31D108-59의 TypeScript·Node.js MCP 실행 기반, -60 로컬 브로커 호출 계층, -61 공통 등록 구조와 7개 업무 도구입니다. MCP Host가 stdio 자식 프로세스로 실행합니다. 초기화·목록·`devlink_ping`은 브로커 없이 동작하며, 업무 도구 요청부터 브로커 세션을 활성화합니다.
+S15P31D108-59의 TypeScript·Node.js MCP 실행 기반, -60 로컬 브로커 호출 계층, -61 공통 등록 구조와 7개 업무 도구, -62 인증 컨텍스트 처리입니다. MCP Host가 stdio 자식 프로세스로 실행합니다. 초기화·목록·`devlink_ping`은 브로커 없이 동작하며, 업무 도구 요청부터 브로커 세션을 활성화합니다.
 
 브로커 호출 계층의 [HTTP·세션 계약 초안](docs/broker-contract-v0.1.md)은 먼저 복구한 인스턴스를 인정하는 정책과 가짜 브로커 테스트를 포함합니다. 실제 Rust 브로커와의 상호 검증은 남아 있습니다.
+
+[인증 컨텍스트·프로필 자격 파일](docs/agent-context.md)에 -62의 처리 정책과 검증 범위를, [공유 계약](../../contracts/local-broker/v1/README.md)에 Rust 측에서 재사용할 JSON Schema와 fixture를 정리했습니다. 현재 Rust 구현은 `/health`·`/shutdown`만 제공하므로 세션·업무 API와 자격 파일 발행은 후속 연동이 필요합니다.
 
 [도구 입력·결과 예제와 확장 방법](docs/tool-contracts-v0.1.md)에 7개 도구의 MCP 측 v0.1 JSON을 정리했습니다. Notion API 페이지가 빈 템플릿인 상태에서 선구현한 DTO이므로 도구 담당자의 필드 확인이 필요합니다.
 
@@ -49,7 +51,7 @@ node packages/mcp-server/dist/index.js
         "stdio"
       ],
       "env": {
-        "DEVLINK_BROKER_FILE": "C:\\Users\\SSAFY\\.devlink\\broker.json"
+        "DEVLINK_BROKER_FILE": "C:\\Users\\SSAFY\\.devlink-mcp\\claude-main\\broker.json"
       }
     }
   }
@@ -63,10 +65,12 @@ Codex는 같은 실행 명령을 다음 TOML 형태로 설정합니다. [공식 
 command = 'C:\Program Files\nodejs\node.exe'
 args = ['C:\Users\SSAFY\Documents\DevLink\packages\mcp-server\dist\index.js', '--transport', 'stdio']
 [mcp_servers.devlink.env]
-DEVLINK_BROKER_FILE = 'C:\Users\SSAFY\.devlink\broker.json'
+DEVLINK_BROKER_FILE = 'C:\Users\SSAFY\.devlink-mcp\codex-main\broker.json'
 ```
 
 위 브로커 파일 경로는 예시이며 실제 CLI 발행 위치로 변경합니다. CLI·Rust 브로커가 아직 이 계약을 제공하지 않으면 업무 도구는 성공하지 않습니다.
+
+Host마다 별도 프로필 파일을 지정합니다. `.devlink-runtime/runtime.json`의 `controlToken`은 CLI 제어용이며 MCP 자격 파일로 사용할 수 없습니다. 자격 파일은 프로세스마다 최초 업무 요청 시 한 번 읽습니다. 토큰 교체, 다른 팀·Agent로 전환할 때는 CLI에서 명시적으로 설정한 뒤 MCP 프로세스를 다시 시작합니다.
 
 MCP SDK 2.4.0의 `serveStdio`가 기존 `initialize` 경로와 현대 프로토콜 경로를 처리합니다. `devlink_ping`은 입력 `{}`에 대해 다음 구조를 텍스트와 `structuredContent`로 반환합니다. 버전은 MCP 패키지 버전이며 브로커·중앙 서버의 준비 상태를 뜻하지 않습니다.
 
@@ -92,6 +96,8 @@ npm --prefix packages/mcp-server test
 - 실제 OS 권한 검사에서 개인 설정 파일을 읽고 공개 권한 파일을 거부합니다. 현재 Windows DACL에서 실행했으며 POSIX 분기는 이 환경에서 실행하지 않았습니다.
 - 두 프로토콜의 실제 stdio → 설정 파일 → 가짜 브로커 경로에서 7개 도구를 모두 호출합니다. 잘못된 입력과 actor 덮어쓰기는 세션 생성 전 거부합니다.
 - 예제 모듈 추가, 공통 결과·오류 처리와 처리 중 EOF의 제한 시간 내 종료를 확인합니다.
+- 프로필별 신원 분리, 동시 등록의 순차 처리, 재등록 이후 오래된 응답의 컨텍스트 변경 차단, 복구 시 신원 일관성 및 자격 교체 후 재시작을 검증합니다.
+- 시스템 프록시가 설정된 자식 프로세스에서도 로컬 브로커 토큰을 프록시로 보내지 않는지 검사합니다. JSON Schema는 런타임 스키마에서 생성하며 `test`에서 파일의 최신 여부를 확인합니다.
 
 테스트의 5초 제한은 테스트 실패를 감지하는 harness 값입니다. 브로커 요청·ACK·업무 처리의 운영 제한 시간이 아닙니다.
 
