@@ -1,0 +1,205 @@
+//! # DevLink Configuration Management
+//!
+//! DevLink의 설정 파일(`config.json`) 로드, 저장, 원자적 쓰기(atomic write), 파일 락(lock),
+//! 유효성 검사 및 동적 수정을 담당하는 모듈입니다.
+
+use anyhow::{Context, Result, bail};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+/// DevLink 브로커 설정 구조체
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Config {
+    /// 중앙 웹소켓 서버 주소 (ws:// 또는 wss://)
+    pub server_url: String,
+    /// 에이전트 식별자 (예: codex, claude 등)
+    pub agent: String,
+    /// 연결 단절 시 자동 재연결 여부
+    pub auto_reconnect: bool,
+    /// 로컬 제어 HTTP 서버 바인딩 포트 (기본값: 43127)
+    #[serde(default = "default_port")]
+    pub local_port: u16,
+    /// 재연결 초기 대기 시간 (ms, 기본값: 2000)
+    #[serde(default = "initial_delay")]
+    pub reconnect_initial_ms: u64,
+    /// 재연결 최대 대기 시간 (ms, 기본값: 30000)
+    #[serde(default = "max_delay")]
+    pub reconnect_max_ms: u64,
+    /// 중앙 서버 인증 응답 제한 시간 (ms, 기본값: 5000)
+    #[serde(default = "auth_timeout")]
+    pub auth_timeout_ms: u64,
+}
+
+fn default_port() -> u16 {
+    43127
+}
+fn initial_delay() -> u64 {
+    2000
+}
+fn max_delay() -> u64 {
+    30000
+}
+fn auth_timeout() -> u64 {
+    5000
+}
+
+impl Default for Config {
+    /// 기본 권장 설정값 반환
+    fn default() -> Self {
+        Self {
+            server_url: "ws://localhost:8080".into(),
+            agent: "codex".into(),
+            auto_reconnect: true,
+            local_port: default_port(),
+            reconnect_initial_ms: initial_delay(),
+            reconnect_max_ms: max_delay(),
+            auth_timeout_ms: auth_timeout(),
+        }
+    }
+}
+
+impl Config {
+    /// 설정값들의 유효성을 엄격하게 검증합니다.
+    /// - `server_url`: ws/wss 스킴 필수, 쿼리/프래그먼트/사용자정보 금지
+    /// - `agent`: 1~64자의 영숫자 및 `-`, `_` 허용
+    /// - `reconnect_*`: 범위 및 max >= initial 조건 확인
+    /// - `auth_timeout_ms`: 100ms ~ 60000ms 범위 확인
+    pub fn validate(&self) -> Result<()> {
+        let url = url::Url::parse(&self.server_url)
+            .map_err(|_| anyhow::anyhow!("serverUrl must be a valid ws:// or wss:// URL"))?;
+        if !matches!(url.scheme(), "ws" | "wss")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!(
+                "serverUrl requires ws/wss and a host; credentials, query and fragment are forbidden"
+            );
+        }
+        if self.agent.is_empty()
+            || self.agent.len() > 64
+            || !self
+                .agent
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+        {
+            bail!("agent must contain 1-64 letters, digits, hyphens or underscores");
+        }
+        if self.reconnect_initial_ms < 50
+            || self.reconnect_max_ms < self.reconnect_initial_ms
+            || self.reconnect_max_ms > 300000
+        {
+            bail!("reconnectInitialMs must be >= 50 and <= reconnectMaxMs (maximum 300000)");
+        }
+        if !(100..=60000).contains(&self.auth_timeout_ms) {
+            bail!("authTimeoutMs must be between 100 and 60000");
+        }
+        Ok(())
+    }
+
+    /// 파일에서 JSON 설정을 읽어 파싱하고 유효성을 검사합니다.
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path).context("Cannot read config; run devlink init first")?;
+        // 보안상 사용자 입력 값이 포함될 수 있는 serde 에러 원문은 외부에 노출하지 않음
+        let config: Self = serde_json::from_slice(&bytes).map_err(|_| {
+            anyhow::anyhow!("Invalid config JSON, unknown field or incorrect value type")
+        })?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+/// 설정 파일의 전체 절대 경로를 결정합니다.
+/// - CLI 옵션으로 지정되지 않은 경우 기본값 `~/.devlink/config.json`을 사용합니다.
+pub fn config_path(path: Option<PathBuf>) -> Result<PathBuf> {
+    let path = match path {
+        Some(path) => path,
+        None => dirs::home_dir()
+            .context("Cannot find home directory")?
+            .join(".devlink/config.json"),
+    };
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    })
+}
+
+/// 설정 파일이 위치한 상위 디렉터리 경로를 반환합니다.
+pub fn directory(path: &Path) -> &Path {
+    path.parent().expect("absolute config path has a parent")
+}
+
+/// 프로세스 간 상호 배제를 위한 파일 락을 획득합니다 (`fs2::FileExt::try_lock_exclusive`).
+/// 중복 실행이나 동시 설정 수정을 방지합니다.
+pub fn lock(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .context("Cannot open lock file")?;
+    file.try_lock_exclusive()
+        .context("Another DevLink operation is running")?;
+    Ok(file)
+}
+
+/// JSON 데이터를 원자적(Atomic)으로 파일에 씁니다.
+/// - 임시 파일(TempFile)에 먼저 기록 후 `persist`(rename)하여 도중에 손상되는 일을 방지합니다.
+/// - Unix 환경에서는 권한을 `0o600`(소유자 읽기/쓰기 전용)으로 제한합니다.
+pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let mut file =
+        tempfile::NamedTempFile::new_in(directory(path)).context("Cannot create temporary file")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    serde_json::to_writer_pretty(&mut file, value)?;
+    file.write_all(b"\n")?;
+    file.as_file().sync_all()?;
+    file.persist(path)
+        .map_err(|_| anyhow::anyhow!("Cannot replace JSON file"))?;
+    Ok(())
+}
+
+/// 설정 디렉터리와 기본 설정 파일을 초기화합니다.
+/// - 파일이 이미 존재하면 생성하지 않고 `Ok(false)`를 반환합니다.
+/// - 새로 생성된 경우 `Ok(true)`를 반환합니다.
+pub fn init(path: &Path) -> Result<bool> {
+    fs::create_dir_all(directory(path)).context("Cannot create config directory")?;
+    let _guard = lock(&directory(path).join("control.lock"))?;
+    if path.exists() {
+        Config::load(path)?;
+        return Ok(false);
+    }
+    atomic_json(path, &Config::default())?;
+    Ok(true)
+}
+
+/// 설정 파일의 특정 키-값(key-value)을 업데이트합니다.
+/// - 파일 락을 획득한 후 안전하게 수정하며, 유효성 검사 통과 시 원자적으로 저장합니다.
+pub fn set(path: &Path, key: &str, raw: &str) -> Result<()> {
+    let _guard = lock(&directory(path).join("control.lock"))?;
+    let mut value = serde_json::to_value(Config::load(path)?)?;
+    let field = value.get_mut(key).context("Unknown config key")?;
+    *field = if field.is_string() {
+        raw.into()
+    } else {
+        serde_json::from_str(raw).map_err(|_| anyhow::anyhow!("Invalid JSON config value"))?
+    };
+    let config: Config = serde_json::from_value(value)
+        .map_err(|_| anyhow::anyhow!("Incorrect config value type or range"))?;
+    config.validate()?;
+    atomic_json(path, &config)
+}
