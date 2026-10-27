@@ -1,6 +1,8 @@
 # DevLink MCP 실행 기반
 
-S15P31D108-59의 TypeScript·Node.js MCP 실행 모듈입니다. MCP Host가 stdio 자식 프로세스로 실행하며, 현재 부작용 없는 `devlink_ping` 도구 하나를 제공합니다. 브로커 연결이나 인증·업무 도구는 후속 작업입니다.
+S15P31D108-59의 TypeScript·Node.js MCP 실행 기반과 S15P31D108-60의 로컬 브로커 호출 계층입니다. MCP Host가 stdio 자식 프로세스로 실행하며, 현재 공개 도구는 부작용 없는 `devlink_ping`입니다. 업무 도구와 호출 계층 연결은 -61에서 진행합니다.
+
+브로커 호출 계층의 [HTTP·세션 계약 초안](docs/broker-contract-v0.1.md)은 먼저 복구한 인스턴스를 인정하는 정책과 가짜 브로커 테스트를 포함합니다. 실제 Rust 브로커와의 상호 검증은 남아 있습니다.
 
 ## 설치와 실행
 
