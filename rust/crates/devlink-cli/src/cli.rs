@@ -178,32 +178,78 @@ async fn start(path: &Path) -> Result<()> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    let t_spawn_start = Instant::now();
+    devlink_broker::diag::diag("CLI_START", "spawning child broker process");
     let mut child = command.spawn().context("Cannot spawn broker process")?;
+    devlink_broker::diag::diag(
+        "CLI_START",
+        &format!("child spawned with PID {}", child.id()),
+    );
     let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last_status = String::new();
     // 최대 8초 동안 프로세스 조기 종료 여부와 헬스체크 응답을 50ms 주기로 폴링
     loop {
-        if let Some(_exit) = child.try_wait()? {
+        if let Some(exit) = child.try_wait()? {
+            devlink_broker::diag::diag(
+                "CLI_START",
+                &format!("child exited prematurely with {:?}", exit),
+            );
             bail!(
                 "Broker exited during startup; check configuration and local port, or run devlink broker in foreground"
             );
         }
         match Runtime::load(path) {
             Ok(runtime) if runtime.pid == child.id() => {
-                if let Err(e) = runtime.health().await {
-                    eprintln!("Health check error: {e}");
-                } else {
-                    println!("Broker started (PID: {})", child.id());
-                    return Ok(());
+                match runtime.health().await {
+                    Ok(_) => {
+                        devlink_broker::diag::diag(
+                            "CLI_START",
+                            &format!(
+                                "Health check SUCCESS at +{}ms for PID {}",
+                                t_spawn_start.elapsed().as_millis(),
+                                child.id()
+                            ),
+                        );
+                        println!("Broker started (PID: {})", child.id());
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let status = format!("Health check error: {e}");
+                        if status != last_status {
+                            devlink_broker::diag::diag("CLI_START", &status);
+                            last_status = status;
+                        }
+                    }
                 }
             }
             Ok(runtime) => {
-                eprintln!("PID mismatch: runtime.pid={}, child.id={}", runtime.pid, child.id());
+                let status = format!(
+                    "PID mismatch: runtime.pid={}, child.id={}",
+                    runtime.pid,
+                    child.id()
+                );
+                if status != last_status {
+                    devlink_broker::diag::diag("CLI_START", &status);
+                    last_status = status;
+                }
             }
             Err(e) => {
-                eprintln!("Runtime::load error: {e}");
+                let status = format!("Runtime::load error: {e}");
+                if status != last_status {
+                    devlink_broker::diag::diag("CLI_START", &status);
+                    last_status = status;
+                }
             }
         }
         if Instant::now() >= deadline {
+            devlink_broker::diag::diag(
+                "CLI_START",
+                &format!(
+                    "8s TIMEOUT REACHED (+{}ms); killing child {}",
+                    t_spawn_start.elapsed().as_millis(),
+                    child.id()
+                ),
+            );
             // 타임아웃 발생 시 생성한 자식 프로세스 정리
             let _ = child.kill();
             let _ = child.wait();

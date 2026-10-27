@@ -47,42 +47,53 @@ impl Drop for RuntimeGuard {
 /// - 로컬 루프백 TCP 리스너 바인딩 및 런타임 메타데이터 등록
 /// - 중앙 서버 연동 태스크 실행 및 Axum 기반 제어 HTTP 서버 구동
 pub async fn run(path: &Path) -> Result<()> {
-    // 설정 로드 및 환경변수 토큰 확인
-    use std::io::Write as _;
-    let mut trace = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("C:\\Users\\SSAFY\\AppData\\Local\\Temp\\broker_trace.log")
-        .unwrap();
-    let _ = writeln!(trace, "[TRACE 1] broker::run started PID {}", std::process::id());
-    let _ = trace.flush();
+    crate::diag::diag("BROKER", "1. run enter");
+    let t_start = std::time::Instant::now();
 
+    // 1. 설정 로드 및 환경변수 토큰 확인
+    let t_cfg = std::time::Instant::now();
     let config = Config::load(path)?;
     let token = central_token()?;
-    let _ = writeln!(trace, "[TRACE 2] config loaded");
-    let _ = trace.flush();
+    crate::diag::diag(
+        "BROKER",
+        &format!("1. config loaded in {}ms", t_cfg.elapsed().as_millis()),
+    );
 
-    // 중복 실행 방지를 위한 파일 락 획득 (broker.lock)
+    // 2. broker.lock 획득
+    let t_lock = std::time::Instant::now();
     let _lock = config::lock(&state_directory(path).join("broker.lock"))?;
-    let _ = writeln!(trace, "[TRACE 3] lock acquired");
-    let _ = trace.flush();
+    crate::diag::diag(
+        "BROKER",
+        &format!("2. broker.lock acquired in {}ms", t_lock.elapsed().as_millis()),
+    );
 
-    // 로컬 제어용 루프백(127.0.0.1) TCP 포트 바인딩
+    // 3. 포트 바인딩
+    let t_bind = std::time::Instant::now();
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, config.local_port))
         .await
         .context("Cannot bind broker loopback port; check for a port conflict")?;
     let bound_port = listener.local_addr()?.port();
     let broker_url = format!("http://127.0.0.1:{bound_port}");
-    let _ = writeln!(trace, "[TRACE 4] listener bound on {bound_port}");
-    let _ = trace.flush();
+    crate::diag::diag(
+        "BROKER",
+        &format!(
+            "3. port bound on {} in {}ms",
+            bound_port,
+            t_bind.elapsed().as_millis()
+        ),
+    );
 
-    // MCP 자격 스냅샷 발행 또는 기존 토큰 재사용
+    // 4. credentials::publish
+    let t_pub = std::time::Instant::now();
     let mcp_creds = crate::credentials::publish(path, &broker_url)?;
-    let _ = writeln!(trace, "[TRACE 5] credentials published");
-    let _ = trace.flush();
+    crate::diag::diag(
+        "BROKER",
+        &format!("4. credentials published in {}ms", t_pub.elapsed().as_millis()),
+    );
     let mcp_token = Arc::new(mcp_creds.local_token);
 
-    // 현재 실행 인스턴스 정보 생성 및 파일로 게시(publish)
+    // 5. runtime.json 발행
+    let t_rt = std::time::Instant::now();
     let runtime = Arc::new(Runtime {
         api_version: API_VERSION,
         pid: std::process::id(),
@@ -91,6 +102,10 @@ pub async fn run(path: &Path) -> Result<()> {
         control_token: uuid::Uuid::new_v4().to_string(),
     });
     local::publish(path, &runtime)?;
+    crate::diag::diag(
+        "BROKER",
+        &format!("5. runtime published in {}ms (total startup: {}ms)", t_rt.elapsed().as_millis(), t_start.elapsed().as_millis()),
+    );
     let _runtime_guard = RuntimeGuard(Runtime::path(path));
 
     // 취소 토큰 및 중앙 서버 연결 상태 초기화

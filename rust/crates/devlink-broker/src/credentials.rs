@@ -123,14 +123,30 @@ pub fn verify_path_safety(file_path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub fn current_user_sid() -> Result<String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
     static CACHED_SID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if let Some(sid) = CACHED_SID.get() {
         return Ok(sid.clone());
     }
-    let output = std::process::Command::new("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
+    crate::diag::diag("CRED_WHOAMI", "whoami /user start");
+    let t0 = std::time::Instant::now();
+    let mut cmd = std::process::Command::new("whoami");
+    cmd.args(["/user", "/fo", "csv", "/nh"])
+        .stdin(Stdio::null())
+        .creation_flags(0x08000000);
+    let output = cmd
         .output()
         .context("Failed to execute whoami to get user SID")?;
+    crate::diag::diag(
+        "CRED_WHOAMI",
+        &format!(
+            "whoami /user finished in {}ms, code={:?}",
+            t0.elapsed().as_millis(),
+            output.status.code()
+        ),
+    );
     let text = String::from_utf8_lossy(&output.stdout);
     for part in text.split(',') {
         let trimmed = part.trim().trim_matches('"');
@@ -145,17 +161,36 @@ pub fn current_user_sid() -> Result<String> {
 
 #[cfg(windows)]
 pub fn set_private_permissions(path: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
     let sid = current_user_sid()?;
     let is_dir = path.is_dir();
     let perm = if is_dir { "(OI)(CI)(F)" } else { "(F)" };
     let grant = format!("*{sid}:{perm}");
-    let output = std::process::Command::new("icacls.exe")
-        .arg(path)
+    crate::diag::diag(
+        "CRED_ICACLS",
+        &format!("icacls set_private start: target={}", path.display()),
+    );
+    let t0 = std::time::Instant::now();
+    let mut cmd = std::process::Command::new("icacls.exe");
+    cmd.arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
         .arg(&grant)
+        .stdin(Stdio::null())
+        .creation_flags(0x08000000);
+    let output = cmd
         .output()
         .context("Failed to execute icacls to set private permissions")?;
+    crate::diag::diag(
+        "CRED_ICACLS",
+        &format!(
+            "icacls set_private finished in {}ms, code={:?}",
+            t0.elapsed().as_millis(),
+            output.status.code()
+        ),
+    );
     if !output.status.success() {
         bail!(
             "Failed to set private Windows ACL on path: {}",
@@ -167,23 +202,86 @@ pub fn set_private_permissions(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub fn verify_private_permissions(path: &Path) -> Result<()> {
-    let sid = current_user_sid()?;
-    let parent = path.parent().context("no parent directory")?;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
-    for target in [path, parent] {
-        let output = std::process::Command::new("icacls.exe")
-            .arg(target)
-            .output()
-            .context("Failed to execute icacls to verify permissions")?;
-        if !output.status.success() {
-            bail!("icacls failed on path: {}", target.display());
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Verify output indicates successfully processed
-        if !stdout.contains("Successfully processed 1 files") {
-            bail!("Insecure or inaccessible Windows permissions on {}", target.display());
-        }
+    let abs_path = std::path::absolute(path)
+        .with_context(|| format!("Cannot determine absolute path for {}", path.display()))?;
+
+    // packages/mcp-server/src/broker/settings.ts와 동일한 Windows ACL 검사 기준 적용:
+    // - 파일 소유자는 현재 사용자 SID
+    // - 파일은 현재 사용자, SYSTEM(S-1-5-18), BUILTIN\Administrators(S-1-5-32-544) 외 Allow 거부
+    // - 직계 부모 디렉터리는 위 신뢰 주체 외 금지된 쓰기·삭제·권한 변경(852310 마스크) Allow 거부
+    // - 검증 성공 시 'private' 출력, 검사 실패 시 exit 2 또는 exit 3
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$p = $env:DEVLINK_ACL_CHECK_PATH
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$trusted = @($sid, 'S-1-5-18', 'S-1-5-32-544')
+foreach ($target in @($p, [System.IO.Path]::GetDirectoryName($p))) {
+  $acl = if ($target -eq $p) { [System.IO.File]::GetAccessControl($target) } else { [System.IO.Directory]::GetAccessControl($target) }
+  if ($target -eq $p -and $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid) { exit 2 }
+  foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trusted) {
+      if ($target -eq $p -or (($rule.FileSystemRights -band 852310) -ne 0)) { exit 3 }
     }
+  }
+}
+[Console]::Write('private')
+"#;
+
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("DEVLINK_ACL_CHECK_PATH", &abs_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(0x08000000); // CREATE_NO_WINDOW: 콘솔 창 없이 실행
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to spawn powershell for ACL verification on {}", path.display()))?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("Failed to wait for ACL verification on {}", path.display()))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "Windows ACL verification timed out on {}",
+                path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    if !status.success() {
+        bail!(
+            "Insecure or inaccessible Windows permissions on {}",
+            path.display()
+        );
+    }
+
+    let mut stdout = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_end(&mut stdout);
+    }
+
+    if std::str::from_utf8(&stdout).map(|s| s.trim()) != Ok("private") {
+        bail!(
+            "Insecure or inaccessible Windows permissions on {}",
+            path.display()
+        );
+    }
+
     Ok(())
 }
 
@@ -285,6 +383,8 @@ pub fn load(config_path: &Path) -> Result<McpCredentials> {
 /// - 자격 파일이 없으면 새로 생성합니다.
 /// - 기존 파일이 손상되었거나 권한이 불안전한 경우 조용히 덮어쓰지 않고 명시적 복구 안내와 함께 오류를 반환합니다.
 pub fn publish(config_path: &Path, broker_url: &str) -> Result<McpCredentials> {
+    crate::diag::diag("CRED_PUB", "publish enter");
+    let t_pub = std::time::Instant::now();
     let cred_path = path(config_path);
     let parent = cred_path
         .parent()
@@ -296,6 +396,10 @@ pub fn publish(config_path: &Path, broker_url: &str) -> Result<McpCredentials> {
         match load(config_path) {
             Ok(existing) => {
                 if existing.broker_url == broker_url {
+                    crate::diag::diag(
+                        "CRED_PUB",
+                        &format!("publish reuse existing in {}ms", t_pub.elapsed().as_millis()),
+                    );
                     return Ok(existing);
                 }
                 existing.local_token
@@ -319,6 +423,10 @@ pub fn publish(config_path: &Path, broker_url: &str) -> Result<McpCredentials> {
     };
     validate(&creds)?;
     write_atomic_private(&cred_path, &creds)?;
+    crate::diag::diag(
+        "CRED_PUB",
+        &format!("publish complete in {}ms", t_pub.elapsed().as_millis()),
+    );
     Ok(creds)
 }
 
@@ -398,4 +506,50 @@ mod tests {
         let loaded = load(&config_path).unwrap();
         assert_eq!(creds, loaded);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_verify_private_permissions_three_cases() {
+        // Case 1: 정상 비공개 파일·부모 → 허용
+        let dir1 = tempfile::tempdir().unwrap();
+        let file1 = dir1.path().join("broker.json");
+        std::fs::write(&file1, b"test").unwrap();
+        set_private_permissions(dir1.path()).unwrap();
+        set_private_permissions(&file1).unwrap();
+        let res1 = verify_private_permissions(&file1);
+        println!("Case 1 Result: {:?}", res1);
+        assert!(res1.is_ok(), "Case 1 failed: {:?}", res1.err());
+
+        // Case 2: 파일에 Everyone 읽기 Allow 추가 → 거부
+        let status2 = std::process::Command::new("icacls.exe")
+            .arg(&file1)
+            .arg("/grant")
+            .arg("*S-1-1-0:(R)")
+            .status()
+            .unwrap();
+        assert!(status2.success());
+        let res2 = verify_private_permissions(&file1);
+        println!("Case 2 Result: {:?}", res2);
+        assert!(res2.is_err(), "Case 2 expected error, got Ok");
+
+        // Case 3: 부모에 Everyone 쓰기 Allow 추가 → 거부
+        let dir3 = tempfile::tempdir().unwrap();
+        let file3 = dir3.path().join("broker.json");
+        std::fs::write(&file3, b"test").unwrap();
+        set_private_permissions(dir3.path()).unwrap();
+        set_private_permissions(&file3).unwrap();
+        assert!(verify_private_permissions(&file3).is_ok());
+
+        let status3 = std::process::Command::new("icacls.exe")
+            .arg(dir3.path())
+            .arg("/grant")
+            .arg("*S-1-1-0:(W)")
+            .status()
+            .unwrap();
+        assert!(status3.success());
+        let res3 = verify_private_permissions(&file3);
+        println!("Case 3 Result: {:?}", res3);
+        assert!(res3.is_err(), "Case 3 expected error, got Ok");
+    }
 }
+
