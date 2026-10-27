@@ -52,4 +52,3 @@ pub enum ServerMessage {
         message: String,
     },
 }
-

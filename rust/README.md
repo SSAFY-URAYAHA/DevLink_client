@@ -49,6 +49,8 @@ Mock 서버를 Ctrl+C로 종료하면 `status`가 `Reconnecting`으로 바뀝니
 
 기본 경로는 `$HOME/.devlink/config.json`입니다. 모든 명령에 `--config <FILE>`을 지정할 수 있습니다. 공백·한글을 포함하는 경로도 지원합니다.
 
+내부 파일은 설정 디렉터리 아래의 `.devlink-runtime/`에 따로 저장합니다. 설정 파일명으로 `runtime.json`, `broker.lock`, `control.lock`을 사용해도 내부 파일과 충돌하지 않습니다.
+
 ```powershell
 cargo run -p devlink-cli -- --config .\.devlink\config.json init
 cargo run -p devlink-cli -- --config .\.devlink\config.json config set serverUrl ws://127.0.0.1:8080
@@ -70,7 +72,9 @@ cargo run -p devlink-cli -- --config .\.devlink\config.json start
 
 `config`와 `config show`는 동일합니다. `config set <키> <값>`은 검증한 뒤 임시 파일을 원자적으로 교체합니다. 잘못된 값·알 수 없는 키는 실패하며 기존 파일을 유지합니다. 설정 변경은 브로커 재시작 후 반영됩니다. `init`은 기존 파일을 덮어쓰지 않습니다. TypeScript의 `serverUrl`/`agent`/`autoReconnect` 3필드 설정도 읽을 수 있지만 기존 `.devlink-practice` 파일을 자동 이동하지는 않습니다.
 
-중앙 서버 인증에는 `DEVLINK_TOKEN` 환경 변수만 사용합니다. 토큰은 필수이며 설정·상태·서버 응답·오류에 출력하지 않습니다. 로컬 API의 제어 토큰은 별개이며 같은 디렉터리의 `runtime.json`에 저장합니다. 이 디렉터리는 사용자 전용으로 관리하고 공유하거나 커밋하지 마세요. Unix JSON 파일은 0600 권한으로 생성하며 Windows는 디렉터리의 ACL을 상속합니다. 다른 로컬 관리자나 같은 사용자 계정의 프로세스에 대한 격리는 제공하지 않습니다.
+중앙 서버 인증에는 `DEVLINK_TOKEN` 환경 변수만 사용합니다. 토큰은 필수이며 설정·상태·서버 응답·오류에 출력하지 않습니다. 로컬 API의 제어 토큰은 별개이며 설정 디렉터리 아래의 `.devlink-runtime/runtime.json`에 저장합니다. `broker.lock`과 `control.lock`도 `.devlink-runtime/`에 저장합니다. 이 디렉터리는 사용자 전용으로 관리하고 공유하거나 커밋하지 마세요. Unix JSON 파일은 0600 권한으로 생성하며 Windows는 디렉터리의 ACL을 상속합니다. 다른 로컬 관리자나 같은 사용자 계정의 프로세스에 대한 격리는 제공하지 않습니다.
+
+구버전에서 업그레이드할 때는 실행 중인 구버전 브로커를 구버전 CLI로 먼저 종료하세요. 새 버전은 `.devlink-runtime/`만 사용하며, 설정 파일 보호를 위해 기존 위치의 런타임·잠금 파일을 자동 이동하거나 삭제하지 않습니다. 구버전과 새 버전은 잠금 경로가 다르므로 동시에 실행하지 마세요.
 
 ## 상태와 오류 처리
 

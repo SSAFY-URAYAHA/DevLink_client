@@ -6,7 +6,7 @@
 
 use crate::{
     central::{self, ConnectionStatus, SharedStatus},
-    config::{self, Config, directory},
+    config::{self, Config, state_directory},
     local::{self, API_VERSION, Health, Runtime, SERVICE},
 };
 use anyhow::{Context, Result};
@@ -50,7 +50,7 @@ pub async fn run(path: &Path) -> Result<()> {
     let token = central_token()?;
 
     // 중복 실행 방지를 위한 파일 락 획득 (broker.lock)
-    let _lock = config::lock(&directory(path).join("broker.lock"))?;
+    let _lock = config::lock(&state_directory(path).join("broker.lock"))?;
 
     // 로컬 제어용 루프백(127.0.0.1) TCP 포트 바인딩
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, config.local_port))
@@ -192,4 +192,39 @@ async fn termination_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_guard_preserves_config_named_like_runtime_metadata() {
+        for name in [
+            "runtime.json",
+            "Runtime.JSON",
+            "broker.lock",
+            "control.lock",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            config::init(&path).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let broker_lock = config::lock(&state_directory(&path).join("broker.lock")).unwrap();
+            let runtime = Runtime {
+                api_version: API_VERSION,
+                pid: std::process::id(),
+                port: 43127,
+                instance_id: "test-instance".into(),
+                control_token: "test-control-token".into(),
+            };
+            local::publish(&path, &runtime).unwrap();
+            assert!(local::running(&path).unwrap());
+            drop(RuntimeGuard(Runtime::path(&path)));
+            assert!(!Runtime::path(&path).exists());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(state_directory(&path).join("broker.lock").exists());
+            drop(broker_lock);
+        }
+    }
 }

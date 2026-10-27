@@ -1,7 +1,7 @@
 use devlink_broker::{
     central::ConnectionStatus,
     config::{self, Config},
-    local::{Health, Runtime},
+    local::{self, Health, Runtime},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -24,11 +24,14 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_config_name("config.json")
+    }
+    fn with_config_name(name: &str) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("devlink test 한글 ")
             .tempdir()
             .unwrap();
-        let path = dir.path().join("config.json");
+        let path = dir.path().join(name);
         config::init(&path).unwrap();
         let mut config = Config::load(&path).unwrap();
         config.local_port = 0;
@@ -125,6 +128,84 @@ fn config_create_show_update_and_validation() {
     assert_eq!(std::fs::read(&f.path).unwrap(), before);
     assert!(!f.run(&["not-a-command"]).status.success());
     assert!(f.ok(&["--help"]).contains("start"));
+}
+
+#[test]
+fn config_names_matching_internal_files_are_preserved() {
+    for name in [
+        "runtime.json",
+        "Runtime.JSON",
+        "broker.lock",
+        "Broker.LOCK",
+        "control.lock",
+        "Control.LOCK",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let f = Fixture {
+            path: dir.path().join(name),
+            _dir: dir,
+        };
+        assert!(f.ok(&["init"]).contains("Configuration created"));
+        assert!(f.ok(&["init"]).contains("already exists"));
+        f.ok(&["config", "set", "agent", "custom-agent"]);
+        let before = std::fs::read(&f.path).unwrap();
+        let runtime = Runtime {
+            api_version: local::API_VERSION,
+            pid: std::process::id(),
+            port: 43127,
+            instance_id: "stale-instance".into(),
+            control_token: "test-control-token".into(),
+        };
+        local::publish(&f.path, &runtime).unwrap();
+        assert!(f.ok(&["status"]).contains("Stopped"));
+        assert!(!Runtime::path(&f.path).exists());
+        assert_eq!(std::fs::read(&f.path).unwrap(), before, "{name}: status");
+
+        local::publish(&f.path, &runtime).unwrap();
+        assert!(f.ok(&["stop"]).contains("already stopped"));
+        assert!(!Runtime::path(&f.path).exists());
+        assert_eq!(std::fs::read(&f.path).unwrap(), before, "{name}: stop");
+
+        local::publish(&f.path, &runtime).unwrap();
+        let output = f
+            .command(&["start"])
+            .env_remove("DEVLINK_TOKEN")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(text(&output).contains("DEVLINK_TOKEN"));
+        assert!(!Runtime::path(&f.path).exists());
+        assert_eq!(std::fs::read(&f.path).unwrap(), before, "{name}: start");
+        assert!(
+            config::state_directory(&f.path)
+                .join("broker.lock")
+                .exists()
+        );
+        assert!(
+            config::state_directory(&f.path)
+                .join("control.lock")
+                .exists()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_names_matching_internal_files_survive_broker_lifecycle() {
+    for name in [
+        "runtime.json",
+        "Runtime.JSON",
+        "broker.lock",
+        "control.lock",
+    ] {
+        let f = Fixture::with_config_name(name);
+        let before = std::fs::read(&f.path).unwrap();
+        f.ok(&["start"]);
+        assert!(f.ok(&["status"]).contains("Running"));
+        assert_eq!(std::fs::read(&f.path).unwrap(), before, "{name}: running");
+        f.ok(&["stop"]);
+        assert!(!Runtime::path(&f.path).exists());
+        assert_eq!(std::fs::read(&f.path).unwrap(), before, "{name}: stopped");
+    }
 }
 
 #[test]

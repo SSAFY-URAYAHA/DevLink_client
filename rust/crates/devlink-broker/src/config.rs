@@ -138,9 +138,15 @@ pub fn directory(path: &Path) -> &Path {
     path.parent().expect("absolute config path has a parent")
 }
 
+/// 설정 파일과 분리된 내부 런타임 및 잠금 파일 디렉터리를 반환합니다.
+pub fn state_directory(config_path: &Path) -> PathBuf {
+    directory(config_path).join(".devlink-runtime")
+}
+
 /// 프로세스 간 상호 배제를 위한 파일 락을 획득합니다 (`fs2::FileExt::try_lock_exclusive`).
 /// 중복 실행이나 동시 설정 수정을 방지합니다.
 pub fn lock(path: &Path) -> Result<File> {
+    fs::create_dir_all(directory(path)).context("Cannot create lock directory")?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -178,7 +184,7 @@ pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 /// - 새로 생성된 경우 `Ok(true)`를 반환합니다.
 pub fn init(path: &Path) -> Result<bool> {
     fs::create_dir_all(directory(path)).context("Cannot create config directory")?;
-    let _guard = lock(&directory(path).join("control.lock"))?;
+    let _guard = lock(&state_directory(path).join("control.lock"))?;
     if path.exists() {
         Config::load(path)?;
         return Ok(false);
@@ -190,7 +196,7 @@ pub fn init(path: &Path) -> Result<bool> {
 /// 설정 파일의 특정 키-값(key-value)을 업데이트합니다.
 /// - 파일 락을 획득한 후 안전하게 수정하며, 유효성 검사 통과 시 원자적으로 저장합니다.
 pub fn set(path: &Path, key: &str, raw: &str) -> Result<()> {
-    let _guard = lock(&directory(path).join("control.lock"))?;
+    let _guard = lock(&state_directory(path).join("control.lock"))?;
     let mut value = serde_json::to_value(Config::load(path)?)?;
     let field = value.get_mut(key).context("Unknown config key")?;
     *field = if field.is_string() {

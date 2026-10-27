@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use devlink_broker::{
     broker,
-    config::{self, Config, directory},
+    config::{self, Config, state_directory},
     local::{self, Runtime},
 };
 use std::{
@@ -96,12 +96,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         // 실행 중인 브로커 정상 종료 (Graceful shutdown)
         Commands::Stop => {
-            if !directory(&path).exists() {
+            if !state_directory(&path).exists() {
                 println!("Broker already stopped");
                 return Ok(());
             }
             // 중복 제어 방지를 위한 파일 락 획득
-            let _guard = config::lock(&directory(&path).join("control.lock"))?;
+            let _guard = config::lock(&state_directory(&path).join("control.lock"))?;
             if !local::running(&path)? {
                 println!("Broker already stopped");
                 return Ok(());
@@ -126,7 +126,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 /// 브로커를 터미널과 분리된 백그라운드 독립 프로세스로 구동하고 정상 기동을 검증합니다.
 async fn start(path: &Path) -> Result<()> {
     Config::load(path)?;
-    let _guard = config::lock(&directory(path).join("control.lock"))?;
+    let _guard = config::lock(&state_directory(path).join("control.lock"))?;
     if local::running(path)? {
         Runtime::load(path)?.health().await?;
         println!("Broker already running");

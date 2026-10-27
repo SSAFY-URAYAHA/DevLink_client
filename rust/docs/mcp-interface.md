@@ -39,7 +39,7 @@ CLI와 브로커는 동일 실행 파일을 다른 모드로 실행하되 별도
 이 절은 현재 코드의 동작입니다. 위 협의안의 토큰 유지·파일 분리·고정 포트 정책이 이미 반영되었다는 의미는 아닙니다.
 
 - 전송: HTTP/1.1 JSON, IPv4 `127.0.0.1`에만 바인딩. 기본 포트 43127, `localPort: 0`이면 자동 할당.
-- 발견: CLI와 MCP가 같은 설정 디렉터리의 `runtime.json`을 읽습니다. 디렉터리당 한 인스턴스입니다.
+- 발견: CLI와 MCP가 설정 디렉터리 아래의 `.devlink-runtime/runtime.json`을 읽습니다. `broker.lock`과 `control.lock`도 `.devlink-runtime/`에 저장하며, 설정 디렉터리당 한 인스턴스입니다. 구버전 브로커는 업그레이드 전에 구버전 CLI로 종료해야 합니다.
 - 런타임 필드: `apiVersion`, `pid`, `port`, `instanceId`, `controlToken`. 토큰과 전체 런타임 JSON은 로그·Tool 응답에 포함하지 않습니다.
 - 인증: 각 요청에 `Authorization: Bearer <controlToken>`. `Origin`이 있는 브라우저 요청은 거절하며 CORS 허용 헤더를 제공하지 않습니다.
 - 클라이언트는 프록시를 끄고 loopback으로만 요청해야 합니다. `GET /health`의 서비스·API 버전·PID·instanceId를 확인합니다.

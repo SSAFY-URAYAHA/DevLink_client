@@ -1,7 +1,7 @@
 //! Authenticated loopback API and runtime discovery shared by CLI and future MCP client.
 use crate::{
     central::ConnectionStatus,
-    config::{self, directory},
+    config::{self, state_directory},
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ pub struct Runtime {
 }
 impl Runtime {
     pub fn path(config: &Path) -> PathBuf {
-        directory(config).join("runtime.json")
+        state_directory(config).join("runtime.json")
     }
     pub fn load(config: &Path) -> Result<Self> {
         let bytes = fs::read(Self::path(config)).context("Cannot read broker runtime metadata")?;
@@ -102,10 +102,11 @@ pub struct Health {
 
 /// A held OS lock is authoritative. PID files alone are unsafe because PIDs can be reused.
 pub fn running(config_path: &Path) -> Result<bool> {
-    if !directory(config_path).exists() {
+    let state = state_directory(config_path);
+    if !state.exists() {
         return Ok(false);
     }
-    let path = directory(config_path).join("broker.lock");
+    let path = state.join("broker.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -130,5 +131,6 @@ pub fn running(config_path: &Path) -> Result<bool> {
 }
 
 pub fn publish(config: &Path, runtime: &Runtime) -> Result<()> {
+    fs::create_dir_all(state_directory(config)).context("Cannot create broker state directory")?;
     config::atomic_json(&Runtime::path(config), runtime)
 }
