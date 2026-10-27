@@ -35,6 +35,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<ConfigCommand>,
     },
+    /// MCP integration and credential management
+    Mcp {
+        #[command(subcommand)]
+        command: Option<McpCommand>,
+    },
     /// Internal command: run the broker loop in foreground (spawned by start)
     #[command(hide = true)]
     Broker,
@@ -51,6 +56,14 @@ pub enum ConfigCommand {
         /// New value for the configuration key
         value: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum McpCommand {
+    /// Print the absolute path of DEVLINK_BROKER_FILE for MCP Host configuration
+    Path,
+    /// Rotate the MCP local token (only allowed when broker is stopped)
+    Rotate,
 }
 
 /// CLI 진입점: 파싱된 CLI 명령어에 따라 적절한 로직을 라우팅하여 실행합니다.
@@ -117,6 +130,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             println!("Broker stopped");
         }
+        // MCP 자격 경로 조회 및 토큰 회전
+        Commands::Mcp { command } => match command.unwrap_or(McpCommand::Path) {
+            McpCommand::Path => {
+                println!("{}", devlink_broker::credentials::path(&path).display());
+            }
+            McpCommand::Rotate => {
+                devlink_broker::credentials::rotate(&path)?;
+                println!("MCP local token rotated; restart any running MCP server to apply");
+            }
+        },
         // 포그라운드에서 직접 브로커 통신 루프 실행 (start 명령어로 생성된 자식 프로세스가 실행)
         Commands::Broker => broker::run(&path).await?,
     }
@@ -133,14 +156,15 @@ async fn start(path: &Path) -> Result<()> {
         return Ok(());
     }
     broker::central_token()?;
+    let log_file = std::fs::File::create(std::env::temp_dir().join("broker_child.log"))?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--config")
         .arg(path)
         .arg("broker")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -163,12 +187,21 @@ async fn start(path: &Path) -> Result<()> {
                 "Broker exited during startup; check configuration and local port, or run devlink broker in foreground"
             );
         }
-        if let Ok(runtime) = Runtime::load(path)
-            && runtime.pid == child.id()
-            && runtime.health().await.is_ok()
-        {
-            println!("Broker started (PID: {})", child.id());
-            return Ok(());
+        match Runtime::load(path) {
+            Ok(runtime) if runtime.pid == child.id() => {
+                if let Err(e) = runtime.health().await {
+                    eprintln!("Health check error: {e}");
+                } else {
+                    println!("Broker started (PID: {})", child.id());
+                    return Ok(());
+                }
+            }
+            Ok(runtime) => {
+                eprintln!("PID mismatch: runtime.pid={}, child.id={}", runtime.pid, child.id());
+            }
+            Err(e) => {
+                eprintln!("Runtime::load error: {e}");
+            }
         }
         if Instant::now() >= deadline {
             // 타임아웃 발생 시 생성한 자식 프로세스 정리
