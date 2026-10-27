@@ -36,3 +36,10 @@ test('invalid log levels and unknown or incomplete arguments fail before startup
     });
   }
 });
+
+test('broker credentials are represented only by an optional file path and validated lazily', () => {
+  const config = loadConfig([], { DEVLINK_MCP_TRANSPORT: 'stdio', DEVLINK_BROKER_FILE: 'not-yet-published.json', DEVLINK_LOCAL_TOKEN: 'ignored-secret' });
+  assert.equal(config.brokerSettingsPath, 'not-yet-published.json');
+  assert.ok(!JSON.stringify(config).includes('ignored-secret'));
+  assert.equal(loadConfig([], { DEVLINK_MCP_TRANSPORT: 'stdio', DEVLINK_BROKER_FILE: '' }).brokerSettingsPath, '');
+});

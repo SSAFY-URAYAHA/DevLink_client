@@ -4,6 +4,7 @@ import { z } from 'zod';
 const configSchema = z.object({
   transport: z.literal('stdio'),
   logLevel: z.enum(['debug', 'info', 'error']).default('info'),
+  brokerSettingsPath: z.string().optional(),
 });
 
 export type RuntimeConfig = Readonly<z.infer<typeof configSchema>>;
@@ -41,6 +42,7 @@ export function loadConfig(
   const parsed = configSchema.safeParse({
     transport: values.transport ?? env.DEVLINK_MCP_TRANSPORT,
     logLevel: values['log-level'] ?? env.DEVLINK_MCP_LOG_LEVEL,
+    ...(env.DEVLINK_BROKER_FILE !== undefined ? { brokerSettingsPath: env.DEVLINK_BROKER_FILE } : {}),
   });
   if (!parsed.success) {
     throw new ConfigError([...new Set(parsed.error.issues.map((issue) => String(issue.path[0])))]);

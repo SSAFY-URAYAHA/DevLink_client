@@ -1,8 +1,10 @@
 # DevLink MCP 실행 기반
 
-S15P31D108-59의 TypeScript·Node.js MCP 실행 기반과 S15P31D108-60의 로컬 브로커 호출 계층입니다. MCP Host가 stdio 자식 프로세스로 실행하며, 현재 공개 도구는 부작용 없는 `devlink_ping`입니다. 업무 도구와 호출 계층 연결은 -61에서 진행합니다.
+S15P31D108-59의 TypeScript·Node.js MCP 실행 기반, -60 로컬 브로커 호출 계층, -61 공통 등록 구조와 7개 업무 도구입니다. MCP Host가 stdio 자식 프로세스로 실행합니다. 초기화·목록·`devlink_ping`은 브로커 없이 동작하며, 업무 도구 요청부터 브로커 세션을 활성화합니다.
 
 브로커 호출 계층의 [HTTP·세션 계약 초안](docs/broker-contract-v0.1.md)은 먼저 복구한 인스턴스를 인정하는 정책과 가짜 브로커 테스트를 포함합니다. 실제 Rust 브로커와의 상호 검증은 남아 있습니다.
+
+[도구 입력·결과 예제와 확장 방법](docs/tool-contracts-v0.1.md)에 7개 도구의 MCP 측 v0.1 JSON을 정리했습니다. Notion API 페이지가 빈 템플릿인 상태에서 선구현한 DTO이므로 도구 담당자의 필드 확인이 필요합니다.
 
 ## 설치와 실행
 
@@ -28,8 +30,9 @@ node packages/mcp-server/dist/index.js
 | --- | --- | --- | --- |
 | 전송 방식 | `--transport` | `DEVLINK_MCP_TRANSPORT` | 필수, 현재 `stdio`만 지원 |
 | 로그 수준 | `--log-level` | `DEVLINK_MCP_LOG_LEVEL` | `debug`, `info`, `error`, 기본값 `info` |
+| 브로커 설정 파일 | 없음 | `DEVLINK_BROKER_FILE` | CLI가 발행한 사용자 전용 JSON 파일의 절대 경로, 업무 요청 시 검사 |
 
-인자는 환경변수보다 우선합니다. 모르는 인자, 누락된 필수 설정, 지원하지 않는 값은 `CONFIG_INVALID`로 종료합니다. 로그에는 설정 필드명만 기록하고 입력값·토큰·임의 환경변수는 기록하지 않습니다. 브로커 주소나 인증 토큰은 이 단계의 필수 설정이 아닙니다.
+인자는 환경변수보다 우선합니다. 모르는 인자, 누락된 필수 설정, 지원하지 않는 값은 `CONFIG_INVALID`로 종료합니다. 로그에는 설정 필드명만 기록하고 입력값·토큰·임의 환경변수는 기록하지 않습니다. 브로커 파일을 찾거나 검증할 수 없으면 업무 도구가 `CREDENTIAL_FILE_INVALID`를 반환하며 진단은 계속 사용할 수 있습니다. 파일 형식과 권한은 HTTP 계약 문서를 따릅니다.
 
 ## MCP Host 설정 예시
 
@@ -44,7 +47,10 @@ node packages/mcp-server/dist/index.js
         "C:\\Users\\SSAFY\\Documents\\DevLink\\packages\\mcp-server\\dist\\index.js",
         "--transport",
         "stdio"
-      ]
+      ],
+      "env": {
+        "DEVLINK_BROKER_FILE": "C:\\Users\\SSAFY\\.devlink\\broker.json"
+      }
     }
   }
 }
@@ -56,8 +62,11 @@ Codex는 같은 실행 명령을 다음 TOML 형태로 설정합니다. [공식 
 [mcp_servers.devlink]
 command = 'C:\Program Files\nodejs\node.exe'
 args = ['C:\Users\SSAFY\Documents\DevLink\packages\mcp-server\dist\index.js', '--transport', 'stdio']
-enabled_tools = ['devlink_ping']
+[mcp_servers.devlink.env]
+DEVLINK_BROKER_FILE = 'C:\Users\SSAFY\.devlink\broker.json'
 ```
+
+위 브로커 파일 경로는 예시이며 실제 CLI 발행 위치로 변경합니다. CLI·Rust 브로커가 아직 이 계약을 제공하지 않으면 업무 도구는 성공하지 않습니다.
 
 MCP SDK 2.4.0의 `serveStdio`가 기존 `initialize` 경로와 현대 프로토콜 경로를 처리합니다. `devlink_ping`은 입력 `{}`에 대해 다음 구조를 텍스트와 `structuredContent`로 반환합니다. 버전은 MCP 패키지 버전이며 브로커·중앙 서버의 준비 상태를 뜻하지 않습니다.
 
@@ -79,6 +88,10 @@ npm --prefix packages/mcp-server test
 - 30회 도구 호출 중 stdout의 모든 줄이 JSON-RPC인지, 로그와 테스트용 비밀값이 섞이지 않는지 검사합니다.
 - stdin EOF 후 강제 종료 없이 코드 0으로 종료하는지, 초기화 전 EOF 후에도 재실행할 수 있는지 확인합니다.
 - 명시적 close의 중복 호출과 stdin 리스너 정리를 확인합니다.
+- 가짜 HTTP 브로커로 복구 경쟁, 세션 교체·만료, 8개 병렬 호출의 응답 상관관계, 제한 시간·취소·종료·재시도 상한을 검증합니다.
+- 실제 OS 권한 검사에서 개인 설정 파일을 읽고 공개 권한 파일을 거부합니다. 현재 Windows DACL에서 실행했으며 POSIX 분기는 이 환경에서 실행하지 않았습니다.
+- 두 프로토콜의 실제 stdio → 설정 파일 → 가짜 브로커 경로에서 7개 도구를 모두 호출합니다. 잘못된 입력과 actor 덮어쓰기는 세션 생성 전 거부합니다.
+- 예제 모듈 추가, 공통 결과·오류 처리와 처리 중 EOF의 제한 시간 내 종료를 확인합니다.
 
 테스트의 5초 제한은 테스트 실패를 감지하는 harness 값입니다. 브로커 요청·ACK·업무 처리의 운영 제한 시간이 아닙니다.
 
@@ -88,6 +101,6 @@ npm --prefix packages/mcp-server test
 
 Host가 stdin을 닫으면 SDK가 서버·전송을 정리합니다. 직접 실행할 때 Ctrl+C로도 닫을 수 있습니다. `SIGINT`·`SIGTERM` 핸들러는 보조 경로이며 Windows 검증은 EOF와 명시적 close를 기준으로 합니다. 종료 시 `process.exit()`로 출력을 강제로 끊지 않습니다.
 
-`src/runtime.ts`는 전송과 인스턴스를, `src/server.ts`는 서버 팩터리와 예제 도구 등록을 맡습니다. 로거는 stderr만 사용하며 SDK 내부의 stdout 함수를 재정의하지 않습니다. 공유 브로커 실행·종료·중앙 연결·토큰 보관은 CLI 담당 범위로 유지합니다.
+`src/runtime.ts`는 전송과 프로세스당 하나의 BrokerClient를, `src/server.ts`는 서버 팩터리와 도구 구성을 맡습니다. `src/tools/registry.ts`가 등록·검증·결과 처리를, `src/tools/business.ts`가 업무 스키마를, `src/broker/`가 HTTP와 세션을 담당합니다. 로거는 stderr만 사용하며 SDK 내부의 stdout 함수를 재정의하지 않습니다. 공유 브로커 실행·종료·중앙 연결·토큰 보관은 CLI 담당 범위로 유지합니다.
 
-S15P31D108-50의 실행 주체·설정 전달 계약과 S15P31D108-28 산출물 확인은 남아 있습니다. 이 모듈의 검증 결과를 해당 합의나 두 Agent의 전체 업무 왕복 검증으로 간주하지 않습니다.
+S15P31D108-50의 실제 브로커와 경로·인증·세션·ACK 계약 상호 검증, 업무 도구별 DTO 확인 및 S15P31D108-28 산출물 확인은 남아 있습니다. 이 모듈의 검증 결과를 해당 합의나 두 Agent의 전체 업무 왕복 검증으로 간주하지 않습니다. Jira 완료 판정은 미확인 수용 기준을 검증한 뒤 수행합니다.

@@ -3,6 +3,7 @@ import type { Readable, Writable } from 'node:stream';
 import type { RuntimeConfig } from './config.js';
 import { createLogger, type Logger } from './logger.js';
 import { createServer } from './server.js';
+import { BrokerClient, type BrokerClientOptions } from './broker/client.js';
 
 export interface Runtime {
   close(): Promise<void>;
@@ -11,14 +12,16 @@ export interface Runtime {
 
 export function startRuntime(
   config: RuntimeConfig,
-  options: { input?: Readable; output?: Writable; logger?: Logger } = {},
+  options: { input?: Readable; output?: Writable; logger?: Logger; brokerOptions?: BrokerClientOptions } = {},
 ): Runtime {
   const logger = options.logger ?? createLogger(process.stderr, config.logLevel);
+  // A single process owns this client, including across SDK discovery/server factories.
+  const broker = new BrokerClient({ ...(config.brokerSettingsPath ? { settingsPath: config.brokerSettingsPath } : {}), ...options.brokerOptions });
   // Validate construction/registration before listening to any protocol messages.
-  let unclaimedServer: ReturnType<typeof createServer> | undefined = createServer(logger);
+  let unclaimedServer: ReturnType<typeof createServer> | undefined = createServer(logger, broker);
   const transport = new StdioServerTransport(options.input, options.output);
   const handle = serveStdio(() => {
-    const server = unclaimedServer ?? createServer(logger);
+    const server = unclaimedServer ?? createServer(logger, broker);
     unclaimedServer = undefined;
     return server;
   }, {
@@ -34,6 +37,7 @@ export function startRuntime(
     // Defer teardown so SDK onclose cannot recursively start a second close.
     closing ??= Promise.resolve().then(async () => {
       try {
+        await broker.close();
         await handle.close();
         await unclaimedServer?.close();
         unclaimedServer = undefined;
