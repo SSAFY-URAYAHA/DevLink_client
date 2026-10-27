@@ -1,5 +1,9 @@
 # DevLink
 
+## MCP 실행 기반
+
+S15P31D108-59의 실행 방법과 검증 절차는 [MCP 서버 문서](packages/mcp-server/README.md)를 참고합니다.
+
 ## Git Flow
 
 [Notion Git Flow 전략](https://www.notion.so/fdd35a4f3ca6837fb6ef8101afa7fb68)을 기준으로 브랜치를 관리합니다.
