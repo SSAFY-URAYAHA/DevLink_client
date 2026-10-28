@@ -45,7 +45,7 @@ cargo run -p devlink-cli -- stop
 
 빌드한 실행 파일을 PATH에 추가하면 `devlink init`, `devlink start`, `devlink status`, `devlink stop`으로 사용할 수 있습니다. CLI가 종료되어도 브로커는 계속 실행되며 Windows에서 별도 콘솔 창을 만들지 않습니다. 운영체제 재부팅 후 자동 실행이나 Windows 서비스 등록은 포함하지 않습니다.
 
-Mock 서버를 Ctrl+C로 종료하면 `status`가 `Reconnecting`으로 바뀝니다. 같은 포트·토큰으로 서버를 다시 실행하면 `Connected`로 돌아옵니다. `Connected`는 WebSocket 연결뿐 아니라 `auth_ok` 인증 응답까지 받은 상태입니다. `auth_error` 또는 종료 코드 `4001`은 `AuthFailed`가 되고 재시도하지 않습니다. 토큰을 고친 뒤 `stop`/`start`로 다시 시작합니다.
+Mock 서버를 Ctrl+C로 종료하면 `status`가 `Reconnecting`으로 바뀝니다. 같은 포트·토큰으로 서버를 다시 실행하면 `Connected`로 돌아옵니다. `Connected`는 `/ws/broker` WebSocket Upgrade 인증(`Authorization: Bearer <DEVLINK_TOKEN>`) 후 유효한 `BROKER_READY` 수신 및 초기 `AGENT_PRESENCE` 보고까지 마친 상태입니다. Upgrade `401`/`403` 또는 종료 코드 `4001`은 `AuthFailed`, 동일 Agent의 새 연결 교체(`4002`)는 `Replaced`, 메시지/정책 위반(`1008` 또는 잘못된 `BROKER_READY`)은 `ProtocolViolation`이 되며 자동 재시도하지 않습니다. 토큰이나 설정을 고친 뒤 `stop`/`start`로 다시 시작합니다.
 
 ## 설정
 
@@ -85,7 +85,7 @@ Local Broker  : Running (PID: 12345)
 Central Server: Connected
 ```
 
-중앙 연결 상태는 `Connecting`, `Authenticating`, `Connected`, `Reconnecting`, `AuthFailed`, `Disconnected`입니다. 재연결은 초기 지연부터 최대 지연까지 지수 백오프를 사용하며, 인증된 연결이 끊기면 초기 지연으로 돌아갑니다. 인증 후 5초마다 Ping을 보내고 15초 이상 응답·메시지가 없으면 재연결합니다. 연결 수립은 5초 제한, 인증 대기는 `authTimeoutMs` 제한입니다. `wss`는 OS 신뢰 저장소로 서버 인증서를 검증합니다.
+중앙 연결 상태는 `Connecting`, `Authenticating`, `Connected`, `Reconnecting`, `AuthFailed`, `Replaced`, `ProtocolViolation`, `Disconnected`입니다. 재연결은 초기 지연부터 최대 지연까지 지수 백오프를 사용하며, `BROKER_READY`까지 완료된 연결이 끊기면 초기 지연으로 돌아갑니다. `BROKER_READY` 후 5초마다 Ping을 보내고 15초 이상 응답·메시지가 없으면 재연결합니다. 연결 수립은 5초 제한, `BROKER_READY` 대기는 `authTimeoutMs` 제한입니다. `wss`는 OS 신뢰 저장소로 서버 인증서를 검증합니다.
 
 브로커 실행 여부는 PID 파일 대신 OS 파일 잠금으로 판단합니다. 살아 있지만 Health Check가 실패한 프로세스는 오류로 보고하며 `Stopped`로 표시하지 않습니다. `stop`은 인증된 HTTP 종료 요청을 보내고 잠금 해제를 기다립니다. 잠금 파일은 삭제하지 않으며 정상 종료 시 `runtime.json`과 소켓·재연결 작업을 정리합니다. 강제 종료로 남은 런타임 정보는 다음 `status`/`start`/`stop`에서 잠금을 획득한 상태로 제거합니다. PID를 이용해 임의 프로세스를 강제 종료하지 않습니다.
 

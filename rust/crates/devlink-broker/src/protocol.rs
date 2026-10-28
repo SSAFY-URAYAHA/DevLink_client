@@ -1,54 +1,161 @@
 //! # DevLink Central Protocol
 //!
-//! 중앙 서버(DevLink Server)와 WebSocket 통신 시 교환하는 메시지 데이터 규격을 정의하는 모듈입니다.
+//! 중앙 서버(DevLink Server)의 `/ws/broker` 엔드포인트와 브로커 간 교환하는
+//! 확정된 2단계 WebSocket JSON 메시지 규격을 정의하는 모듈입니다.
 //!
-//! - 모든 메시지는 JSON 형식으로 직렬화/역직렬화됩니다.
-//! - serde의 내부 태그 방식(`#[serde(tag = "type", rename_all = "snake_case")]`)을 사용하여
-//!   JSON 객체의 `"type"` 필드로 각 메시지 유형을 식별합니다.
-//! - 정식 프로토콜 확정 전까지 사용되는 실습/임시 프로토콜 규격입니다.
+//! - 연결 인증은 WebSocket Upgrade 요청의 `Authorization: Bearer <Agent 토큰>` 헤더로 수행하며,
+//!   연결 수립 후 별도의 `auth` / `hello` 메시지를 송신하지 않습니다.
+//! - 서버는 인증·등록 완료 시 `BROKER_READY`를 전송합니다.
+//! - 브로커는 유효한 `BROKER_READY` 수신 직후 `AGENT_PRESENCE`로 로컬 Agent 접속 상태(`ONLINE` / `OFFLINE`)를 보고합니다.
 
 use serde::{Deserialize, Serialize};
 
-/// 클라이언트(Broker)에서 중앙 서버로 전송하는 메시지 규격
-///
-/// 불필요한 메모리 할당 및 복사를 방지하기 위해 라이프타임(`'a`) 기반의 문자열 슬라이스(`&'a str`)를 사용합니다.
-///
-/// # 직렬화(JSON) 예시
-/// - `Auth`: `{"type": "auth", "token": "..."}`
-/// - `Hello`: `{"type": "hello", "message": "..."}`
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMessage<'a> {
-    /// 서버 연결 직후 인증을 위해 클라이언트 토큰을 전송하는 메시지
-    Auth {
-        /// 사용자 또는 장치 인증 토큰
-        token: &'a str,
-    },
-    /// 인증 완료 후 연결 확인 및 인사 메시지를 전송하는 메시지
-    Hello {
-        /// 전송할 메시지 내용
-        message: &'a str,
-    },
+/// 로컬 Agent와 브로커 사이의 접속 상태 (`ONLINE` 또는 `OFFLINE`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PresenceStatus {
+    Online,
+    Offline,
 }
 
-/// 중앙 서버에서 클라이언트(Broker)로 수신되는 메시지 규격
+/// `AGENT_PRESENCE` 메시지 페이로드 규격
 ///
-/// 수신된 JSON 텍스트로부터 역직렬화되며, `"type"` 필드 값에 따라 해당 variant로 파싱됩니다.
+/// `status` 외의 `agent_id`나 클라이언트 시각(`last_seen_at` 등)을 추가하지 않습니다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPresencePayload {
+    pub status: PresenceStatus,
+}
+
+/// 브로커에서 중앙 서버로 전송하는 메시지 규격
+///
+/// # 직렬화(JSON) 예시
+/// ```json
+/// {
+///   "type": "AGENT_PRESENCE",
+///   "payload": { "status": "OFFLINE" }
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ClientMessage {
+    /// 로컬 Agent 접속 상태 보고 메시지
+    AgentPresence(AgentPresencePayload),
+}
+
+impl ClientMessage {
+    /// 주어진 접속 상태로 `AGENT_PRESENCE` 메시지를 생성합니다.
+    pub fn agent_presence(status: PresenceStatus) -> Self {
+        Self::AgentPresence(AgentPresencePayload { status })
+    }
+}
+
+/// `BROKER_READY` 메시지 페이로드 규격
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerReadyPayload {
+    /// 현재 중앙 WebSocket 세션 식별자
+    pub connection_id: String,
+    /// 인증된 Agent의 숫자 식별자 (양의 정수)
+    pub agent_id: u64,
+}
+
+impl BrokerReadyPayload {
+    /// `connection_id`가 비어 있지 않고 `agent_id`가 양수인지 검증합니다.
+    pub fn is_valid(&self) -> bool {
+        !self.connection_id.trim().is_empty() && self.agent_id > 0
+    }
+}
+
+/// 중앙 서버에서 브로커로 수신되는 메시지 규격
 ///
 /// # 역직렬화(JSON) 예시
-/// - `AuthOk`: `{"type": "auth_ok"}`
-/// - `AuthError`: `{"type": "auth_error"}`
-/// - `Echo`: `{"type": "echo", "message": "..."}`
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// ```json
+/// {
+///   "type": "BROKER_READY",
+///   "payload": {
+///     "connection_id": "current-websocket-session-id",
+///     "agent_id": 11
+///   }
+/// }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ServerMessage {
-    /// 인증 성공 응답
-    AuthOk,
-    /// 인증 실패 응답 (만료되거나 올바르지 않은 토큰)
-    AuthError,
-    /// 서버로부터 전달받은 에코 테스트 응답 메시지
-    Echo {
-        /// 에코 응답 메시지 내용
-        message: String,
-    },
+    /// 서버 측 인증 및 ConnectionRegistry 등록 완료 응답
+    BrokerReady(BrokerReadyPayload),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broker_ready_parses_valid_payload_and_rejects_invalid_shapes() {
+        let raw = r#"{
+            "type": "BROKER_READY",
+            "payload": {
+                "connection_id": "current-websocket-session-id",
+                "agent_id": 11
+            }
+        }"#;
+        let msg: ServerMessage = serde_json::from_str(raw).expect("valid BROKER_READY must parse");
+        let ServerMessage::BrokerReady(payload) = msg;
+        assert!(payload.is_valid());
+        assert_eq!(payload.connection_id, "current-websocket-session-id");
+        assert_eq!(payload.agent_id, 11);
+
+        // Empty connection_id or zero agent_id must be rejected by validation
+        let empty_conn: ServerMessage = serde_json::from_str(
+            r#"{"type":"BROKER_READY","payload":{"connection_id":"   ","agent_id":11}}"#,
+        )
+        .unwrap();
+        let ServerMessage::BrokerReady(empty_payload) = empty_conn;
+        assert!(!empty_payload.is_valid());
+
+        let zero_agent: ServerMessage = serde_json::from_str(
+            r#"{"type":"BROKER_READY","payload":{"connection_id":"conn-1","agent_id":0}}"#,
+        )
+        .unwrap();
+        let ServerMessage::BrokerReady(zero_payload) = zero_agent;
+        assert!(!zero_payload.is_valid());
+
+        // Malformed types, string agent_id, unknown fields, and legacy messages must fail deserialization
+        for invalid in [
+            r#"{"type":"auth_ok"}"#,
+            r#"{"type":"BROKER_READY","payload":{"connection_id":"c1","agent_id":"11"}}"#,
+            r#"{"type":"BROKER_READY","payload":{"connection_id":"c1","agent_id":-1}}"#,
+            r#"{"type":"BROKER_READY","payload":{"connection_id":"c1","agent_id":11,"extra":true}}"#,
+            r#"{"type":"BROKER_READY","payload":{"connection_id":"c1"}}"#,
+            r#"{"type":"BROKER_READY"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ServerMessage>(invalid).is_err(),
+                "expected invalid ServerMessage to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_presence_serializes_exact_contract_without_extra_fields() {
+        let online = serde_json::to_value(ClientMessage::agent_presence(PresenceStatus::Online))
+            .expect("online presence must serialize");
+        assert_eq!(
+            online,
+            serde_json::json!({
+                "type": "AGENT_PRESENCE",
+                "payload": { "status": "ONLINE" }
+            })
+        );
+
+        let offline = serde_json::to_value(ClientMessage::agent_presence(PresenceStatus::Offline))
+            .expect("offline presence must serialize");
+        assert_eq!(
+            offline,
+            serde_json::json!({
+                "type": "AGENT_PRESENCE",
+                "payload": { "status": "OFFLINE" }
+            })
+        );
+    }
 }
