@@ -19,6 +19,21 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const CREDENTIALS_FILE_NAME: &str = "broker.json";
 pub const MAX_CREDENTIALS_SIZE: u64 = 16_384;
 
+/// Each Windows ACL verifier is bounded independently. Publishing changed credentials
+/// may verify the existing snapshot, the temporary file, and the persisted file.
+pub const ACL_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const MAX_PUBLISH_ACL_CHECKS: u32 = 3;
+
+/// Extra readiness allowance before the broker can publish runtime.json.
+/// Keep the CLI's original startup/health margin in addition to these checks.
+pub fn startup_validation_allowance() -> std::time::Duration {
+    if cfg!(windows) {
+        ACL_CHECK_TIMEOUT * MAX_PUBLISH_ACL_CHECKS
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
 /// MCP 서버용 비공개 브로커 자격 스냅샷
 ///
 /// MCP settingsSchema:
@@ -336,7 +351,7 @@ foreach ($target in @($p, [System.IO.Path]::GetDirectoryName($p))) {
         )
     })?;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + ACL_CHECK_TIMEOUT;
     let status = loop {
         if let Some(status) = child
             .try_wait()
@@ -407,6 +422,7 @@ pub fn verify_private_permissions(path: &Path) -> Result<()> {
 }
 
 /// 비공개 임시 파일 생성 후 원자적으로 대상 경로에 교체 저장
+/// ACL verifier 호출을 변경하면 MAX_PUBLISH_ACL_CHECKS와 지연 회귀도 갱신합니다.
 pub fn write_atomic_private(target: &Path, creds: &McpCredentials) -> Result<()> {
     let parent = target
         .parent()

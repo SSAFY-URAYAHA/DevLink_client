@@ -1,6 +1,22 @@
 # 로컬 검증 기록
 
-## 최종 확인: 2026-10-27
+## 2026-10-28: PR #11 P2 후속 수정 (S15P31D108-46)
+
+최신 develop `69f155a`에서 확인한 Unix `libc` 의존성 누락과 Windows ACL 검사·기동 시간 예산 충돌을 수정했습니다. Unix 전용 직접 의존성을 workspace manifest와 lockfile에 반영했으며, Windows 시작 대기는 기존 준비 여유 8초에 최대 3회 ACL 검사(각 5초)를 포함한 23초입니다. Unix 시작 대기는 기존 8초를 유지합니다. 권한 검사는 생략하지 않습니다.
+
+Windows MSVC에서 다음 검사를 통과했습니다. 기본 GNU 도구 체인에는 `dlltool`이 없어 설치된 MSVC를 명시했습니다.
+
+```powershell
+cargo +stable-x86_64-pc-windows-msvc test --locked --offline --workspace --all-targets
+cargo +stable-x86_64-pc-windows-msvc clippy --locked --offline --workspace --all-targets -- -D warnings
+cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check
+```
+
+단위 7개·통합 22개가 통과했습니다. 신규 `startup_waits_for_valid_slow_acl_checks`는 합성 자격 파일과 동적 포트를 사용하고, 테스트가 실행한 start CLI 자식의 PATH에만 네이티브 PowerShell 프록시를 지정해 브로커가 상속하도록 합니다. 실제 ACL 스크립트마다 3초를 추가한 상태에서 검사 3회가 모두 실행되고, 8초를 넘겨 정상 기동하며 기존 토큰·새 주소·status·stop이 유지되는지 확인합니다. 프록시는 테스트에서 설치된 `rustc`로 임시 디렉터리에 컴파일하며 운영 실행 파일에 지연 옵션을 추가하지 않습니다. 실제 MCP reader 검사와 기존 토큰 유지·회전·권한 분리 테스트도 통과했습니다.
+
+`cargo metadata --locked --offline --no-deps`로 broker의 `libc` 직접 의존성과 `cfg(unix)` 조건을 확인했습니다. 이 Windows 환경에 Unix 실행 도구 체인이 없어 Linux/macOS 전체 빌드·실행은 미검증입니다. 실제 `/v1` 업무 API나 중앙 서버 연동 검증을 의미하지 않습니다.
+
+## 이전 확인: 2026-10-27
 
 검증 환경: Windows x86_64 MSVC, rustc/cargo 1.99.1, Visual Studio 2022 Build Tools 및 Windows SDK. 기능 코드 기준은 `7bfca74`(P2 디렉터리 분리)입니다. P1의 `Cargo.lock` 추적과 `protocol.rs` 포맷 수정도 이 기준에 포함되어 있습니다.
 

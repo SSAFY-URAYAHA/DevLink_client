@@ -181,8 +181,12 @@ async fn start(path: &Path) -> Result<()> {
         command.process_group(0);
     }
     let mut child = command.spawn().context("Cannot spawn broker process")?;
-    let deadline = Instant::now() + Duration::from_secs(8);
-    // 최대 8초 동안 프로세스 조기 종료 여부와 헬스체크 응답을 50ms 주기로 폴링
+    // Credential publication precedes runtime discovery. On Windows its three ACL
+    // checks can each succeed within 5 s and still exceed the former 8 s wait.
+    let startup_timeout =
+        Duration::from_secs(8) + devlink_broker::credentials::startup_validation_allowance();
+    let deadline = Instant::now() + startup_timeout;
+    // Poll process exit and authenticated readiness within the combined budget.
     loop {
         if let Some(_exit) = child.try_wait()? {
             bail!(
