@@ -1,13 +1,13 @@
 //! # DevLink Central WebSocket Client
 //!
 //! 중앙 서버(DevLink Server)와의 WebSocket 연결, 인증, `BROKER_READY` 수신,
-//! 초기/재연결 `AGENT_PRESENCE` 보고, 하트비트 및 지수 백오프 기반 재연결을 담당하는 모듈입니다.
+//! 확인된 로컬 Agent 접속 상태(`AGENT_PRESENCE`) 보고, 하트비트 및 지수 백오프 기반 재연결을 담당하는 모듈입니다.
 
 use crate::{
     config::Config,
     protocol::{ClientMessage, PresenceStatus, ServerMessage},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
@@ -30,7 +30,8 @@ pub enum ConnectionStatus {
     Connecting,
     /// Upgrade 성공 후 서버의 유효한 `BROKER_READY` 응답 대기 중
     Authenticating,
-    /// 유효한 `BROKER_READY` 수신 및 초기 `AGENT_PRESENCE` 전송 완료 후 정상 연결 유지 상태
+    /// 유효한 `BROKER_READY` 수신 완료 후 정상 연결 유지 상태
+    /// (확인된 로컬 Agent 상태가 있는 경우 초기 `AGENT_PRESENCE` 전송까지 완료된 상태)
     Connected,
     /// 일시적 연결 해제 또는 타임아웃 후 재연결 시도 중
     Reconnecting,
@@ -59,8 +60,11 @@ pub type SharedStatus = Arc<RwLock<ConnectionStatus>>;
 /// 현재 활성 연결의 식별 정보(`connection_id`, `agent_id`) 공유 타입
 pub type SharedIdentity = Arc<RwLock<Option<CentralIdentity>>>;
 
-/// 로컬 Agent의 현재 접속 상태(`ONLINE` / `OFFLINE`) 공유 타입
-pub type SharedPresence = Arc<RwLock<PresenceStatus>>;
+/// 로컬 Agent의 현재 접속 상태 공유 타입
+/// - `None`: 로컬 Agent 상태 미확인 (추측하여 `ONLINE`/`OFFLINE`을 보고하지 않음)
+/// - `Some(PresenceStatus::Offline)`: 로컬 Agent 연결이 없다고 확인된 상태
+/// - `Some(PresenceStatus::Online)`: 로컬 Agent 연결이 있다고 확인된 상태
+pub type SharedPresence = Arc<RwLock<Option<PresenceStatus>>>;
 
 #[derive(Debug)]
 struct StateInner {
@@ -81,16 +85,17 @@ pub struct CentralState {
 
 impl CentralState {
     /// 기본 상태 저장소를 생성합니다.
-    /// 2단계에서는 로컬 Agent 세션 API가 아직 연결되지 않았으므로 신뢰 가능한 로컬 Agent 연결이 없을 때의 기본값으로 `PresenceStatus::Offline`을 사용합니다.
+    /// 2단계에서는 로컬 Agent 상태 감지 및 `/v1/sessions/*` API가 아직 연결되지 않았으므로
+    /// 로컬 Agent 상태를 추측하지 않고 미확인(`None`)으로 초기화합니다.
     pub fn new(status: SharedStatus) -> Self {
         Self::with_details(
             status,
             Arc::new(RwLock::new(None)),
-            Arc::new(RwLock::new(PresenceStatus::Offline)),
+            Arc::new(RwLock::new(None)),
         )
     }
 
-    /// 외부에서 상태·식별자·로컬 Agent 접속 상태를 주입하여 생성합니다.
+    /// 외부에서 상태·식별자·확인된 로컬 Agent 접속 상태(`Option<PresenceStatus>`)를 주입하여 생성합니다.
     pub fn with_details(
         status: SharedStatus,
         identity: SharedIdentity,
@@ -130,8 +135,8 @@ impl CentralState {
         self.identity.read().await.clone()
     }
 
-    /// 현재 로컬 Agent 접속 상태를 조회합니다.
-    pub async fn presence(&self) -> PresenceStatus {
+    /// 현재 확인된 로컬 Agent 접속 상태를 조회합니다 (`None`이면 미확인).
+    pub async fn presence(&self) -> Option<PresenceStatus> {
         *self.presence.read().await
     }
 }
@@ -196,8 +201,8 @@ impl SessionHandle {
         true
     }
 
-    /// 현재 로컬 Agent의 접속 상태(`ONLINE` / `OFFLINE`)를 읽습니다.
-    pub async fn current_presence(&self) -> PresenceStatus {
+    /// 현재 확인된 로컬 Agent의 접속 상태(`Some(Online)` / `Some(Offline)` / 미확인 `None`)를 읽습니다.
+    pub async fn current_presence(&self) -> Option<PresenceStatus> {
         *self.state.presence.read().await
     }
 }
@@ -220,8 +225,10 @@ enum Outcome {
     Stopped,
 }
 
-/// 설정된 `server_url`을 중앙 브로커 엔드포인트(`/ws/broker`) URL로 정규화합니다.
-/// - 경로가 비어 있거나 `"/"`인 경우 `"/ws/broker"`로 설정합니다.
+/// 설정된 `server_url`을 중앙 브로커 엔드포인트(`/ws/broker`) URL로 검증·정규화합니다.
+/// - 루트 경로(`""` 또는 `"/"`)인 경우 `"/ws/broker"`로 정규화합니다.
+/// - 명시적 `"/ws/broker"` 경로는 그대로 허용합니다.
+/// - 그 외 임의 경로는 허용하지 않고 오류로 거부하여 다른 경로로 Bearer 토큰이 전송되지 않게 합니다.
 /// - URL 쿼리, 프래그먼트, 사용자 자격 증명은 허용하지 않습니다.
 pub fn endpoint_url(server_url: &str) -> Result<String> {
     let mut url = url::Url::parse(server_url).map_err(|_| anyhow::anyhow!("Invalid serverUrl"))?;
@@ -237,14 +244,16 @@ pub fn endpoint_url(server_url: &str) -> Result<String> {
         url.query().is_none() && url.fragment().is_none(),
         "serverUrl must not include query parameters or fragments"
     );
-    if url.path().is_empty() || url.path() == "/" {
-        url.set_path("/ws/broker");
+    match url.path() {
+        "" | "/" => url.set_path("/ws/broker"),
+        "/ws/broker" => {}
+        _ => bail!("serverUrl path must be empty, '/', or '/ws/broker'"),
     }
     Ok(url.into())
 }
 
 /// `/ws/broker` WebSocket Upgrade 요청을 생성하고 `Authorization: Bearer <Agent 토큰>` 헤더를 설정합니다.
-/// - 토큰은 오직 `Authorization` 헤더로만 전달하며 URL 쿼리나 쿠키로 전달하지 않습니다.
+/// - 토큰은 오직 `/ws/broker` 경로의 `Authorization` 헤더로만 전달하며 URL 쿼리나 쿠키로 전달하지 않습니다.
 /// - 임의 `Origin`이나 `Cookie` 헤더를 추가하지 않습니다.
 /// - `HeaderValue::set_sensitive(true)`를 설정해 디버그 출력 시 헤더 값이 노출되지 않도록 보호합니다.
 pub fn build_upgrade_request(server_url: &str, token: &str) -> Result<Request<()>> {
@@ -354,7 +363,7 @@ fn classify_close_code(code: u16, was_connected: bool) -> Outcome {
     }
 }
 
-/// 단일 WebSocket 연결 세션을 수립하고 `BROKER_READY` 확인, `AGENT_PRESENCE` 보고 및 메시지 루프를 실행합니다.
+/// 단일 WebSocket 연결 세션을 수립하고 `BROKER_READY` 확인, 확인된 `AGENT_PRESENCE` 보고 및 메시지 루프를 실행합니다.
 async fn session(
     config: &Config,
     token: &str,
@@ -366,7 +375,7 @@ async fn session(
     }
 
     let Ok(request) = build_upgrade_request(&config.server_url, token) else {
-        return Outcome::AuthFailed;
+        return Outcome::ProtocolViolation;
     };
 
     // 웹소켓 프레임 및 메시지 최대 크기 제한 (64KB)
@@ -485,27 +494,30 @@ async fn session(
                                         return Outcome::Stopped;
                                     }
 
-                                    // 초기/재연결 BROKER_READY 수신 직후 현재 로컬 Agent 접속 상태를 AGENT_PRESENCE 1회로 전송
-                                    let presence_status = handle.current_presence().await;
-                                    let presence_json = serde_json::to_string(
-                                        &ClientMessage::agent_presence(presence_status),
-                                    )
-                                    .expect("serializable AGENT_PRESENCE protocol");
+                                    // 신뢰할 수 있는 현재 로컬 Agent 상태가 확인된 경우(Some(Online | Offline))에만
+                                    // 초기/재연결 BROKER_READY 직후 AGENT_PRESENCE를 1회 전송한다.
+                                    // 로컬 Agent 상태가 미확인(None)인 경우 추측하여 ONLINE/OFFLINE을 전송하지 않는다.
+                                    if let Some(presence_status) = handle.current_presence().await {
+                                        let presence_json = serde_json::to_string(
+                                            &ClientMessage::agent_presence(presence_status),
+                                        )
+                                        .expect("serializable AGENT_PRESENCE protocol");
 
-                                    let sent = tokio::select! {
-                                        _ = cancel.cancelled() => {
-                                            let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
-                                            return Outcome::Stopped;
-                                        }
-                                        sent = timeout(
-                                            Duration::from_secs(2),
-                                            socket.send(Message::Text(presence_json.into())),
-                                        ) => sent,
-                                    };
-                                    if !matches!(sent, Ok(Ok(()))) {
-                                        return Outcome::Retry {
-                                            was_connected: false,
+                                        let sent = tokio::select! {
+                                            _ = cancel.cancelled() => {
+                                                let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                                                return Outcome::Stopped;
+                                            }
+                                            sent = timeout(
+                                                Duration::from_secs(2),
+                                                socket.send(Message::Text(presence_json.into())),
+                                            ) => sent,
                                         };
+                                        if !matches!(sent, Ok(Ok(()))) {
+                                            return Outcome::Retry {
+                                                was_connected: false,
+                                            };
+                                        }
                                     }
 
                                     ready = true;
@@ -565,7 +577,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoint_url_normalizes_root_to_ws_broker_and_preserves_custom_path() {
+    fn endpoint_url_normalizes_root_and_rejects_non_broker_paths() {
         assert_eq!(
             endpoint_url("ws://localhost:8080").unwrap(),
             "ws://localhost:8080/ws/broker"
@@ -578,7 +590,19 @@ mod tests {
             endpoint_url("ws://127.0.0.1:9000/ws/broker").unwrap(),
             "ws://127.0.0.1:9000/ws/broker"
         );
-        assert!(endpoint_url("ws://localhost:8080/ws/broker?token=abc").is_err());
+        for invalid in [
+            "ws://localhost:8080/custom",
+            "ws://localhost:8080/ws/broker/",
+            "ws://localhost:8080/ws/broker/extra",
+            "ws://localhost:8080/ws",
+            "ws://localhost:8080/ws/broker?token=abc",
+            "ws://localhost:8080/ws/broker#frag",
+        ] {
+            assert!(
+                endpoint_url(invalid).is_err(),
+                "endpoint_url must reject disallowed URL: {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -605,6 +629,15 @@ mod tests {
             !debug_output.contains(secret),
             "Debug formatting of upgrade request must not expose token"
         );
+
+        assert!(build_upgrade_request("ws://127.0.0.1:8080/other", secret).is_err());
+    }
+
+    #[tokio::test]
+    async fn central_state_defaults_to_unknown_local_presence() {
+        let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
+        let state = CentralState::new(status);
+        assert_eq!(state.presence().await, None);
     }
 
     #[tokio::test]

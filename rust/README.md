@@ -45,7 +45,7 @@ cargo run -p devlink-cli -- stop
 
 빌드한 실행 파일을 PATH에 추가하면 `devlink init`, `devlink start`, `devlink status`, `devlink stop`으로 사용할 수 있습니다. CLI가 종료되어도 브로커는 계속 실행되며 Windows에서 별도 콘솔 창을 만들지 않습니다. 운영체제 재부팅 후 자동 실행이나 Windows 서비스 등록은 포함하지 않습니다.
 
-Mock 서버를 Ctrl+C로 종료하면 `status`가 `Reconnecting`으로 바뀝니다. 같은 포트·토큰으로 서버를 다시 실행하면 `Connected`로 돌아옵니다. `Connected`는 `/ws/broker` WebSocket Upgrade 인증(`Authorization: Bearer <DEVLINK_TOKEN>`) 후 유효한 `BROKER_READY` 수신 및 초기 `AGENT_PRESENCE` 보고까지 마친 상태입니다. Upgrade `401`/`403` 또는 종료 코드 `4001`은 `AuthFailed`, 동일 Agent의 새 연결 교체(`4002`)는 `Replaced`, 메시지/정책 위반(`1008` 또는 잘못된 `BROKER_READY`)은 `ProtocolViolation`이 되며 자동 재시도하지 않습니다. 토큰이나 설정을 고친 뒤 `stop`/`start`로 다시 시작합니다.
+Mock 서버를 Ctrl+C로 종료하면 `status`가 `Reconnecting`으로 바뀝니다. 같은 포트·토큰으로 서버를 다시 실행하면 `Connected`로 돌아옵니다. `Connected`는 `/ws/broker` WebSocket Upgrade 인증(`Authorization: Bearer <DEVLINK_TOKEN>`) 후 유효한 `BROKER_READY` 수신(확인된 로컬 Agent 상태가 있는 경우 초기 `AGENT_PRESENCE` 보고 포함; 로컬 상태 미확인 시 추측한 `AGENT_PRESENCE`는 전송하지 않음)까지 마친 상태입니다. Upgrade `401`/`403` 또는 종료 코드 `4001`은 `AuthFailed`, 동일 Agent의 새 연결 교체(`4002`)는 `Replaced`, 메시지/정책 위반(`1008` 또는 잘못된 `BROKER_READY`)은 `ProtocolViolation`이 되며 자동 재시도하지 않습니다. 토큰이나 설정을 고친 뒤 `stop`/`start`로 다시 시작합니다.
 
 ## 설정
 
@@ -64,7 +64,7 @@ cargo run -p devlink-cli -- --config .\.devlink\config.json start
 
 | 키 | 기본값 | 제약 |
 | --- | --- | --- |
-| `serverUrl` | `ws://localhost:8080` | ws/wss URL. 사용자 정보·쿼리·프래그먼트 금지 |
+| `serverUrl` | `ws://localhost:8080` | ws/wss URL. 경로는 비어 있거나 `/` 또는 `/ws/broker`만 허용. 사용자 정보·쿼리·프래그먼트 금지 |
 | `agent` | `codex` | 영문·숫자·`-`·`_`, 1~64자 |
 | `autoReconnect` | `true` | JSON boolean |
 | `localPort` | `43127` | 0~65535, 0은 OS 자동 할당 |

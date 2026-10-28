@@ -127,6 +127,17 @@ fn config_create_show_update_and_validation() {
     assert!(f.ok(&["config"]).contains("serverUrl"));
     f.ok(&["config", "set", "agent", "test-agent"]);
     f.ok(&["config", "set", "autoReconnect", "false"]);
+    f.ok(&[
+        "config",
+        "set",
+        "serverUrl",
+        "ws://localhost:8080/ws/broker",
+    ]);
+    assert_eq!(
+        Config::load(&f.path).unwrap().server_url,
+        "ws://localhost:8080/ws/broker"
+    );
+    f.ok(&["config", "set", "serverUrl", "ws://localhost:8080"]);
     assert_eq!(Config::load(&f.path).unwrap().agent, "test-agent");
     assert!(!Config::load(&f.path).unwrap().auto_reconnect);
     let before = std::fs::read(&f.path).unwrap();
@@ -136,6 +147,13 @@ fn config_create_show_update_and_validation() {
         ["config", "set", "autoReconnect", "123"],
         ["config", "set", "serverUrl", "https://example.com"],
         ["config", "set", "serverUrl", "ws://user:password@localhost"],
+        ["config", "set", "serverUrl", "ws://localhost:8080/custom"],
+        [
+            "config",
+            "set",
+            "serverUrl",
+            "ws://localhost:8080/ws/broker/",
+        ],
         ["config", "set", "reconnectInitialMs", "0"],
         ["config", "set", "unknown", "value"],
     ] {
@@ -333,7 +351,9 @@ async fn simultaneous_start_cannot_spawn_two_brokers() {
 async fn crash_releases_os_lock_and_stale_runtime_is_recovered() {
     let f = Fixture::new();
     let mut child = OwnedProcess(f.command(&["broker"]).spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let startup_timeout =
+        Duration::from_secs(8) + devlink_broker::credentials::startup_validation_allowance();
+    let deadline = Instant::now() + startup_timeout;
     loop {
         if let Ok(runtime) = Runtime::load(&f.path)
             && runtime.health().await.is_ok()
@@ -521,53 +541,48 @@ impl Mock {
                         return;
                     }
 
+                    match behavior {
+                        Behavior::CloseReplaced4002 => {
+                            let _ = socket
+                                .close(Some(CloseFrame {
+                                    code: 4002.into(),
+                                    reason: "Replaced by newer connection".into(),
+                                }))
+                                .await;
+                            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                                while let Some(Ok(msg)) = socket.next().await {
+                                    if msg.is_close() {
+                                        break;
+                                    }
+                                }
+                            })
+                            .await;
+                            return;
+                        }
+                        Behavior::ClosePolicyViolation1008 => {
+                            let _ = socket
+                                .close(Some(CloseFrame {
+                                    code: 1008.into(),
+                                    reason: "Invalid message".into(),
+                                }))
+                                .await;
+                            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                                while let Some(Ok(msg)) = socket.next().await {
+                                    if msg.is_close() {
+                                        break;
+                                    }
+                                }
+                            })
+                            .await;
+                            return;
+                        }
+                        _ => {}
+                    }
+
                     while let Some(Ok(message)) = socket.next().await {
                         match message {
                             Message::Text(text) => {
                                 received.lock().await.push(text.to_string());
-                                match behavior {
-                                    Behavior::CloseReplaced4002 => {
-                                        let _ = socket
-                                            .close(Some(CloseFrame {
-                                                code: 4002.into(),
-                                                reason: "Replaced by newer connection".into(),
-                                            }))
-                                            .await;
-                                        let _ = tokio::time::timeout(
-                                            Duration::from_millis(500),
-                                            async {
-                                                while let Some(Ok(msg)) = socket.next().await {
-                                                    if msg.is_close() {
-                                                        break;
-                                                    }
-                                                }
-                                            },
-                                        )
-                                        .await;
-                                        return;
-                                    }
-                                    Behavior::ClosePolicyViolation1008 => {
-                                        let _ = socket
-                                            .close(Some(CloseFrame {
-                                                code: 1008.into(),
-                                                reason: "Invalid message".into(),
-                                            }))
-                                            .await;
-                                        let _ = tokio::time::timeout(
-                                            Duration::from_millis(500),
-                                            async {
-                                                while let Some(Ok(msg)) = socket.next().await {
-                                                    if msg.is_close() {
-                                                        break;
-                                                    }
-                                                }
-                                            },
-                                        )
-                                        .await;
-                                        return;
-                                    }
-                                    _ => {}
-                                }
                             }
                             Message::Ping(payload) => {
                                 if socket.send(Message::Pong(payload)).await.is_err() {
@@ -600,36 +615,24 @@ impl Mock {
 async fn websocket_auth_disconnect_restart_and_reconnect() {
     let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 11 }).await;
     let f = Fixture::new();
+    // 1. Root URL (`ws://<addr>`) is normalized to `/ws/broker`
     f.configure(|config| config.server_url = format!("ws://{}", server.address));
     f.ok(&["start"]);
     f.wait_status(ConnectionStatus::Connected).await;
     assert!(f.ok(&["status"]).contains("Connected"));
 
-    // Initial BROKER_READY must trigger exactly 1 AGENT_PRESENCE (default OFFLINE in Stage 2)
-    // and never send legacy auth/hello or close the connection after reporting OFFLINE.
-    {
-        let msgs = server.received.lock().await;
-        assert_eq!(
-            msgs.len(),
-            1,
-            "Expected exactly 1 message after BROKER_READY"
-        );
-        let parsed: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
-        assert_eq!(
-            parsed,
-            serde_json::json!({
-                "type": "AGENT_PRESENCE",
-                "payload": {
-                    "status": "OFFLINE"
-                }
-            })
-        );
-    }
+    // In default CLI broker start, local Agent state is unconfirmed (`None`),
+    // so the broker must NOT guess or send `AGENT_PRESENCE` (`ONLINE` or `OFFLINE`),
+    // and must never send legacy `auth`/`hello`.
     sleep(Duration::from_millis(120)).await;
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Broker must not send guessed AGENT_PRESENCE when local Agent status is unknown"
+    );
     assert_eq!(
         f.health().await.central_server,
         ConnectionStatus::Connected,
-        "Central WebSocket must remain Connected after reporting OFFLINE without ACK"
+        "Central WebSocket must remain Connected after BROKER_READY when local status is unknown"
     );
 
     // Ensure agent_id is NOT persisted to broker.json in Stage 2
@@ -647,26 +650,39 @@ async fn websocket_auth_disconnect_restart_and_reconnect() {
 
     let server = Mock::start(&address.to_string(), Behavior::Ready { agent_id: 11 }).await;
     f.wait_status(ConnectionStatus::Connected).await;
-    {
-        let msgs = server.received.lock().await;
-        assert_eq!(
-            msgs.len(),
-            1,
-            "Reconnect BROKER_READY must trigger 1 fresh AGENT_PRESENCE"
-        );
-        let parsed: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
-        assert_eq!(
-            parsed,
-            serde_json::json!({
-                "type": "AGENT_PRESENCE",
-                "payload": {
-                    "status": "OFFLINE"
-                }
-            })
-        );
-    }
-
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Reconnect with unknown local Agent status must not send guessed AGENT_PRESENCE"
+    );
     f.ok(&["stop"]);
+
+    // 2. Explicit `/ws/broker` URL (`ws://<addr>/ws/broker`) also connects to `/ws/broker`
+    f.configure(|config| config.server_url = format!("ws://{}/ws/broker", server.address));
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Connected).await;
+    f.ok(&["stop"]);
+
+    // 3. Disallowed custom path (`ws://<addr>/other`) is rejected before opening a socket;
+    //    the Mock server receives 0 additional attempts so the Bearer token is never sent to `/other`.
+    let attempts_before = server.attempts.load(Ordering::SeqCst);
+    let bad_config = Config {
+        server_url: format!("ws://{}/other", server.address),
+        ..Config::default()
+    };
+    let bad_status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
+    let bad_state = CentralState::new(bad_status);
+    let bad_cancel = CancellationToken::new();
+    central::run_with_state(bad_config, TOKEN.to_string(), bad_state.clone(), bad_cancel).await;
+    assert_eq!(
+        bad_state.status().await,
+        ConnectionStatus::ProtocolViolation
+    );
+    assert_eq!(
+        server.attempts.load(Ordering::SeqCst),
+        attempts_before,
+        "Bearer token must never be transmitted to a disallowed serverUrl path"
+    );
+
     server.stop().await;
 }
 
@@ -836,7 +852,7 @@ async fn silent_broker_ready_waits_in_authenticating_then_retries_or_disconnects
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn central_state_tracks_active_identity_and_reports_online_or_offline_presence() {
+async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_online_presence() {
     let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 42 }).await;
     let config = Config {
         server_url: format!("ws://{}", server.address),
@@ -848,7 +864,8 @@ async fn central_state_tracks_active_identity_and_reports_online_or_offline_pres
 
     let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
     let identity = Arc::new(RwLock::new(None));
-    let presence = Arc::new(RwLock::new(PresenceStatus::Online));
+    // Case 1: Local Agent status is unknown (`None`) -> must NOT send guessed AGENT_PRESENCE
+    let presence = Arc::new(RwLock::new(None));
     let state = CentralState::with_details(status.clone(), identity.clone(), presence.clone());
     let cancel = CancellationToken::new();
 
@@ -872,23 +889,14 @@ async fn central_state_tracks_active_identity_and_reports_online_or_offline_pres
             agent_id: 42,
         })
     );
-    {
-        let msgs = server.received.lock().await;
-        assert_eq!(msgs.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
-        assert_eq!(
-            parsed,
-            serde_json::json!({
-                "type": "AGENT_PRESENCE",
-                "payload": {
-                    "status": "ONLINE"
-                }
-            })
-        );
-    }
+    sleep(Duration::from_millis(80)).await;
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Unknown local Agent status (None) must not send guessed AGENT_PRESENCE"
+    );
 
-    // Update local Agent presence to OFFLINE, then disconnect server to verify identity invalidation & new READY
-    *presence.write().await = PresenceStatus::Offline;
+    // Case 2: Local Agent status is confirmed OFFLINE (`Some(PresenceStatus::Offline)`)
+    *presence.write().await = Some(PresenceStatus::Offline);
     let address = server.address;
     server.stop().await;
 
@@ -911,7 +919,7 @@ async fn central_state_tracks_active_identity_and_reports_online_or_offline_pres
     while state.status().await != ConnectionStatus::Connected {
         assert!(
             Instant::now() < deadline,
-            "Timed out waiting for reconnect Connected"
+            "Timed out waiting for reconnect Connected (Offline)"
         );
         sleep(Duration::from_millis(20)).await;
     }
@@ -933,6 +941,52 @@ async fn central_state_tracks_active_identity_and_reports_online_or_offline_pres
                 "type": "AGENT_PRESENCE",
                 "payload": {
                     "status": "OFFLINE"
+                }
+            })
+        );
+    }
+
+    // Case 3: Local Agent status is confirmed ONLINE (`Some(PresenceStatus::Online)`)
+    *presence.write().await = Some(PresenceStatus::Online);
+    server.stop().await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status().await != ConnectionStatus::Reconnecting {
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for second Reconnecting"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(state.identity().await, None);
+
+    let server = Mock::start(&address.to_string(), Behavior::Ready { agent_id: 99 }).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status().await != ConnectionStatus::Connected {
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for reconnect Connected (Online)"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        state.identity().await,
+        Some(CentralIdentity {
+            connection_id: "conn-1".into(),
+            agent_id: 99,
+        })
+    );
+    {
+        let msgs = server.received.lock().await;
+        assert_eq!(msgs.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "type": "AGENT_PRESENCE",
+                "payload": {
+                    "status": "ONLINE"
                 }
             })
         );
@@ -1046,7 +1100,9 @@ async fn mcp_local_token_survives_crash_restart() {
 
     // 3. broker를 직접 자식 프로세스로 실행하고 Health 준비를 기다린다.
     let mut child = OwnedProcess(f.command(&["broker"]).spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let startup_timeout =
+        Duration::from_secs(8) + devlink_broker::credentials::startup_validation_allowance();
+    let deadline = Instant::now() + startup_timeout;
     loop {
         if let Ok(runtime) = Runtime::load(&f.path)
             && runtime.health().await.is_ok()
