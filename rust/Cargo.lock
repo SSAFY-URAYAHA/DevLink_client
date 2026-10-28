@@ -267,6 +267,7 @@ dependencies = [
  "dirs",
  "fs2",
  "futures-util",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
