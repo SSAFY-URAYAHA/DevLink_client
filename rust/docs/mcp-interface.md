@@ -2,6 +2,12 @@
 
 상태: **사용자 결정으로 기존 MCP v0.1 규칙을 Rust 구현 기준으로 채택. Rust 대응 구현·상호 검증은 미완료**. 작성일 2026-10-26, 결정 상태 갱신일 2026-10-27 (Asia/Seoul).
 
+## 2026-10-28 중앙 WebSocket 규칙 확인
+
+중앙 서버의 보안 전략과 2026-10-27 작업 기록을 확인해 [중앙 WebSocket 연동 규칙](central-websocket-contract.md)에 Rust 적용 기준을 기록했습니다. `/ws/broker`의 Agent 토큰 인증, `BROKER_READY`, `AGENT_PRESENCE`, 동일 Agent 연결 교체·종료 보호는 문서에 정의돼 있으므로 해당 규칙을 따릅니다. 아래의 포괄적인 중앙 인증·메시지 협의 표기는 이 구체적인 규칙과 후속 항목을 구분해 읽습니다.
+
+중앙은 인증 Principal과 DB의 Agent 소유자·팀을 검증합니다. READY에는 `connection_id`와 숫자 `agent_id`만 있으며 사용자·팀 필드를 추가하는 계약은 없습니다. MCP 세션 principal에 필요한 `userId/teamId` 전달 경로와 최초 Agent 등록·토큰 발급 흐름의 연결은 별도 후속 항목입니다. 중앙 Heartbeat의 20초·20초·40초는 초기안이며 현재 Rust의 5초 Ping·15초 초과 무응답 판정과 정합성을 확인해야 합니다. 로컬 세션 상태에 따른 실시간 presence와 업무 라우팅·수신함 ACK도 남아 있습니다.
+
 ## 협의 상태와 결정 범위
 
 2026-10-27 저장소의 [MCP → 로컬 브로커 계약 v0.1](../../packages/mcp-server/docs/broker-contract-v0.1.md)과 `packages/mcp-server/src/broker/`의 현재 규칙을 Rust 구현 기준으로 채택합니다. 브로커 재시작 후 소유권은 먼저 유효하게 복구한 인스턴스가 해당 Agent의 빈 슬롯을 확보하는 방식으로 정합니다. 이전 소유자는 보존하지 않습니다.

@@ -110,4 +110,6 @@ Central Server: Connected
 
 테스트는 임시 디렉터리·동적 포트를 사용하며 사용자 설정을 변경하지 않습니다. 독립 실행, 동시 시작, 중복 방지, 정상/강제 종료, 포트 충돌, 토큰 비노출, 설정 오류, 로컬 API 인증, WebSocket 인증·서버 재시작·재연결·재시도 중 종료를 검증합니다.
 
-[TypeScript 분석](docs/typescript-analysis.md), [MCP 실행 구조 및 내부 API 초안](docs/mcp-interface.md), [작업별 현황](docs/task-status.md)을 참고하세요. MCP 담당자와의 합의, 실제 MCP Tool과 중앙 서버 운영 프로토콜은 후속 협의 대상입니다.
+[중앙 WebSocket 연동 규칙](docs/central-websocket-contract.md)에 중앙 서버의 보안 전략·2026-10-27 작업 기록을 기준으로 인증, READY·PRESENCE, 연결 교체·종료 규칙과 Rust 적용 현황을 정리했습니다. 해당 규칙을 구현 기준으로 사용하며, Heartbeat 초기안과 MCP 신원 전달·업무 라우팅의 후속 항목은 별도로 표시합니다.
+
+[TypeScript 분석](docs/typescript-analysis.md), [MCP 실행 구조 및 내부 API 초안](docs/mcp-interface.md), [작업별 현황](docs/task-status.md)을 참고하세요. 실제 MCP Tool·중앙 서버 연동 검증과 아직 명시되지 않은 업무 메시지 계약은 후속 작업입니다.
