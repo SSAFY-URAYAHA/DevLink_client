@@ -8,11 +8,11 @@ use crate::{
     protocol::{ClientMessage, PresenceStatus, ServerMessage},
 };
 use anyhow::{Result, bail, ensure};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::{
-    sync::RwLock,
+    sync::{RwLock, watch},
     time::{Instant, sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::{
@@ -64,7 +64,7 @@ pub type SharedIdentity = Arc<RwLock<Option<CentralIdentity>>>;
 /// - `None`: 로컬 Agent 상태 미확인 (추측하여 `ONLINE`/`OFFLINE`을 보고하지 않음)
 /// - `Some(PresenceStatus::Offline)`: 로컬 Agent 연결이 없다고 확인된 상태
 /// - `Some(PresenceStatus::Online)`: 로컬 Agent 연결이 있다고 확인된 상태
-pub type SharedPresence = Arc<RwLock<Option<PresenceStatus>>>;
+pub type SharedPresence = watch::Sender<Option<PresenceStatus>>;
 
 #[derive(Debug)]
 struct StateInner {
@@ -88,11 +88,7 @@ impl CentralState {
     /// 2단계에서는 로컬 Agent 상태 감지 및 `/v1/sessions/*` API가 아직 연결되지 않았으므로
     /// 로컬 Agent 상태를 추측하지 않고 미확인(`None`)으로 초기화합니다.
     pub fn new(status: SharedStatus) -> Self {
-        Self::with_details(
-            status,
-            Arc::new(RwLock::new(None)),
-            Arc::new(RwLock::new(None)),
-        )
+        Self::with_details(status, Arc::new(RwLock::new(None)), watch::channel(None).0)
     }
 
     /// 외부에서 상태·식별자·확인된 로컬 Agent 접속 상태(`Option<PresenceStatus>`)를 주입하여 생성합니다.
@@ -137,7 +133,19 @@ impl CentralState {
 
     /// 현재 확인된 로컬 Agent 접속 상태를 조회합니다 (`None`이면 미확인).
     pub async fn presence(&self) -> Option<PresenceStatus> {
-        *self.presence.read().await
+        *self.presence.borrow()
+    }
+
+    /// 로컬 세션 관리가 확인한 현재 상태를 게시합니다.
+    /// 동일 상태는 재전송하지 않으며, 연결 전·재접속 중 갱신도 다음 READY까지 보존합니다.
+    pub fn set_presence(&self, status: PresenceStatus) {
+        self.presence.send_if_modified(|current| {
+            if *current == Some(status) {
+                return false;
+            }
+            *current = Some(status);
+            true
+        });
     }
 }
 
@@ -203,7 +211,7 @@ impl SessionHandle {
 
     /// 현재 확인된 로컬 Agent의 접속 상태(`Some(Online)` / `Some(Offline)` / 미확인 `None`)를 읽습니다.
     pub async fn current_presence(&self) -> Option<PresenceStatus> {
-        *self.state.presence.read().await
+        *self.state.presence.borrow()
     }
 }
 
@@ -363,6 +371,30 @@ fn classify_close_code(code: u16, was_connected: bool) -> Outcome {
     }
 }
 
+/// READY 직후와 상태 변경 보고에 동일한 전송 제한·종료 처리를 적용합니다.
+async fn send_presence<S: Sink<Message> + Unpin>(
+    socket: &mut S,
+    status: PresenceStatus,
+    cancel: &CancellationToken,
+    was_connected: bool,
+) -> Result<(), Outcome> {
+    let text = serde_json::to_string(&ClientMessage::agent_presence(status))
+        .expect("serializable AGENT_PRESENCE protocol");
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            let _ = timeout(Duration::from_secs(1), socket.send(Message::Close(None))).await;
+            Err(Outcome::Stopped)
+        }
+        sent = timeout(Duration::from_secs(2), socket.send(Message::Text(text.into()))) => {
+            if matches!(sent, Ok(Ok(()))) {
+                Ok(())
+            } else {
+                Err(Outcome::Retry { was_connected })
+            }
+        }
+    }
+}
+
 /// 단일 WebSocket 연결 세션을 수립하고 `BROKER_READY` 확인, 확인된 `AGENT_PRESENCE` 보고 및 메시지 루프를 실행합니다.
 async fn session(
     config: &Config,
@@ -370,6 +402,9 @@ async fn session(
     handle: &SessionHandle,
     cancel: &CancellationToken,
 ) -> Outcome {
+    // 연결 전부터 구독해 READY 수신과 구독 사이의 상태 변경을 놓치지 않습니다.
+    let mut presence = handle.state.presence.subscribe();
+    let mut last_presence = None;
     if !handle.mark_connecting().await {
         return Outcome::Stopped;
     }
@@ -440,6 +475,22 @@ async fn session(
                 };
             }
 
+            // READY 이후 현재 연결에서 변경된 최신 상태만 전송합니다.
+            changed = presence.changed(), if ready => {
+                if changed.is_err() {
+                    return Outcome::Stopped;
+                }
+                let current = *presence.borrow_and_update();
+                if let Some(current) = current
+                    && last_presence != Some(current)
+                {
+                    if let Err(outcome) = send_presence(&mut socket, current, cancel, true).await {
+                        return outcome;
+                    }
+                    last_presence = Some(current);
+                }
+            }
+
             // 주기적 하트비트(Ping) 전송 및 15초 이상 서버 응답 부재 시 재연결
             _ = heartbeat.tick(), if ready => {
                 if last_seen.elapsed() > Duration::from_secs(15) {
@@ -497,27 +548,12 @@ async fn session(
                                     // 신뢰할 수 있는 현재 로컬 Agent 상태가 확인된 경우(Some(Online | Offline))에만
                                     // 초기/재연결 BROKER_READY 직후 AGENT_PRESENCE를 1회 전송한다.
                                     // 로컬 Agent 상태가 미확인(None)인 경우 추측하여 ONLINE/OFFLINE을 전송하지 않는다.
-                                    if let Some(presence_status) = handle.current_presence().await {
-                                        let presence_json = serde_json::to_string(
-                                            &ClientMessage::agent_presence(presence_status),
-                                        )
-                                        .expect("serializable AGENT_PRESENCE protocol");
-
-                                        let sent = tokio::select! {
-                                            _ = cancel.cancelled() => {
-                                                let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
-                                                return Outcome::Stopped;
-                                            }
-                                            sent = timeout(
-                                                Duration::from_secs(2),
-                                                socket.send(Message::Text(presence_json.into())),
-                                            ) => sent,
-                                        };
-                                        if !matches!(sent, Ok(Ok(()))) {
-                                            return Outcome::Retry {
-                                                was_connected: false,
-                                            };
+                                    let current = *presence.borrow_and_update();
+                                    if let Some(current) = current {
+                                        if let Err(outcome) = send_presence(&mut socket, current, cancel, false).await {
+                                            return outcome;
                                         }
+                                        last_presence = Some(current);
                                     }
 
                                     ready = true;

@@ -1,5 +1,39 @@
 # 로컬 검증 기록
 
+## 2026-10-28: 작업 현황 점검에서 재확인
+
+`feature/rust/broekr_sessionapi`의 HEAD `037810b`와 미커밋 presence·통합 검사 보완을 포함한 로컬 작업 트리에서 다음 결과를 재확인했습니다. 아래 검사는 문서 갱신 직전의 작업 현황 점검에서 실행했으며 문서 수정 후 기능 검사를 새로 실행했다는 의미는 아닙니다.
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo check --offline --locked --workspace --all-targets` | 통과. 증분 캐시 hard link 실패 시 파일 복사로 대체하는 경고 발생 |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 13개·통합 27개 통과, 실패 0 |
+| `npm.cmd test` (`packages/mcp-server/`) | TypeScript 빌드·공유 계약 검사·100개 테스트 통과, 실패 0 |
+
+Rust와 MCP의 ACL·로컬 HTTP/WebSocket 테스트는 승인된 샌드박스 외부 실행에서 통과했습니다. MCP 테스트의 샌드박스 내부 시도에서는 로컬 통신·권한 검사가 포함된 항목에 실패가 발생해 중단했고, 외부에서 전체를 재실행했습니다. 이 점검에서는 Clippy·일반/릴리스 빌드·Rust 준비 상태 재현 도구를 다시 실행하지 않았습니다. 해당 결과는 아래의 기존 기록과 구분합니다.
+
+이번 테스트는 로컬 테스트 서버·가짜 브로커·임시 자격 파일을 사용했습니다. 실제 중앙 인증·DB 갱신·검증된 사용자/팀 신원 전달·Rust 세션/업무 API·두 사용자 업무 왕복의 통과를 의미하지 않습니다. GitHub 연결에서 저장소 검색 접근 오류가 발생해 원격 PR·이슈·최신 브랜치 상태는 확인하지 못했습니다.
+
+## 2026-10-28: 통합 검사 도구 호환성·presence 변경 보고 보완
+
+기준 브랜치는 `feature/rust/broekr_sessionapi`, 병합 기준은 `037810b`다. 격리 Rust 재현 도구의 중앙 주소를 `/ws/broker`로 변경하고, MCP 준비 상태 검사기에 `Replaced`·`ProtocolViolation`을 추가했다. 두 상태도 유효한 health로 인식한 뒤 `CENTRAL_NOT_CONNECTED`로 보고하고 11개 경로 검사를 계속한다.
+
+Rust는 HTTP 핸들러와 중앙 연결 태스크가 같은 `CentralState`를 공유한다. `set_presence`에 확인된 상태를 게시하면 READY 이후 현재 연결에서 보고하며, 동일 상태는 중복 전송하지 않는다. 연결 전·재접속 중에는 최신 상태를 보존하고 다음 READY 직후 보고한다. 기본 미확인 상태는 유지하며 실제 세션 API의 bind·해제·만료 이벤트 연결은 아직 남아 있다.
+
+Windows MSVC와 Node.js 24 환경에서 다음 검사를 수행했다. ACL·로컬 HTTP/WebSocket 검사는 샌드박스 밖에서 실행했다. 앞선 병렬 검토에서 5초 종료 시간 조건 실패가 관측되어 이번 전체 Rust 검증은 순차 실행했다.
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo check --offline --locked --workspace --all-targets` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 13개·통합 27개 통과 |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| `npm.cmd test` (`packages/mcp-server/`) | 빌드·공유 계약 검사·100개 테스트 통과 |
+| 실제 CLI로 `scripts/verify-rust-readiness.mjs --cli <절대 경로>` 실행 | 자격 파일 valid, health 200, 세션·업무 11개 OPTIONS 404, `blocked` 및 실제 자식 종료 코드 2 확인 |
+
+presence 검증은 실제 로컬 WebSocket 테스트 서버에서 READY 전 전송 보류, 연결 유지 중 ONLINE/OFFLINE 변경, 동일 상태 중복 생략, ACK 없이 연속 보고, 재접속 중 최신 상태 보존·READY 직후 재보고, 종료 후 식별자 정리를 확인했다. 실제 중앙 서버·운영 토큰·DB·실제 Host 세션을 사용한 검증은 아니다. 격리 재현은 중앙 503 서버와 미구현 API를 의도적으로 사용하므로 차단 판정이 예상 결과이며 MVP 통과를 뜻하지 않는다.
+
 ## 2026-10-28: PR #11 P2 후속 수정 (S15P31D108-46)
 
 최신 develop `69f155a`에서 확인한 Unix `libc` 의존성 누락과 Windows ACL 검사·기동 시간 예산 충돌을 수정했습니다. Unix 전용 직접 의존성을 workspace manifest와 lockfile에 반영했으며, Windows 시작 대기는 기존 준비 여유 8초에 최대 3회 ACL 검사(각 5초)를 포함한 23초입니다. Unix 시작 대기는 기존 8초를 유지합니다. 권한 검사는 생략하지 않습니다.

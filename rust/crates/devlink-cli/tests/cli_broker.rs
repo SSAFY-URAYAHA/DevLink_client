@@ -609,6 +609,22 @@ impl Mock {
         // Await cancellation so both listening socket and accepted sockets have been dropped.
         let _ = self.task.await;
     }
+
+    async fn wait_messages(&self, count: usize) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let messages = self.received.lock().await;
+            if messages.len() >= count {
+                return messages
+                    .iter()
+                    .map(|message| serde_json::from_str(message).unwrap())
+                    .collect();
+            }
+            drop(messages);
+            assert!(Instant::now() < deadline, "Timed out waiting for presence");
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -865,7 +881,7 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
     let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
     let identity = Arc::new(RwLock::new(None));
     // Case 1: Local Agent status is unknown (`None`) -> must NOT send guessed AGENT_PRESENCE
-    let presence = Arc::new(RwLock::new(None));
+    let presence = tokio::sync::watch::channel(None).0;
     let state = CentralState::with_details(status.clone(), identity.clone(), presence.clone());
     let cancel = CancellationToken::new();
 
@@ -896,7 +912,6 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
     );
 
     // Case 2: Local Agent status is confirmed OFFLINE (`Some(PresenceStatus::Offline)`)
-    *presence.write().await = Some(PresenceStatus::Offline);
     let address = server.address;
     server.stop().await;
 
@@ -913,6 +928,9 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         None,
         "Previous connection_id and agent_id must be invalidated on disconnect"
     );
+    // 재접속 대기 중에도 최신 상태만 보존하고 다음 READY 뒤에 보고합니다.
+    state.set_presence(PresenceStatus::Online);
+    state.set_presence(PresenceStatus::Offline);
 
     let server = Mock::start(&address.to_string(), Behavior::Ready { agent_id: 42 }).await;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -932,11 +950,10 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         })
     );
     {
-        let msgs = server.received.lock().await;
+        let msgs = server.wait_messages(1).await;
         assert_eq!(msgs.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
         assert_eq!(
-            parsed,
+            msgs[0],
             serde_json::json!({
                 "type": "AGENT_PRESENCE",
                 "payload": {
@@ -947,7 +964,6 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
     }
 
     // Case 3: Local Agent status is confirmed ONLINE (`Some(PresenceStatus::Online)`)
-    *presence.write().await = Some(PresenceStatus::Online);
     server.stop().await;
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -959,6 +975,7 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(state.identity().await, None);
+    state.set_presence(PresenceStatus::Online);
 
     let server = Mock::start(&address.to_string(), Behavior::Ready { agent_id: 99 }).await;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -978,11 +995,10 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         })
     );
     {
-        let msgs = server.received.lock().await;
+        let msgs = server.wait_messages(1).await;
         assert_eq!(msgs.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
         assert_eq!(
-            parsed,
+            msgs[0],
             serde_json::json!({
                 "type": "AGENT_PRESENCE",
                 "payload": {
@@ -997,6 +1013,136 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
     assert_eq!(state.status().await, ConnectionStatus::Disconnected);
     assert_eq!(state.identity().await, None);
     server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn presence_changes_use_the_current_connection_without_duplicates_or_ack() {
+    let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 42 }).await;
+    let config = Config {
+        server_url: format!("ws://{}", server.address),
+        ..Config::default()
+    };
+    let state = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)));
+    let cancel = CancellationToken::new();
+    let runner = tokio::spawn(central::run_with_state(
+        config,
+        TOKEN.into(),
+        state.clone(),
+        cancel.clone(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status().await != ConnectionStatus::Connected {
+        assert!(Instant::now() < deadline, "Timed out waiting for Connected");
+        sleep(Duration::from_millis(10)).await;
+    }
+    // 로컬 상태 미확인 시에는 READY만으로 ONLINE/OFFLINE을 만들지 않습니다.
+    assert!(server.received.lock().await.is_empty());
+    state.set_presence(PresenceStatus::Online);
+    server.wait_messages(1).await;
+    state.set_presence(PresenceStatus::Online);
+    state.set_presence(PresenceStatus::Offline);
+    let messages = server.wait_messages(2).await;
+    assert_eq!(
+        messages,
+        vec![
+            serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"ONLINE"}}),
+            serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"OFFLINE"}}),
+        ]
+    );
+    assert_eq!(server.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.status().await, ConnectionStatus::Connected);
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(3), runner)
+        .await
+        .unwrap()
+        .unwrap();
+    state.set_presence(PresenceStatus::Online);
+    assert_eq!(server.received.lock().await.len(), 2);
+    assert_eq!(state.identity().await, None);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn presence_waits_for_ready_and_reports_only_the_latest_confirmed_state() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (messages_tx, mut messages_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        accepted_tx.send(()).unwrap();
+        tokio::select! {
+            _ = release_rx => {},
+            message = socket.next() => panic!("Unexpected frame before READY: {message:?}"),
+        }
+        socket
+            .send(Message::Text(
+                r#"{"type":"BROKER_READY","payload":{"connection_id":"gated","agent_id":42}}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        while let Some(Ok(message)) = socket.next().await {
+            match message {
+                Message::Text(text) => messages_tx
+                    .send(serde_json::from_str::<serde_json::Value>(&text).unwrap())
+                    .unwrap(),
+                Message::Ping(payload) => socket.send(Message::Pong(payload)).await.unwrap(),
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+    let config = Config {
+        server_url: format!("ws://{address}"),
+        ..Config::default()
+    };
+    let state = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)));
+    // 수신자가 생기기 전 확인한 상태도 다음 READY까지 유지해야 합니다.
+    state.set_presence(PresenceStatus::Online);
+    let cancel = CancellationToken::new();
+    let runner = tokio::spawn(central::run_with_state(
+        config,
+        TOKEN.into(),
+        state.clone(),
+        cancel.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(3), accepted_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    state.set_presence(PresenceStatus::Offline);
+    // READY가 보류된 동안에는 presence도 보류합니다.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), messages_rx.recv())
+            .await
+            .is_err()
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), messages_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"OFFLINE"}})
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), messages_rx.recv())
+            .await
+            .is_err()
+    );
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(3), runner)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
