@@ -196,7 +196,7 @@ test('a shared failed session claim consumes one recovery attempt for concurrent
     return false;
   });
   const outcomes = await Promise.allSettled(Array.from({ length: 16 }, () => client.execute('get_tasks', {})));
-  assert.ok(outcomes.every((outcome) => outcome.status === 'rejected' && outcome.reason.code === 'BROKER_UNAVAILABLE'));
+  assert.ok(outcomes.every((outcome) => outcome.status === 'rejected' && outcome.reason.code === 'BROKER_CONNECTION_CLOSED'));
   const deadline = Date.now() + 1000;
   while (client.state !== 'bound' && Date.now() < deadline) await delay(10);
   assert.equal(client.state, 'bound');

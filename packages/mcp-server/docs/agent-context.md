@@ -52,4 +52,4 @@ debug 로그는 서버가 생성한 UUID requestId, 허용된 operation, 고정�
 
 현재 Rust의 `/v1/sessions`, bind/heartbeat/delete, 업무 route, 프로필별 localToken 발행·검증 및 중앙의 user/team/Agent 연결은 구현 전이다. 따라서 두 실제 Host가 Rust와 중앙 서버를 거쳐 구분되는 -62 수용 기준은 미검증이다. 로컬 테스트 통과나 스토리 커밋만으로 Jira Done 처리하지 않는다.
 
-업무 403과 로컬 자격 403의 구분, 오류 분류 전반·요청 키·업무별 제한 시간 정리는 -63 범위다. 현재 HTTP 403은 기존처럼 `BROKER_FORBIDDEN`으로 세션을 중단하므로 실제 업무 권한 오류의 보존은 후속 검증이 필요하다.
+2026-10-28 갱신: -63의 [공통 오류·시간 제한 계약](error-contract.md)에서 업무 403과 명시적 local_auth 거부를 구분했다. 업무 BROKER_FORBIDDEN은 세션을 영구 중단하지 않고 로컬 LOCAL_AUTH_FORBIDDEN은 중단한다. requestKey·원본 요청 ID 보존과 전체 시간 예산을 추가했으며 실제 Rust·중앙 계약 검증은 남아 있다.

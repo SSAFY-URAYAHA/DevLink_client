@@ -6,6 +6,8 @@ S15P31D108-59의 TypeScript·Node.js MCP 실행 기반, -60 로컬 브로커 호
 
 [인증 컨텍스트·프로필 자격 파일](docs/agent-context.md)에 -62의 처리 정책과 검증 범위를, [공유 계약](../../contracts/local-broker/v1/README.md)에 Rust 측에서 재사용할 JSON Schema와 fixture를 정리했습니다. 현재 Rust 구현은 `/health`·`/shutdown`만 제공하므로 세션·업무 API와 자격 파일 발행은 후속 연동이 필요합니다.
 
+[공통 오류·시간 제한 계약](docs/error-contract.md)은 -63의 오류 코드·원본 요청 식별자·requestKey 보존, 저장/전달 결과와 전체 호출 예산을 설명합니다. SDK의 입력 검증과 프로토콜 오류는 원래 wire id를 유지합니다.
+
 [도구 입력·결과 예제와 확장 방법](docs/tool-contracts-v0.1.md)에 7개 도구의 MCP 측 v0.1 JSON을 정리했습니다. Notion API 페이지가 빈 템플릿인 상태에서 선구현한 DTO이므로 도구 담당자의 필드 확인이 필요합니다.
 
 ## 설치와 실행
@@ -33,8 +35,12 @@ node packages/mcp-server/dist/index.js
 | 전송 방식 | `--transport` | `DEVLINK_MCP_TRANSPORT` | 필수, 현재 `stdio`만 지원 |
 | 로그 수준 | `--log-level` | `DEVLINK_MCP_LOG_LEVEL` | `debug`, `info`, `error`, 기본값 `info` |
 | 브로커 설정 파일 | 없음 | `DEVLINK_BROKER_FILE` | CLI가 발행한 사용자 전용 JSON 파일의 절대 경로, 업무 요청 시 검사 |
+| HTTP별 제한 | `--request-timeout-ms` | `DEVLINK_MCP_REQUEST_TIMEOUT_MS` | 1–300000 ms 정수, 소비자 기본 10000 |
+| 호출 전체 제한 | `--call-timeout-ms` | `DEVLINK_MCP_CALL_TIMEOUT_MS` | 대기·세션·등록·bind 포함, 소비자 기본 30000 ms |
 
 인자는 환경변수보다 우선합니다. 모르는 인자, 누락된 필수 설정, 지원하지 않는 값은 `CONFIG_INVALID`로 종료합니다. 로그에는 설정 필드명만 기록하고 입력값·토큰·임의 환경변수는 기록하지 않습니다. 브로커 파일을 찾거나 검증할 수 없으면 업무 도구가 `CREDENTIAL_FILE_INVALID`를 반환하며 진단은 계속 사용할 수 있습니다. 파일 형식과 권한은 HTTP 계약 문서를 따릅니다.
+
+제한 시간 기본값은 현재 소비자 설정이며 운영 SLA 합의가 아닙니다. 전체 예산을 넘거나 취소해도 중앙 작업을 FAILED로 바꾸거나 재전송하지 않습니다. 알려진 taskId/requestKey를 보존하되 응답을 받지 못해 모르는 값을 만들지는 않습니다.
 
 ## MCP Host 설정 예시
 
