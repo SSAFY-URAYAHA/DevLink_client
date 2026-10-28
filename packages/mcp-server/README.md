@@ -107,7 +107,7 @@ npm --prefix packages/mcp-server test
 
 테스트의 5초 제한은 테스트 실패를 감지하는 harness 값입니다. 브로커 요청·ACK·업무 처리의 운영 제한 시간이 아닙니다.
 
-2026-10-26에 Claude Code 2.1.310과 Codex CLI 0.164.0-alpha.11.1에서도 일회성 설정으로 `devlink_ping({})`의 실제 도구 호출과 결과를 확인했습니다. Codex 공유 데몬에서는 일회성 설정의 도구가 노출되지 않아 `--no-daemon` 실행으로 확인했습니다. 이는 최소 연결 점검이며 S15P31D108-64의 전체 오류·인증·브로커 호환성 검증은 후속 작업입니다.
+S15P31D108-64의 [실제 Host 호환성 실행기·검증 범위](docs/host-compatibility.md)는 Codex CLI와 Claude Code를 동일한 로컬 HTTP 테스트 브로커에 연결합니다. 오류·인증 컨텍스트·복구·자격 교체·종료를 실제 도구 이벤트와 대조하며, 비용이 발생하는 Host 실행은 `test:hosts`로 명시적으로 선택합니다. 실제 Rust의 세션·업무 API와 중앙 서비스 연동은 별도 확인이 필요합니다.
 
 ## 종료와 담당 경계
 

@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 
 /** Test double for the MCP-side draft contract. This is not the Rust implementation. */
 export async function fakeBroker({ profiles } = {}) {
@@ -7,12 +8,16 @@ export async function fakeBroker({ profiles } = {}) {
   const credentials = new Map((profiles ?? [{ localToken: token, userId: 'trusted-user', teamId: 'trusted-team' }])
     .map((profile) => [profile.localToken, profile]));
   const calls = [];
+  const arrivals = []; const responses = new Set();
   const sessions = new Map();
   const owners = new Map();
   const instances = new Map();
   let now = 0;
   let hook;
+  let businessHook;
   const server = createServer(async (req, res) => {
+    arrivals.push({ method: req.method, path: req.url });
+    responses.add(res); res.once('close', () => responses.delete(res));
     try {
       let text = '';
       for await (const chunk of req) text += chunk;
@@ -67,8 +72,9 @@ export async function fakeBroker({ profiles } = {}) {
       }
       const principal = session.view.principal;
       if (body.context.userId !== principal.userId || body.context.teamId !== principal.teamId || body.context.agentId !== principal.agentId || body.context.toolType !== principal.toolType) return send({ error: { code: 'FORBIDDEN' } }, 403);
+      if (body.operation !== 'register_agent' && !principal.agentId) return fail('AGENT_UNREGISTERED');
+      if (businessHook && await businessHook({ path, body, req, res, send, profile })) return;
       if (body.operation === 'register_agent') return send({ data: { agentId: principal.agentId ?? 'registered-agent' } });
-      if (!principal.agentId) return fail('AGENT_UNREGISTERED');
       return send({ data: { taskId: 'task-1', status: 'PENDING', delivery: { status: 'FAILED' }, echo: body.arguments } });
     } catch {
       if (!res.destroyed) res.writeHead(500).end();
@@ -77,13 +83,19 @@ export async function fakeBroker({ profiles } = {}) {
   server.listen(0, '127.0.0.1');
   await new Promise((resolve) => server.once('listening', resolve));
   return {
-    calls, sessions, owners,
+    calls, arrivals, sessions, owners,
     settings: { schemaVersion: 1, brokerUrl: `http://127.0.0.1:${server.address().port}`, localToken: profiles?.[0]?.localToken ?? token },
     revokeToken(value) { credentials.delete(value); },
     addProfile(profile) { credentials.set(profile.localToken, profile); },
     setHook(fn) { hook = fn; },
+    setBusinessHook(fn) { businessHook = fn; },
     advance(ms) { now += ms; },
     restart() { server.closeAllConnections(); sessions.clear(); owners.clear(); instances.clear(); },
+    async drain() {
+      const deadline = Date.now() + 1000;
+      do { await delay(25); } while (responses.size && Date.now() < deadline);
+      if (responses.size) throw new Error('Test broker still has in-flight responses');
+    },
     async close() { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); },
   };
 }
