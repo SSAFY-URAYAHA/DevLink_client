@@ -10,6 +10,8 @@ S15P31D108-59의 TypeScript·Node.js MCP 실행 기반, -60 로컬 브로커 호
 
 [도구 입력·결과 예제와 확장 방법](docs/tool-contracts-v0.1.md)에 7개 도구의 MCP 측 v0.1 JSON을 정리했습니다. Notion API 페이지가 빈 템플릿인 상태에서 선구현한 DTO이므로 도구 담당자의 필드 확인이 필요합니다.
 
+[요청·수락·결과 등록 지침](docs/agent-workflow.md)은 -65의 사용자 지정 수신자, 요청 템플릿, 명시적 수락 후 로컬 작업, 완료·실패·결과 불명 처리 순서를 설명합니다. [Codex](docs/hosts/codex.md)·[Claude Code](docs/hosts/claude-code.md)용 붙여 넣을 지침과 [스키마 검증 가능한 JSON 예제](examples/workflow.json)를 함께 제공합니다.
+
 ## 설치와 실행
 
 Node.js 24 이상이 필요합니다. 현재 Windows, Node.js 24.18.0, npm 12.0.2에서 검증했습니다. 아래 명령은 저장소 루트에서 실행합니다.

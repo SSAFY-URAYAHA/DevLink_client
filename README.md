@@ -4,6 +4,8 @@
 
 S15P31D108-59 실행 기반, -60 브로커 호출·세션 복구, -61 공통 도구 등록과 7개 업무 도구의 실행 방법 및 검증 절차는 [MCP 서버 문서](packages/mcp-server/README.md)를 참고합니다. 로컬 HTTP·도구 JSON은 MCP 측 v0.1 초안이며 실제 Rust 브로커와의 상호 검증은 남아 있습니다.
 
+사용자는 [Agent 요청·수락·결과 등록 지침](packages/mcp-server/docs/agent-workflow.md)에서 수신자 지정부터 사용자 수락, Host의 로컬 수정·검증, 완료·실패 조회까지 확인할 수 있습니다.
+
 ## Git Flow
 
 [Notion Git Flow 전략](https://www.notion.so/fdd35a4f3ca6837fb6ef8101afa7fb68)을 기준으로 브랜치를 관리합니다.
