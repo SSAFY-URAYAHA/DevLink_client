@@ -66,7 +66,7 @@ impl Default for Config {
 
 impl Config {
     /// 설정값들의 유효성을 엄격하게 검증합니다.
-    /// - `server_url`: ws/wss 스킴 필수, 쿼리/프래그먼트/사용자정보 금지
+    /// - `server_url`: ws/wss 스킴 필수, 경로는 루트(`""` 또는 `"/"`) 또는 `"/ws/broker"`만 허용, 쿼리/프래그먼트/사용자정보 금지
     /// - `agent`: 1~64자의 영숫자 및 `-`, `_` 허용
     /// - `reconnect_*`: 범위 및 max >= initial 조건 확인
     /// - `auth_timeout_ms`: 100ms ~ 60000ms 범위 확인
@@ -83,6 +83,9 @@ impl Config {
             bail!(
                 "serverUrl requires ws/wss and a host; credentials, query and fragment are forbidden"
             );
+        }
+        if !matches!(url.path(), "" | "/" | "/ws/broker") {
+            bail!("serverUrl path must be empty, '/', or '/ws/broker'");
         }
         if self.agent.is_empty()
             || self.agent.len() > 64

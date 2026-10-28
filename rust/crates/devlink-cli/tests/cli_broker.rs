@@ -1,20 +1,35 @@
+#![allow(clippy::result_large_err)]
 use devlink_broker::{
-    central::ConnectionStatus,
+    central::{self, CancellationToken, CentralIdentity, CentralState, ConnectionStatus},
     config::{self, Config},
     local::{self, Health, Runtime},
+    protocol::{ClientMessage, HeartbeatPing, PresenceStatus, ServerMessage},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
     path::PathBuf,
     process::{Child, Command, Output},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     net::TcpListener,
+    sync::{Mutex, RwLock},
     task::{JoinHandle, JoinSet},
     time::{Instant, sleep},
 };
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_hdr_async,
+    tungstenite::{
+        Message,
+        handshake::server::{ErrorResponse, Request, Response},
+        http::{StatusCode, header::AUTHORIZATION},
+        protocol::CloseFrame,
+    },
+};
 
 const TOKEN: &str = "test-only-secret-never-print";
 
@@ -112,6 +127,17 @@ fn config_create_show_update_and_validation() {
     assert!(f.ok(&["config"]).contains("serverUrl"));
     f.ok(&["config", "set", "agent", "test-agent"]);
     f.ok(&["config", "set", "autoReconnect", "false"]);
+    f.ok(&[
+        "config",
+        "set",
+        "serverUrl",
+        "ws://localhost:8080/ws/broker",
+    ]);
+    assert_eq!(
+        Config::load(&f.path).unwrap().server_url,
+        "ws://localhost:8080/ws/broker"
+    );
+    f.ok(&["config", "set", "serverUrl", "ws://localhost:8080"]);
     assert_eq!(Config::load(&f.path).unwrap().agent, "test-agent");
     assert!(!Config::load(&f.path).unwrap().auto_reconnect);
     let before = std::fs::read(&f.path).unwrap();
@@ -121,6 +147,13 @@ fn config_create_show_update_and_validation() {
         ["config", "set", "autoReconnect", "123"],
         ["config", "set", "serverUrl", "https://example.com"],
         ["config", "set", "serverUrl", "ws://user:password@localhost"],
+        ["config", "set", "serverUrl", "ws://localhost:8080/custom"],
+        [
+            "config",
+            "set",
+            "serverUrl",
+            "ws://localhost:8080/ws/broker/",
+        ],
         ["config", "set", "reconnectInitialMs", "0"],
         ["config", "set", "unknown", "value"],
     ] {
@@ -318,7 +351,9 @@ async fn simultaneous_start_cannot_spawn_two_brokers() {
 async fn crash_releases_os_lock_and_stale_runtime_is_recovered() {
     let f = Fixture::new();
     let mut child = OwnedProcess(f.command(&["broker"]).spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let startup_timeout =
+        Duration::from_secs(8) + devlink_broker::credentials::startup_validation_allowance();
+    let deadline = Instant::now() + startup_timeout;
     loop {
         if let Ok(runtime) = Runtime::load(&f.path)
             && runtime.health().await.is_ok()
@@ -366,57 +401,222 @@ async fn unhealthy_live_broker_is_not_reported_as_stopped() {
 
 #[derive(Clone, Copy)]
 enum Behavior {
-    Authenticate,
-    Deny,
+    Ready { agent_id: u64 },
+    Deny401,
+    Deny403,
     Silent,
     InvalidJson,
-    CloseUnauthorized,
+    EmptyConnectionId,
+    ZeroAgentId,
+    LegacyAuthOk,
+    CloseHeartbeatTimeout4001,
+    CloseReplaced4002,
+    ClosePolicyViolation1008,
 }
+
 struct Mock {
     address: std::net::SocketAddr,
+    attempts: Arc<AtomicUsize>,
+    received: Arc<Mutex<Vec<String>>>,
+    heartbeat_pings: Arc<Mutex<Vec<(u64, String, Instant)>>>,
+    expirations: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 impl Mock {
     async fn start(address: &str, behavior: Behavior) -> Self {
         let listener = TcpListener::bind(address).await.unwrap();
         let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let heartbeat_pings = Arc::new(Mutex::new(Vec::new()));
+        let expirations = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let received_clone = received.clone();
+        let heartbeat_pings_clone = heartbeat_pings.clone();
+        let expirations_clone = expirations.clone();
+        let next_seq = Arc::new(AtomicU64::new(1));
+
         let task = tokio::spawn(async move {
             let mut clients = JoinSet::new();
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
+                let attempts = attempts_clone.clone();
+                let received = received_clone.clone();
+                let heartbeat_pings = heartbeat_pings_clone.clone();
+                let expirations = expirations_clone.clone();
+                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+
                 clients.spawn(async move {
-                    let Ok(mut socket) = accept_async(stream).await else {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let handshake = accept_hdr_async(
+                        stream,
+                        move |req: &Request,
+                              response: Response|
+                              -> Result<Response, ErrorResponse> {
+                            assert_eq!(
+                                req.uri().path(),
+                                "/ws/broker",
+                                "Upgrade request path must be /ws/broker"
+                            );
+                            assert!(
+                                req.uri().query().is_none(),
+                                "Upgrade request must not carry query parameters"
+                            );
+                            assert!(
+                                req.headers().get("origin").is_none(),
+                                "Upgrade request must not include Origin header"
+                            );
+                            assert!(
+                                req.headers().get("cookie").is_none(),
+                                "Upgrade request must not include Cookie header"
+                            );
+                            let auth = req
+                                .headers()
+                                .get(AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok());
+                            assert!(
+                                auth == Some(&format!("Bearer {TOKEN}")),
+                                "Upgrade request must carry Authorization: Bearer token"
+                            );
+
+                            match behavior {
+                                Behavior::Deny401 => {
+                                    let mut err = ErrorResponse::new(None);
+                                    *err.status_mut() = StatusCode::UNAUTHORIZED;
+                                    Err(err)
+                                }
+                                Behavior::Deny403 => {
+                                    let mut err = ErrorResponse::new(None);
+                                    *err.status_mut() = StatusCode::FORBIDDEN;
+                                    Err(err)
+                                }
+                                _ => Ok(response),
+                            }
+                        },
+                    )
+                    .await;
+
+                    let Ok(mut socket) = handshake else {
                         return;
                     };
-                    let Some(Ok(Message::Text(text))) = socket.next().await else {
-                        return;
-                    };
-                    let auth: serde_json::Value = serde_json::from_str(&text).unwrap();
-                    assert_eq!(auth["type"], "auth");
-                    assert_eq!(auth["token"], TOKEN);
-                    let message = match behavior {
-                        Behavior::Authenticate => r#"{"type":"auth_ok"}"#,
-                        Behavior::Deny => r#"{"type":"auth_error"}"#,
+
+                    let ready_text = match behavior {
+                        Behavior::Ready { agent_id } => {
+                            format!(
+                                r#"{{"type":"BROKER_READY","payload":{{"connection_id":"conn-{seq}","agent_id":{agent_id}}}}}"#
+                            )
+                        }
+                        Behavior::CloseHeartbeatTimeout4001 | Behavior::CloseReplaced4002 | Behavior::ClosePolicyViolation1008 => {
+                            format!(
+                                r#"{{"type":"BROKER_READY","payload":{{"connection_id":"conn-{seq}","agent_id":11}}}}"#
+                            )
+                        }
                         Behavior::Silent => {
                             std::future::pending::<()>().await;
                             return;
                         }
-                        Behavior::InvalidJson => "malformed-json",
-                        Behavior::CloseUnauthorized => {
-                            let _ = socket
-                                .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                                    code: 4001.into(),
-                                    reason: "Unauthorized".into(),
-                                }))
-                                .await;
-                            return;
+                        Behavior::InvalidJson => "malformed-json".to_string(),
+                        Behavior::EmptyConnectionId => {
+                            r#"{"type":"BROKER_READY","payload":{"connection_id":"","agent_id":11}}"#
+                                .to_string()
                         }
+                        Behavior::ZeroAgentId => {
+                            r#"{"type":"BROKER_READY","payload":{"connection_id":"conn-0","agent_id":0}}"#
+                                .to_string()
+                        }
+                        Behavior::LegacyAuthOk => r#"{"type":"auth_ok"}"#.to_string(),
+                        Behavior::Deny401 | Behavior::Deny403 => unreachable!(),
                     };
-                    if socket.send(Message::Text(message.into())).await.is_err() {
+
+                    if socket.send(Message::Text(ready_text.into())).await.is_err() {
                         return;
                     }
-                    while let Some(Ok(message)) = socket.next().await {
+
+                    match behavior {
+                        Behavior::CloseReplaced4002 => {
+                            let _ = socket
+                                .close(Some(CloseFrame {
+                                    code: 4002.into(),
+                                    reason: "Replaced by newer connection".into(),
+                                }))
+                                .await;
+                            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                                while let Some(Ok(msg)) = socket.next().await {
+                                    if msg.is_close() {
+                                        break;
+                                    }
+                                }
+                            })
+                            .await;
+                            return;
+                        }
+                        Behavior::ClosePolicyViolation1008 => {
+                            let _ = socket
+                                .close(Some(CloseFrame {
+                                    code: 1008.into(),
+                                    reason: "Invalid message".into(),
+                                }))
+                                .await;
+                            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                                while let Some(Ok(msg)) = socket.next().await {
+                                    if msg.is_close() {
+                                        break;
+                                    }
+                                }
+                            })
+                            .await;
+                            return;
+                        }
+                        _ => {}
+                    }
+
+                    if matches!(behavior, Behavior::CloseHeartbeatTimeout4001) && seq == 1 {
+                        let _ = socket.close(Some(CloseFrame {
+                            code: 4001.into(),
+                            reason: "Heartbeat timeout".into(),
+                        })).await;
+                        return;
+                    }
+
+                    // 실제 중앙처럼 JSON PING만 40초 무수신 만료를 연장합니다.
+                    let heartbeat_expiration = sleep(Duration::from_secs(40));
+                    tokio::pin!(heartbeat_expiration);
+                    loop {
+                        let message = tokio::select! {
+                            _ = &mut heartbeat_expiration => {
+                                expirations.fetch_add(1, Ordering::SeqCst);
+                                let _ = socket.close(Some(CloseFrame {
+                                    code: 4001.into(),
+                                    reason: "Heartbeat timeout".into(),
+                                })).await;
+                                break;
+                            }
+                            message = socket.next() => message,
+                        };
+                        let Some(Ok(message)) = message else { break };
                         match message {
+                            Message::Text(text) => {
+                                if let Ok(ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id })) =
+                                    serde_json::from_str::<ClientMessage>(&text)
+                                {
+                                    if ping_id.trim().is_empty() || ping_id.encode_utf16().count() > 128 {
+                                        let _ = socket.close(Some(CloseFrame {
+                                            code: 1008.into(),
+                                            reason: "Invalid HEARTBEAT PING".into(),
+                                        })).await;
+                                        break;
+                                    }
+                                    let received_at = Instant::now();
+                                    heartbeat_expiration.as_mut().reset(received_at + Duration::from_secs(40));
+                                    heartbeat_pings.lock().await.push((seq, ping_id.clone(), received_at));
+                                    let pong = serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id)).unwrap();
+                                    if socket.send(Message::Text(pong.into())).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                received.lock().await.push(text.to_string());
+                            }
                             Message::Ping(payload) => {
                                 if socket.send(Message::Pong(payload)).await.is_err() {
                                     break;
@@ -430,47 +630,222 @@ impl Mock {
                 while clients.try_join_next().is_some() {}
             }
         });
-        Self { address, task }
+        Self {
+            address,
+            attempts,
+            received,
+            heartbeat_pings,
+            expirations,
+            task,
+        }
     }
     async fn stop(self) {
         self.task.abort();
         // Await cancellation so both listening socket and accepted sockets have been dropped.
         let _ = self.task.await;
     }
+
+    async fn wait_messages(&self, count: usize) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let messages = self.received.lock().await;
+            if messages.len() >= count {
+                return messages
+                    .iter()
+                    .map(|message| serde_json::from_str(message).unwrap())
+                    .collect();
+            }
+            drop(messages);
+            assert!(Instant::now() < deadline, "Timed out waiting for presence");
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_auth_disconnect_restart_and_reconnect() {
-    let server = Mock::start("127.0.0.1:0", Behavior::Authenticate).await;
+    let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 11 }).await;
     let f = Fixture::new();
+    // 1. Root URL (`ws://<addr>`) is normalized to `/ws/broker`
     f.configure(|config| config.server_url = format!("ws://{}", server.address));
     f.ok(&["start"]);
     f.wait_status(ConnectionStatus::Connected).await;
     assert!(f.ok(&["status"]).contains("Connected"));
+
+    // In default CLI broker start, local Agent state is unconfirmed (`None`),
+    // so the broker must NOT guess or send `AGENT_PRESENCE` (`ONLINE` or `OFFLINE`),
+    // and must never send legacy `auth`/`hello`.
+    sleep(Duration::from_millis(120)).await;
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Broker must not send guessed AGENT_PRESENCE when local Agent status is unknown"
+    );
+    assert_eq!(
+        f.health().await.central_server,
+        ConnectionStatus::Connected,
+        "Central WebSocket must remain Connected after BROKER_READY when local status is unknown"
+    );
+
+    // Ensure agent_id is NOT persisted to broker.json in Stage 2
+    let cred_raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(devlink_broker::credentials::path(&f.path)).unwrap())
+            .unwrap();
+    assert!(
+        cred_raw.get("agentId").is_none() && cred_raw.get("agent_id").is_none(),
+        "broker.json must not persist agent_id in Stage 2"
+    );
+
     let address = server.address;
     server.stop().await;
     f.wait_status(ConnectionStatus::Reconnecting).await;
-    let server = Mock::start(&address.to_string(), Behavior::Authenticate).await;
+
+    let server = Mock::start(&address.to_string(), Behavior::Ready { agent_id: 11 }).await;
+    f.wait_status(ConnectionStatus::Connected).await;
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Reconnect with unknown local Agent status must not send guessed AGENT_PRESENCE"
+    );
+    f.ok(&["stop"]);
+
+    // 2. Explicit `/ws/broker` URL (`ws://<addr>/ws/broker`) also connects to `/ws/broker`
+    f.configure(|config| config.server_url = format!("ws://{}/ws/broker", server.address));
+    f.ok(&["start"]);
     f.wait_status(ConnectionStatus::Connected).await;
     f.ok(&["stop"]);
+
+    // 3. Disallowed custom path (`ws://<addr>/other`) is rejected before opening a socket;
+    //    the Mock server receives 0 additional attempts so the Bearer token is never sent to `/other`.
+    let attempts_before = server.attempts.load(Ordering::SeqCst);
+    let bad_config = Config {
+        server_url: format!("ws://{}/other", server.address),
+        ..Config::default()
+    };
+    let bad_status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
+    let bad_state = CentralState::new(bad_status);
+    let bad_cancel = CancellationToken::new();
+    central::run_with_state(bad_config, TOKEN.to_string(), bad_state.clone(), bad_cancel).await;
+    assert_eq!(
+        bad_state.status().await,
+        ConnectionStatus::ProtocolViolation
+    );
+    assert_eq!(
+        server.attempts.load(Ordering::SeqCst),
+        attempts_before,
+        "Bearer token must never be transmitted to a disallowed serverUrl path"
+    );
+
     server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authentication_rejection_and_4001_stop_retries() {
-    for behavior in [Behavior::Deny, Behavior::CloseUnauthorized] {
+async fn json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect() {
+    let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 11 }).await;
+    let f = Fixture::new();
+    f.configure(|config| config.server_url = format!("ws://{}", server.address));
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Connected).await;
+    let initial = f.health().await;
+    let started = Instant::now();
+
+    // 시간을 단축하지 않고 실제 CLI의 JSON PING 20초·PONG 대기 20초와
+    // Mock의 40초 무수신 만료를 사용합니다. 재접속으로 연결이 바뀌어도 실패합니다.
+    loop {
+        let health = f.health().await;
+        assert_eq!(health.central_server, ConnectionStatus::Connected);
+        assert_eq!(health.pid, initial.pid);
+        assert_eq!(health.instance_id, initial.instance_id);
+        assert_eq!(
+            server.attempts.load(Ordering::SeqCst),
+            1,
+            "Must keep the original WebSocket connection"
+        );
+        assert_eq!(server.expirations.load(Ordering::SeqCst), 0);
+        if started.elapsed() >= Duration::from_secs(45) {
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    {
+        let pings = server.heartbeat_pings.lock().await;
+        assert!(
+            pings.len() >= 2,
+            "Expected production JSON PINGs around 20 and 40 seconds"
+        );
+        assert!(pings.iter().all(|(seq, _, _)| *seq == 1));
+        assert_ne!(
+            pings[0].1, pings[1].1,
+            "Each heartbeat must use a new ping_id"
+        );
+        assert!(pings[1].2.duration_since(pings[0].2) >= Duration::from_secs(19));
+    }
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Heartbeat must not guess local Agent presence"
+    );
+    f.ok(&["stop"]);
+    assert!(!local::running(&f.path).unwrap());
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_timeout_4001_reconnects_only_when_enabled() {
+    for auto_reconnect in [true, false] {
+        let server = Mock::start("127.0.0.1:0", Behavior::CloseHeartbeatTimeout4001).await;
+        let f = Fixture::new();
+        f.configure(|config| {
+            config.server_url = format!("ws://{}", server.address);
+            config.auto_reconnect = auto_reconnect;
+        });
+        f.ok(&["start"]);
+        if auto_reconnect {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while server.attempts.load(Ordering::SeqCst) < 2 {
+                assert!(Instant::now() < deadline, "4001 must reconnect");
+                sleep(Duration::from_millis(10)).await;
+            }
+            f.wait_status(ConnectionStatus::Connected).await;
+            assert_eq!(server.attempts.load(Ordering::SeqCst), 2);
+        } else {
+            f.wait_status(ConnectionStatus::Disconnected).await;
+            sleep(Duration::from_millis(200)).await;
+            assert_eq!(server.attempts.load(Ordering::SeqCst), 1);
+        }
+        f.ok(&["stop"]);
+        server.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authentication_rejection_401_and_403_stop_retries() {
+    for behavior in [Behavior::Deny401, Behavior::Deny403] {
         let server = Mock::start("127.0.0.1:0", behavior).await;
         let f = Fixture::new();
         f.configure(|config| config.server_url = format!("ws://{}", server.address));
         f.ok(&["start"]);
         f.wait_status(ConnectionStatus::AuthFailed).await;
+        assert_eq!(
+            server.attempts.load(Ordering::SeqCst),
+            1,
+            "Auth failure must not auto-retry"
+        );
+        assert!(
+            server.received.lock().await.is_empty(),
+            "Client must not send messages on auth failure"
+        );
+
         let address = server.address;
         server.stop().await;
-        let server = Mock::start(&address.to_string(), Behavior::Authenticate).await;
-        sleep(Duration::from_millis(400)).await;
+        let server = Mock::start(&address.to_string(), Behavior::Ready { agent_id: 11 }).await;
+        sleep(Duration::from_millis(300)).await;
         assert_eq!(
             f.health().await.central_server,
             ConnectionStatus::AuthFailed
+        );
+        assert_eq!(
+            server.attempts.load(Ordering::SeqCst),
+            0,
+            "Broker must remain stopped from retrying after AuthFailed"
         );
         f.ok(&["stop"]);
         server.stop().await;
@@ -478,19 +853,406 @@ async fn authentication_rejection_and_4001_stop_retries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn silent_or_malformed_auth_times_out_without_reconnect_when_disabled() {
-    for behavior in [Behavior::Silent, Behavior::InvalidJson] {
+async fn replaced_4002_and_policy_violation_1008_stop_retries_with_distinct_status() {
+    for (behavior, expected_status) in [
+        (Behavior::CloseReplaced4002, ConnectionStatus::Replaced),
+        (
+            Behavior::ClosePolicyViolation1008,
+            ConnectionStatus::ProtocolViolation,
+        ),
+    ] {
+        let server = Mock::start("127.0.0.1:0", behavior).await;
+        let f = Fixture::new();
+        f.configure(|config| config.server_url = format!("ws://{}", server.address));
+        f.ok(&["start"]);
+        f.wait_status(expected_status).await;
+        assert!(
+            f.ok(&["status"]).contains(&format!("{expected_status:?}")),
+            "CLI status must report {expected_status:?} distinctly"
+        );
+        assert_eq!(
+            server.attempts.load(Ordering::SeqCst),
+            1,
+            "{expected_status:?} must stop auto-retries"
+        );
+
+        let address = server.address;
+        server.stop().await;
+        let server = Mock::start(&address.to_string(), Behavior::Ready { agent_id: 11 }).await;
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(f.health().await.central_server, expected_status);
+        assert_eq!(
+            server.attempts.load(Ordering::SeqCst),
+            0,
+            "No reconnect attempt must occur after {expected_status:?}"
+        );
+        f.ok(&["stop"]);
+        server.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_broker_ready_is_rejected_without_connected_presence_or_retry() {
+    for behavior in [
+        Behavior::InvalidJson,
+        Behavior::EmptyConnectionId,
+        Behavior::ZeroAgentId,
+        Behavior::LegacyAuthOk,
+    ] {
         let server = Mock::start("127.0.0.1:0", behavior).await;
         let f = Fixture::new();
         f.configure(|config| {
             config.server_url = format!("ws://{}", server.address);
-            config.auto_reconnect = false;
+            config.auto_reconnect = true;
         });
         f.ok(&["start"]);
-        f.wait_status(ConnectionStatus::Disconnected).await;
+        f.wait_status(ConnectionStatus::ProtocolViolation).await;
+        assert!(
+            server.received.lock().await.is_empty(),
+            "AGENT_PRESENCE must never be sent when BROKER_READY is invalid"
+        );
+        sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            server.attempts.load(Ordering::SeqCst),
+            1,
+            "Invalid BROKER_READY must stop auto-retry"
+        );
         f.ok(&["stop"]);
         server.stop().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn silent_broker_ready_waits_in_authenticating_then_retries_or_disconnects() {
+    // 1. auto_reconnect = false: transitions to Disconnected on BROKER_READY timeout without retry
+    let server = Mock::start("127.0.0.1:0", Behavior::Silent).await;
+    let f = Fixture::new();
+    f.configure(|config| {
+        config.server_url = format!("ws://{}", server.address);
+        config.auto_reconnect = false;
+        config.auth_timeout_ms = 200;
+    });
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Disconnected).await;
+    assert_eq!(server.attempts.load(Ordering::SeqCst), 1);
+    f.ok(&["stop"]);
+    server.stop().await;
+
+    // 2. auto_reconnect = true: retries after BROKER_READY timeout
+    let server = Mock::start("127.0.0.1:0", Behavior::Silent).await;
+    let f2 = Fixture::new();
+    f2.configure(|config| {
+        config.server_url = format!("ws://{}", server.address);
+        config.auto_reconnect = true;
+        config.auth_timeout_ms = 150;
+    });
+    f2.ok(&["start"]);
+    let retry_deadline = Instant::now() + Duration::from_secs(5);
+    while server.attempts.load(Ordering::SeqCst) < 2 {
+        assert!(
+            Instant::now() < retry_deadline,
+            "Expected retry after BROKER_READY timeout"
+        );
+        sleep(Duration::from_millis(30)).await;
+    }
+    f2.ok(&["stop"]);
+    server.stop().await;
+
+    // 3. Upgrade alone stays in Authenticating (not Connected) and stops promptly during BROKER_READY wait
+    let server = Mock::start("127.0.0.1:0", Behavior::Silent).await;
+    let f3 = Fixture::new();
+    f3.configure(|config| {
+        config.server_url = format!("ws://{}", server.address);
+        config.auto_reconnect = true;
+        config.auth_timeout_ms = 5000;
+    });
+    f3.ok(&["start"]);
+    f3.wait_status(ConnectionStatus::Authenticating).await;
+    let stop_started = Instant::now();
+    f3.ok(&["stop"]);
+    assert!(
+        stop_started.elapsed() < Duration::from_secs(5),
+        "Broker must stop promptly while waiting for BROKER_READY"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_online_presence() {
+    let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 42 }).await;
+    let config = Config {
+        server_url: format!("ws://{}", server.address),
+        reconnect_initial_ms: 50,
+        reconnect_max_ms: 100,
+        auth_timeout_ms: 500,
+        ..Config::default()
+    };
+
+    let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
+    let identity = Arc::new(RwLock::new(None));
+    // Case 1: Local Agent status is unknown (`None`) -> must NOT send guessed AGENT_PRESENCE
+    let presence = tokio::sync::watch::channel(None).0;
+    let state = CentralState::with_details(status.clone(), identity.clone(), presence.clone());
+    let cancel = CancellationToken::new();
+
+    let runner = tokio::spawn(central::run_with_state(
+        config,
+        TOKEN.to_string(),
+        state.clone(),
+        cancel.clone(),
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status().await != ConnectionStatus::Connected {
+        assert!(Instant::now() < deadline, "Timed out waiting for Connected");
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        state.identity().await,
+        Some(CentralIdentity {
+            connection_id: "conn-1".into(),
+            agent_id: 42,
+        })
+    );
+    sleep(Duration::from_millis(80)).await;
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Unknown local Agent status (None) must not send guessed AGENT_PRESENCE"
+    );
+
+    // Case 2: Local Agent status is confirmed OFFLINE (`Some(PresenceStatus::Offline)`)
+    let address = server.address;
+    server.stop().await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status().await != ConnectionStatus::Reconnecting {
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for Reconnecting"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        state.identity().await,
+        None,
+        "Previous connection_id and agent_id must be invalidated on disconnect"
+    );
+    // 재접속 대기 중에도 최신 상태만 보존하고 다음 READY 뒤에 보고합니다.
+    state.set_presence(PresenceStatus::Online);
+    state.set_presence(PresenceStatus::Offline);
+
+    let server = Mock::start(&address.to_string(), Behavior::Ready { agent_id: 42 }).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status().await != ConnectionStatus::Connected {
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for reconnect Connected (Offline)"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        state.identity().await,
+        Some(CentralIdentity {
+            connection_id: "conn-1".into(),
+            agent_id: 42,
+        })
+    );
+    {
+        let msgs = server.wait_messages(1).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0],
+            serde_json::json!({
+                "type": "AGENT_PRESENCE",
+                "payload": {
+                    "status": "OFFLINE"
+                }
+            })
+        );
+    }
+
+    // Case 3: Local Agent status is confirmed ONLINE (`Some(PresenceStatus::Online)`)
+    server.stop().await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status().await != ConnectionStatus::Reconnecting {
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for second Reconnecting"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(state.identity().await, None);
+    state.set_presence(PresenceStatus::Online);
+
+    let server = Mock::start(&address.to_string(), Behavior::Ready { agent_id: 99 }).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status().await != ConnectionStatus::Connected {
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for reconnect Connected (Online)"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        state.identity().await,
+        Some(CentralIdentity {
+            connection_id: "conn-1".into(),
+            agent_id: 99,
+        })
+    );
+    {
+        let msgs = server.wait_messages(1).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0],
+            serde_json::json!({
+                "type": "AGENT_PRESENCE",
+                "payload": {
+                    "status": "ONLINE"
+                }
+            })
+        );
+    }
+
+    cancel.cancel();
+    runner.await.unwrap();
+    assert_eq!(state.status().await, ConnectionStatus::Disconnected);
+    assert_eq!(state.identity().await, None);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn presence_changes_use_the_current_connection_without_duplicates_or_ack() {
+    let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 42 }).await;
+    let config = Config {
+        server_url: format!("ws://{}", server.address),
+        ..Config::default()
+    };
+    let state = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)));
+    let cancel = CancellationToken::new();
+    let runner = tokio::spawn(central::run_with_state(
+        config,
+        TOKEN.into(),
+        state.clone(),
+        cancel.clone(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status().await != ConnectionStatus::Connected {
+        assert!(Instant::now() < deadline, "Timed out waiting for Connected");
+        sleep(Duration::from_millis(10)).await;
+    }
+    // 로컬 상태 미확인 시에는 READY만으로 ONLINE/OFFLINE을 만들지 않습니다.
+    assert!(server.received.lock().await.is_empty());
+    state.set_presence(PresenceStatus::Online);
+    server.wait_messages(1).await;
+    state.set_presence(PresenceStatus::Online);
+    state.set_presence(PresenceStatus::Offline);
+    let messages = server.wait_messages(2).await;
+    assert_eq!(
+        messages,
+        vec![
+            serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"ONLINE"}}),
+            serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"OFFLINE"}}),
+        ]
+    );
+    assert_eq!(server.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.status().await, ConnectionStatus::Connected);
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(3), runner)
+        .await
+        .unwrap()
+        .unwrap();
+    state.set_presence(PresenceStatus::Online);
+    assert_eq!(server.received.lock().await.len(), 2);
+    assert_eq!(state.identity().await, None);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn presence_waits_for_ready_and_reports_only_the_latest_confirmed_state() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (messages_tx, mut messages_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        accepted_tx.send(()).unwrap();
+        tokio::select! {
+            _ = release_rx => {},
+            message = socket.next() => panic!("Unexpected frame before READY: {message:?}"),
+        }
+        socket
+            .send(Message::Text(
+                r#"{"type":"BROKER_READY","payload":{"connection_id":"gated","agent_id":42}}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        while let Some(Ok(message)) = socket.next().await {
+            match message {
+                Message::Text(text) => messages_tx
+                    .send(serde_json::from_str::<serde_json::Value>(&text).unwrap())
+                    .unwrap(),
+                Message::Ping(payload) => socket.send(Message::Pong(payload)).await.unwrap(),
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+    let config = Config {
+        server_url: format!("ws://{address}"),
+        ..Config::default()
+    };
+    let state = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)));
+    // 수신자가 생기기 전 확인한 상태도 다음 READY까지 유지해야 합니다.
+    state.set_presence(PresenceStatus::Online);
+    let cancel = CancellationToken::new();
+    let runner = tokio::spawn(central::run_with_state(
+        config,
+        TOKEN.into(),
+        state.clone(),
+        cancel.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(3), accepted_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    state.set_presence(PresenceStatus::Offline);
+    // READY가 보류된 동안에는 presence도 보류합니다.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), messages_rx.recv())
+            .await
+            .is_err()
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), messages_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"OFFLINE"}})
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), messages_rx.recv())
+            .await
+            .is_err()
+    );
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(3), runner)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -594,7 +1356,9 @@ async fn mcp_local_token_survives_crash_restart() {
 
     // 3. broker를 직접 자식 프로세스로 실행하고 Health 준비를 기다린다.
     let mut child = OwnedProcess(f.command(&["broker"]).spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let startup_timeout =
+        Duration::from_secs(8) + devlink_broker::credentials::startup_validation_allowance();
+    let deadline = Instant::now() + startup_timeout;
     loop {
         if let Ok(runtime) = Runtime::load(&f.path)
             && runtime.health().await.is_ok()

@@ -5,7 +5,7 @@
 //! - 중앙 웹소켓 서버(central)와의 연결 세션을 백그라운드 태스크로 관리합니다.
 
 use crate::{
-    central::{self, ConnectionStatus, SharedStatus},
+    central::{self, CentralState, ConnectionStatus},
     config::{self, Config, state_directory},
     local::{self, API_VERSION, Health, Runtime, SERVICE},
 };
@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 struct ApiState {
     /// 브로커 런타임 정보 (PID, 포트, 인증 토큰 등)
     runtime: Arc<Runtime>,
-    /// 중앙 서버와의 웹소켓 연결 상태
-    status: SharedStatus,
+    /// 중앙 연결과 로컬 세션 핸들러가 함께 사용하는 상태·presence 게시 지점
+    central: CentralState,
     /// 프로세스 전체에 종료 시그널을 전파하는 토큰
     cancel: CancellationToken,
     /// MCP 클라이언트용 로컬 인증 토큰
@@ -79,9 +79,15 @@ pub async fn run(path: &Path) -> Result<()> {
     // 취소 토큰 및 중앙 서버 연결 상태 초기화
     let cancel = CancellationToken::new();
     let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
+    let central_state = CentralState::new(status);
 
     // 중앙 서버와 통신하는 비동기 태스크 시작
-    let central = tokio::spawn(central::run(config, token, status.clone(), cancel.clone()));
+    let central = tokio::spawn(central::run_with_state(
+        config,
+        token,
+        central_state.clone(),
+        cancel.clone(),
+    ));
 
     // 로컬 제어 API 라우터 설정 (/health, /shutdown)
     let app = Router::new()
@@ -90,7 +96,7 @@ pub async fn run(path: &Path) -> Result<()> {
         .fallback(not_found)
         .with_state(ApiState {
             runtime,
-            status,
+            central: central_state,
             cancel: cancel.clone(),
             mcp_token,
         });
@@ -190,7 +196,7 @@ async fn health(State(state): State<ApiState>, headers: HeaderMap) -> Response {
         api_version: API_VERSION,
         pid: state.runtime.pid,
         instance_id: state.runtime.instance_id.clone(),
-        central_server: *state.status.read().await,
+        central_server: state.central.status().await,
     })
     .into_response()
 }

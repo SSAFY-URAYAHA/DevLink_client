@@ -1,8 +1,24 @@
-//! Compatible with cli-pratice/src/mock-server.ts. Never prints authentication payloads.
+//! Stage 2 central server mock (`/ws/broker`). Never prints authentication payloads.
+#![allow(clippy::result_large_err)]
 use anyhow::{Context, Result};
+use devlink_broker::protocol::{BrokerReadyPayload, ClientMessage, HeartbeatPing, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpListener;
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::{
+    net::TcpListener,
+    time::{Duration, Instant, sleep},
+};
+use tokio_tungstenite::{
+    accept_hdr_async,
+    tungstenite::{
+        Message,
+        handshake::server::{ErrorResponse, Request, Response},
+        http::{StatusCode, header::AUTHORIZATION},
+        protocol::CloseFrame,
+    },
+};
+
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,48 +34,97 @@ async fn main() -> Result<()> {
             _ = tokio::signal::ctrl_c() => return Ok(()),
             accepted = listener.accept() => accepted?,
         };
-        let token = token.clone();
+        let expected_bearer = format!("Bearer {token}");
         tokio::spawn(async move {
+            let handshake = accept_hdr_async(
+                stream,
+                move |req: &Request,
+                      response: Response|
+                      -> std::result::Result<Response, ErrorResponse> {
+                    if req.uri().path() != "/ws/broker" || req.uri().query().is_some() {
+                        let mut err = ErrorResponse::new(None);
+                        *err.status_mut() = StatusCode::UNAUTHORIZED;
+                        return Err(err);
+                    }
+                    let authorized = req
+                        .headers()
+                        .get(AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v == expected_bearer);
+                    if !authorized {
+                        let mut err = ErrorResponse::new(None);
+                        *err.status_mut() = StatusCode::UNAUTHORIZED;
+                        return Err(err);
+                    }
+                    Ok(response)
+                },
+            );
             let Ok(Ok(mut socket)) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), accept_async(stream)).await
+                tokio::time::timeout(std::time::Duration::from_secs(5), handshake).await
             else {
                 return;
             };
-            let message =
-                tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await;
-            let valid = match message {
-                Ok(Some(Ok(Message::Text(text)))) => {
-                    serde_json::from_str::<serde_json::Value>(&text)
-                        .ok()
-                        .is_some_and(|v| v["type"] == "auth" && v["token"].as_str() == Some(&token))
-                }
-                _ => false,
-            };
-            if !valid {
-                let _ = socket
-                    .send(Message::Text(r#"{"type":"auth_error"}"#.into()))
-                    .await;
-                let _ = socket.close(None).await;
+
+            let seq = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+            let ready = serde_json::to_string(&ServerMessage::BrokerReady(BrokerReadyPayload {
+                connection_id: format!("mock-session-{seq}"),
+                agent_id: 1,
+            }))
+            .expect("serializable BROKER_READY");
+
+            if socket.send(Message::Text(ready.into())).await.is_err() {
                 return;
             }
-            if socket
-                .send(Message::Text(r#"{"type":"auth_ok"}"#.into()))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            while let Some(Ok(message)) = socket.next().await {
-                let response = match message {
-                    Message::Text(_) => Message::Text(
-                        r#"{"type":"echo","message":"Authenticated message received"}"#.into(),
-                    ),
-                    Message::Ping(payload) => Message::Pong(payload),
-                    Message::Close(_) => break,
-                    _ => continue,
+
+            // 운영 서버처럼 JSON PING만 만료 감시 시간을 갱신합니다.
+            let deadline = sleep(Duration::from_secs(40));
+            tokio::pin!(deadline);
+            loop {
+                let message = tokio::select! {
+                    _ = &mut deadline => {
+                        let _ = socket.close(Some(CloseFrame {
+                            code: 4001.into(),
+                            reason: "Heartbeat timeout".into(),
+                        })).await;
+                        break;
+                    }
+                    message = socket.next() => message,
                 };
-                if socket.send(response).await.is_err() {
-                    break;
+                let Some(Ok(message)) = message else { break };
+                match message {
+                    Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(ClientMessage::AgentPresence(_)) => {}
+                        Ok(ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }))
+                            if !ping_id.trim().is_empty()
+                                && ping_id.encode_utf16().count() <= 128 =>
+                        {
+                            deadline
+                                .as_mut()
+                                .reset(Instant::now() + Duration::from_secs(40));
+                            let pong =
+                                serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id))
+                                    .expect("serializable HEARTBEAT PONG");
+                            if socket.send(Message::Text(pong.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => {
+                            let _ = socket
+                                .close(Some(CloseFrame {
+                                    code: 1008.into(),
+                                    reason: "Invalid message".into(),
+                                }))
+                                .await;
+                            break;
+                        }
+                    },
+                    Message::Ping(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
         });
