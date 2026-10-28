@@ -12,6 +12,7 @@
     "check": "tsc --noEmit",
     "start": "node dist/index.js",
     "test": "npm run build && node scripts/export-contracts.mjs --check && node --test --test-concurrency=1 test/*.test.mjs",
+    "test:hosts": "npm run build && node scripts/verify-hosts.mjs",
     "contracts:write": "npm run build && node scripts/export-contracts.mjs",
     "contracts:check": "npm run build && node scripts/export-contracts.mjs --check"
   },

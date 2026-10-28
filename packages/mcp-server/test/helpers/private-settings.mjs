@@ -21,7 +21,7 @@ $acl.AddAccessRule($rule)
   } else await chmod(dir, 0o700);
   if (profile) await mkdir(join(dir, '.devlink-mcp', profile), { recursive: true, mode: 0o700 });
   await writeFile(path, JSON.stringify(settings), { mode: 0o600 });
-  return { path, cleanup: () => rm(dir, { recursive: true, force: true }) };
+  return { path, cleanup: () => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }) };
 }
 
 export async function allowOtherUserRead(path) {
