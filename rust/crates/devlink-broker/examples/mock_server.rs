@@ -1,10 +1,13 @@
 //! Stage 2 central server mock (`/ws/broker`). Never prints authentication payloads.
 #![allow(clippy::result_large_err)]
 use anyhow::{Context, Result};
-use devlink_broker::protocol::{BrokerReadyPayload, ClientMessage, ServerMessage};
+use devlink_broker::protocol::{BrokerReadyPayload, ClientMessage, HeartbeatPing, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    time::{Duration, Instant, sleep},
+};
 use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::{
@@ -73,10 +76,39 @@ async fn main() -> Result<()> {
                 return;
             }
 
-            while let Some(Ok(message)) = socket.next().await {
+            // 운영 서버처럼 JSON PING만 만료 감시 시간을 갱신합니다.
+            let deadline = sleep(Duration::from_secs(40));
+            tokio::pin!(deadline);
+            loop {
+                let message = tokio::select! {
+                    _ = &mut deadline => {
+                        let _ = socket.close(Some(CloseFrame {
+                            code: 4001.into(),
+                            reason: "Heartbeat timeout".into(),
+                        })).await;
+                        break;
+                    }
+                    message = socket.next() => message,
+                };
+                let Some(Ok(message)) = message else { break };
                 match message {
-                    Message::Text(text) => {
-                        if serde_json::from_str::<ClientMessage>(&text).is_err() {
+                    Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(ClientMessage::AgentPresence(_)) => {}
+                        Ok(ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }))
+                            if !ping_id.trim().is_empty()
+                                && ping_id.encode_utf16().count() <= 128 =>
+                        {
+                            deadline
+                                .as_mut()
+                                .reset(Instant::now() + Duration::from_secs(40));
+                            let pong =
+                                serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id))
+                                    .expect("serializable HEARTBEAT PONG");
+                            if socket.send(Message::Text(pong.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => {
                             let _ = socket
                                 .close(Some(CloseFrame {
                                     code: 1008.into(),
@@ -85,7 +117,7 @@ async fn main() -> Result<()> {
                                 .await;
                             break;
                         }
-                    }
+                    },
                     Message::Ping(payload) => {
                         if socket.send(Message::Pong(payload)).await.is_err() {
                             break;

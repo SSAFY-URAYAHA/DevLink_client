@@ -3,7 +3,7 @@
 - 갱신일: 2026-10-28 (Asia/Seoul)
 - 확인 기준: 로컬 소스 코드·작업 트리와 같은 날 실행한 검사 결과
 - 현재 브랜치: `feature/rust/broekr_sessionapi`
-- HEAD: `037810b` (develop 병합). 아래 구현 상태는 미커밋 presence·통합 검사 보완을 포함합니다.
+- 기준 커밋: `6e6fd78` (presence 보완). 아래 구현 상태는 후속 JSON Heartbeat·4001 수정도 포함합니다.
 - 원격 PR·이슈·최신 브랜치 상태는 GitHub 연결 접근 오류로 확인하지 못했습니다.
 
 ## 1. 현재 상태
@@ -47,26 +47,26 @@ MCP는 주소·토큰을 실행 중 고정하므로 회전·주소 변경 후 �
 
 HTTP 핸들러와 중앙 태스크가 같은 `CentralState`를 공유합니다. `set_presence`로 확인된 상태를 게시하면 READY·연결 중 변경·재접속 후 READY에서 보고하고 같은 상태는 중복 전송하지 않습니다. 기본 상태는 미확인이고 실제 세션의 생성·bind·해제·만료 이벤트는 아직 연결되지 않았습니다.
 
-`401`·`403`·`4001`은 AuthFailed, `4002`는 Replaced, `1008`·잘못된 READY는 ProtocolViolation으로 분류합니다. 재시도 가능한 단절에는 백오프를 적용합니다. 현재 Rust Ping 5초·15초 초과 무응답 판정과 중앙 초기안 20초·20초·40초의 최종 정합성 확인이 남아 있습니다. 상세 규칙은 [중앙 WebSocket 연동 기준](docs/central-websocket-contract.md)을 따릅니다.
+Upgrade HTTP `401`·`403`은 AuthFailed, Close `4002`는 Replaced, `1008`·잘못된 READY는 ProtocolViolation으로 분류해 자동 재시도를 중단합니다. Close `4001`은 서버의 하트비트 만료이며 재시도 가능한 단절로 처리합니다. Rust는 JSON HEARTBEAT PING 20초 간격·같은 ping_id PONG 최대 20초 대기를 적용합니다. 현재 로컬 서버의 JSON PING 무수신 기본 만료는 40초입니다. 다른 메시지나 제어 프레임으로 PONG 대기를 연장하지 않습니다. 로컬 소켓 검증과 실제 중앙 배포 환경 검증은 구분하며 상세 규칙은 [중앙 WebSocket 연동 기준](docs/central-websocket-contract.md)을 따릅니다.
 
 ## 4. 최근 검증 결과
 
-2026-10-28 작업 현황 점검에서 다음 검사를 재확인했습니다. ACL·로컬 HTTP/WebSocket 테스트는 승인된 샌드박스 외부에서 실행했습니다.
+2026-10-28 실시간 45초 Heartbeat 자동 회귀 추가 후 다음 검사를 실행했습니다. ACL·로컬 HTTP/WebSocket 테스트는 승인된 샌드박스 외부에서 실행했습니다.
 
 | 검사 | 결과 |
 | --- | --- |
 | `cargo check --offline --locked --workspace --all-targets` | 통과 |
 | `cargo fmt --all -- --check` | 통과 |
-| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 13개·통합 27개 통과 |
-| `npm.cmd test` (`packages/mcp-server/`) | 빌드·공유 계약 검사·100개 테스트 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 17개·통합 29개 통과 |
 
-Clippy·일반/릴리스 빌드·준비 상태 재현 도구는 이번 점검에서 다시 실행하지 않았습니다. 기존 실행 결과와 샌드박스 실패·외부 실행 통과의 구분은 [로컬 검증 기록](docs/verification.md)에 보관합니다. 가짜 브로커·로컬 WebSocket 테스트 통과는 실제 중앙 인증·DB·Host 업무 왕복 통과를 의미하지 않습니다.
+MCP 전체 테스트·일반/릴리스 빌드·준비 상태 재현 도구는 이번 추가에서 다시 실행하지 않았습니다. MCP 100개 테스트 등 기존 실행 결과는 [로컬 검증 기록](docs/verification.md)에 실행 시점별로 보관합니다. JSON Heartbeat에는 시간 단축 방식의 만료·재접속 테스트와 실제 CLI를 45초 동안 같은 연결로 유지하는 자동 회귀 테스트가 있습니다. 후자는 기본 전체 테스트에 포함하며 PING 20초·PONG 대기 20초·서버 만료 40초를 단축하지 않습니다. 로컬 검증 통과는 실제 중앙 인증·DB·Host 업무 왕복 통과를 의미하지 않습니다.
 
 ## 5. 다음 작업 순서
 
-1. **현재 변경 정리·공유**: 문서와 presence·통합 검사 보완을 검토한 뒤 현재 브랜치에 커밋·Push합니다. 문서 갱신 자체는 커밋·Push 완료를 의미하지 않습니다.
+1. **현재 변경 정리·공유**: JSON Heartbeat·4001 수정과 문서·회귀 테스트를 검토한 뒤 현재 브랜치에 커밋·Push합니다. 문서 갱신 자체는 커밋·Push 완료를 의미하지 않습니다.
 2. **Rust 세션 API 4개 구현**: 세션 생성·bind·heartbeat·해제를 구현하고 instanceId 멱등성, fresh/recover 소유권, 교체·충돌, 브로커 시계 기준 90초 만료와 오래된 갱신·해제 차단을 적용합니다. 확인된 세션 상태를 presence에 연결합니다.
-3. **검증된 중앙 신원·인증 연결**: 세션 구현과 함께 userId/teamId 전달·Agent 소유 검증 경로를 확인합니다. 실제 Agent 토큰으로 Upgrade → READY → PRESENCE → DB 갱신, 해제·만료·재접속·연결 교체를 검증하고 Heartbeat 최종값을 맞춥니다. 신원은 클라이언트 입력이나 READY만으로 추측하지 않습니다.
+3. **검증된 중앙 신원·인증 연결**: 세션 구현과 함께 userId/teamId 전달·Agent 소유 검증 경로를 확인합니다. 실제 Agent 토큰으로 Upgrade → READY → PRESENCE → DB 갱신, 해제·만료·재접속·연결 교체를 검증하고 구현한 JSON Heartbeat가 배포 환경에서도 연결을 유지하는지 확인합니다. 신원은 클라이언트 입력이나 READY만으로 추측하지 않습니다.
 4. **업무 API·중앙 라우팅 구현**: 업무 7개 경로, 요청·응답·오류 매핑, timeout 후 결과 조회, 수신함 디스크 기록·ACK·중복 방지·전달 결과를 연결합니다. 업무 요청을 자동 재전송하거나 로컬 만료로 중앙 작업을 임의 실패 처리하지 않습니다.
 5. **실제 통합 검증**: 두 사용자·프로젝트의 양방향 왕복과 실패·권한·중복·timeout 시나리오를 [MVP 검증 절차](../packages/mcp-server/docs/mvp-integration.md)에 따라 수행합니다.
 6. **Windows/Ubuntu CI 구성·원격 확인**: 로컬 검사를 자동화하고 Unix 실행 결과를 확인합니다.

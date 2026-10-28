@@ -7,6 +7,7 @@
 //!   연결 수립 후 별도의 `auth` / `hello` 메시지를 송신하지 않습니다.
 //! - 서버는 인증·등록 완료 시 `BROKER_READY`를 전송합니다.
 //! - 브로커는 유효한 `BROKER_READY` 수신 직후 `AGENT_PRESENCE`로 로컬 Agent 접속 상태(`ONLINE` / `OFFLINE`)를 보고합니다.
+//! - 연결 유지는 JSON `HEARTBEAT` PING/PONG과 동일한 `ping_id`로 확인합니다.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,20 @@ pub struct AgentPresencePayload {
     pub status: PresenceStatus,
 }
 
+/// 서버가 만료 감시에 사용하는 JSON PING. WebSocket 제어 Ping과 별개입니다.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum HeartbeatPing {
+    Ping { ping_id: String },
+}
+
+/// 서버는 요청의 ping_id를 그대로 돌려줍니다.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum HeartbeatPong {
+    Pong { ping_id: String },
+}
+
 /// 브로커에서 중앙 서버로 전송하는 메시지 규격
 ///
 /// # 직렬화(JSON) 예시
@@ -36,17 +51,22 @@ pub struct AgentPresencePayload {
 ///   "payload": { "status": "OFFLINE" }
 /// }
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ClientMessage {
     /// 로컬 Agent 접속 상태 보고 메시지
     AgentPresence(AgentPresencePayload),
+    Heartbeat(HeartbeatPing),
 }
 
 impl ClientMessage {
     /// 주어진 접속 상태로 `AGENT_PRESENCE` 메시지를 생성합니다.
     pub fn agent_presence(status: PresenceStatus) -> Self {
         Self::AgentPresence(AgentPresencePayload { status })
+    }
+
+    pub fn heartbeat_ping(ping_id: String) -> Self {
+        Self::Heartbeat(HeartbeatPing::Ping { ping_id })
     }
 }
 
@@ -84,6 +104,13 @@ impl BrokerReadyPayload {
 pub enum ServerMessage {
     /// 서버 측 인증 및 ConnectionRegistry 등록 완료 응답
     BrokerReady(BrokerReadyPayload),
+    Heartbeat(HeartbeatPong),
+}
+
+impl ServerMessage {
+    pub fn heartbeat_pong(ping_id: String) -> Self {
+        Self::Heartbeat(HeartbeatPong::Pong { ping_id })
+    }
 }
 
 #[cfg(test)]
@@ -100,7 +127,9 @@ mod tests {
             }
         }"#;
         let msg: ServerMessage = serde_json::from_str(raw).expect("valid BROKER_READY must parse");
-        let ServerMessage::BrokerReady(payload) = msg;
+        let ServerMessage::BrokerReady(payload) = msg else {
+            panic!("expected BROKER_READY");
+        };
         assert!(payload.is_valid());
         assert_eq!(payload.connection_id, "current-websocket-session-id");
         assert_eq!(payload.agent_id, 11);
@@ -110,14 +139,18 @@ mod tests {
             r#"{"type":"BROKER_READY","payload":{"connection_id":"   ","agent_id":11}}"#,
         )
         .unwrap();
-        let ServerMessage::BrokerReady(empty_payload) = empty_conn;
+        let ServerMessage::BrokerReady(empty_payload) = empty_conn else {
+            panic!("expected BROKER_READY");
+        };
         assert!(!empty_payload.is_valid());
 
         let zero_agent: ServerMessage = serde_json::from_str(
             r#"{"type":"BROKER_READY","payload":{"connection_id":"conn-1","agent_id":0}}"#,
         )
         .unwrap();
-        let ServerMessage::BrokerReady(zero_payload) = zero_agent;
+        let ServerMessage::BrokerReady(zero_payload) = zero_agent else {
+            panic!("expected BROKER_READY");
+        };
         assert!(!zero_payload.is_valid());
 
         // Malformed types, string agent_id, unknown fields, and legacy messages must fail deserialization
@@ -157,5 +190,29 @@ mod tests {
                 "payload": { "status": "OFFLINE" }
             })
         );
+    }
+
+    #[test]
+    fn heartbeat_uses_exact_json_ping_pong_contract() {
+        assert_eq!(
+            serde_json::to_value(ClientMessage::heartbeat_ping("ping-1".into())).unwrap(),
+            serde_json::json!({"type":"HEARTBEAT","payload":{"kind":"PING","ping_id":"ping-1"}})
+        );
+        let pong = r#"{"type":"HEARTBEAT","payload":{"kind":"PONG","ping_id":"ping-1"}}"#;
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(pong).unwrap(),
+            ServerMessage::heartbeat_pong("ping-1".into())
+        );
+        for payload in [
+            r#"{"kind":"PING","ping_id":"ping-1"}"#,
+            r#"{"kind":"PONG"}"#,
+            r#"{"kind":"PONG","ping_id":1}"#,
+            r#"{"kind":"PONG","ping_id":"ping-1","agent_id":11}"#,
+            r#"{"kind":"UNKNOWN","ping_id":"ping-1"}"#,
+        ] {
+            let raw = format!(r#"{{"type":"HEARTBEAT","payload":{payload}}}"#);
+            assert!(serde_json::from_str::<ServerMessage>(&raw).is_err());
+        }
+        assert!(serde_json::from_str::<ServerMessage>(&format!("{pong} {{}}")).is_err());
     }
 }

@@ -5,7 +5,7 @@
 
 use crate::{
     config::Config,
-    protocol::{ClientMessage, PresenceStatus, ServerMessage},
+    protocol::{ClientMessage, HeartbeatPong, PresenceStatus, ServerMessage},
 };
 use anyhow::{Result, bail, ensure};
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -23,6 +23,19 @@ use tokio_tungstenite::tungstenite::{
 };
 pub use tokio_util::sync::CancellationToken;
 
+/// 운영 중앙의 40초 PING 무수신 제한 안에 전송하며 응답은 최대 20초 대기합니다.
+/// 테스트는 같은 연결 루프에 짧은 시간을 주입해 실제 소켓에서 만료를 재현합니다.
+#[derive(Clone, Copy)]
+struct HeartbeatTiming {
+    interval: Duration,
+    pong_timeout: Duration,
+}
+
+const HEARTBEAT_TIMING: HeartbeatTiming = HeartbeatTiming {
+    interval: Duration::from_secs(20),
+    pong_timeout: Duration::from_secs(20),
+};
+
 /// 중앙 웹소켓 서버와의 연결 상태
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionStatus {
@@ -35,7 +48,7 @@ pub enum ConnectionStatus {
     Connected,
     /// 일시적 연결 해제 또는 타임아웃 후 재연결 시도 중
     Reconnecting,
-    /// Upgrade 401/403 또는 Close 4001 등 인증 거부 (자동 재시도 중단)
+    /// Upgrade HTTP 401/403 인증 거부 (자동 재시도 중단)
     AuthFailed,
     /// Close 4002: 동일 Agent의 새 연결로 교체됨 (자동 재시도 중단)
     Replaced,
@@ -223,7 +236,7 @@ enum Outcome {
         /// 해당 세션에서 유효한 `BROKER_READY`를 받아 `Connected`에 도달했었는지 여부
         was_connected: bool,
     },
-    /// 인증 거부로 인한 영구 중단 (HTTP 401/403, Close 4001)
+    /// 인증 거부로 인한 영구 중단 (HTTP 401/403)
     AuthFailed,
     /// 동일 Agent의 새 연결로 교체되어 영구 중단 (Close 4002)
     Replaced,
@@ -300,10 +313,20 @@ pub async fn run_with_state(
     state: CentralState,
     cancel: CancellationToken,
 ) {
+    run_with_heartbeat(config, token, state, cancel, HEARTBEAT_TIMING).await;
+}
+
+async fn run_with_heartbeat(
+    config: Config,
+    token: String,
+    state: CentralState,
+    cancel: CancellationToken,
+    heartbeat_timing: HeartbeatTiming,
+) {
     let mut delay = config.reconnect_initial_ms;
     loop {
         let session_handle = state.begin_session().await;
-        let outcome = session(&config, &token, &session_handle, &cancel).await;
+        let outcome = session(&config, &token, &session_handle, &cancel, heartbeat_timing).await;
         // 연결 세션이 종료되면 해당 세션의 connection_id / agent_id를 즉시 무효화
         session_handle.clear_identity().await;
 
@@ -364,7 +387,8 @@ pub async fn run_with_state(
 /// WebSocket Close 코드를 종료 결과(`Outcome`)로 분류합니다.
 fn classify_close_code(code: u16, was_connected: bool) -> Outcome {
     match code {
-        4001 => Outcome::AuthFailed,
+        // 중앙의 4001은 하트비트 만료입니다. 인증 실패와 달리 재접속 가능합니다.
+        4001 => Outcome::Retry { was_connected },
         4002 => Outcome::Replaced,
         1008 => Outcome::ProtocolViolation,
         _ => Outcome::Retry { was_connected },
@@ -401,6 +425,7 @@ async fn session(
     token: &str,
     handle: &SessionHandle,
     cancel: &CancellationToken,
+    heartbeat_timing: HeartbeatTiming,
 ) -> Outcome {
     // 연결 전부터 구독해 READY 수신과 구독 사이의 상태 변경을 놓치지 않습니다.
     let mut presence = handle.state.presence.subscribe();
@@ -454,9 +479,11 @@ async fn session(
     let ready_deadline = sleep(Duration::from_millis(config.auth_timeout_ms));
     tokio::pin!(ready_deadline);
 
-    // 5초 간격 하트비트(Ping) 및 응답 타임아웃(15초) 측정
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
-    let mut last_seen = Instant::now();
+    let mut heartbeat = tokio::time::interval(heartbeat_timing.interval);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let pong_deadline = sleep(heartbeat_timing.pong_timeout);
+    tokio::pin!(pong_deadline);
+    let mut pending_ping: Option<String> = None;
     let mut ready = false;
 
     loop {
@@ -491,17 +518,22 @@ async fn session(
                 }
             }
 
-            // 주기적 하트비트(Ping) 전송 및 15초 이상 서버 응답 부재 시 재연결
-            _ = heartbeat.tick(), if ready => {
-                if last_seen.elapsed() > Duration::from_secs(15) {
-                    return Outcome::Retry {
-                        was_connected: true,
-                    };
-                }
+            // 다른 JSON·제어 Ping/Pong·잘못된 ping_id는 이 대기 시간을 연장하지 않습니다.
+            _ = &mut pong_deadline, if pending_ping.is_some() => {
+                let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                return Outcome::Retry { was_connected: true };
+            }
+
+            // 응답 대기 중에는 새 PING으로 이전 요청과 제한 시간을 덮어쓰지 않습니다.
+            _ = heartbeat.tick(), if ready && pending_ping.is_none() => {
+                let ping_id = uuid::Uuid::new_v4().to_string();
+                let text = serde_json::to_string(&ClientMessage::heartbeat_ping(ping_id.clone()))
+                    .expect("serializable HEARTBEAT PING");
+                let sent_at = Instant::now();
                 if !matches!(
                     timeout(
                         Duration::from_secs(1),
-                        socket.send(Message::Ping(Vec::new().into())),
+                        socket.send(Message::Text(text.into())),
                     )
                     .await,
                     Ok(Ok(()))
@@ -510,6 +542,8 @@ async fn session(
                         was_connected: true,
                     };
                 }
+                pending_ping = Some(ping_id);
+                pong_deadline.as_mut().reset(sent_at + heartbeat_timing.pong_timeout);
             }
 
             // 서버로부터 메시지 수신 처리
@@ -532,7 +566,6 @@ async fn session(
 
                     // 텍스트(JSON) 메시지 수신 처리
                     Some(Ok(Message::Text(text))) => {
-                        last_seen = Instant::now();
                         if !ready {
                             match serde_json::from_str::<ServerMessage>(&text) {
                                 Ok(ServerMessage::BrokerReady(payload)) if payload.is_valid() => {
@@ -557,7 +590,6 @@ async fn session(
                                     }
 
                                     ready = true;
-                                    last_seen = Instant::now();
                                     heartbeat.reset();
                                     if !handle.set_status(ConnectionStatus::Connected).await {
                                         let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
@@ -571,11 +603,20 @@ async fn session(
                                 }
                             }
                         } else {
-                            // 이미 BROKER_READY가 완료된 상태에서 중복 BROKER_READY 또는 알 수 없는 비정상 JSON 수신 시
-                            // 보안을 위해 원문은 로그에 남기지 않으며, 중복 BROKER_READY는 정책 위반으로 거부
-                            if serde_json::from_str::<ServerMessage>(&text).is_ok() {
-                                let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
-                                return Outcome::ProtocolViolation;
+                            match serde_json::from_str::<ServerMessage>(&text) {
+                                Ok(ServerMessage::Heartbeat(HeartbeatPong::Pong { ping_id })) => {
+                                    if pending_ping.as_deref() == Some(ping_id.as_str())
+                                        && Instant::now() < pong_deadline.deadline()
+                                    {
+                                        pending_ping = None;
+                                    }
+                                }
+                                Ok(ServerMessage::BrokerReady(_)) => {
+                                    let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                                    return Outcome::ProtocolViolation;
+                                }
+                                // 원문은 출력하지 않으며 알 수 없는 메시지로 PONG 대기를 연장하지 않습니다.
+                                Err(_) => {}
                             }
                         }
                     }
@@ -588,7 +629,6 @@ async fn session(
 
                     // 서버로부터 Ping 수신 시 Pong 응답
                     Some(Ok(Message::Ping(payload))) => {
-                        last_seen = Instant::now();
                         if !matches!(
                             timeout(Duration::from_secs(1), socket.send(Message::Pong(payload))).await,
                             Ok(Ok(()))
@@ -599,8 +639,8 @@ async fn session(
                         }
                     }
 
-                    // 서버로부터 Pong 수신 시 last_seen 갱신
-                    Some(Ok(Message::Pong(_))) => last_seen = Instant::now(),
+                    // 제어 Pong은 JSON HEARTBEAT 응답으로 인정하지 않습니다.
+                    Some(Ok(Message::Pong(_))) => {}
                     _ => {}
                 }
             }
@@ -611,6 +651,279 @@ async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{BrokerReadyPayload, HeartbeatPing};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{
+        net::TcpListener,
+        sync::Mutex,
+        task::{JoinHandle, JoinSet},
+    };
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+    #[derive(Clone, Copy)]
+    enum HeartbeatReply {
+        Echo,
+        WrongId,
+        ReplayFirst,
+        ExpireFirstConnection,
+    }
+
+    struct HeartbeatFixture {
+        state: CentralState,
+        cancel: CancellationToken,
+        runner: JoinHandle<()>,
+        server: JoinHandle<()>,
+        attempts: Arc<AtomicUsize>,
+        expirations: Arc<AtomicUsize>,
+        messages: Arc<Mutex<Vec<(usize, ClientMessage)>>>,
+    }
+
+    impl HeartbeatFixture {
+        async fn start(reply: HeartbeatReply, auto_reconnect: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let expirations = Arc::new(AtomicUsize::new(0));
+            let messages = Arc::new(Mutex::new(Vec::new()));
+            let attempts_copy = attempts.clone();
+            let expirations_copy = expirations.clone();
+            let messages_copy = messages.clone();
+            let server = tokio::spawn(async move {
+                let mut clients = JoinSet::new();
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let connection = attempts_copy.fetch_add(1, Ordering::SeqCst) + 1;
+                    let messages = messages_copy.clone();
+                    let expirations = expirations_copy.clone();
+                    clients.spawn(async move {
+                        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                        let ready = ServerMessage::BrokerReady(BrokerReadyPayload {
+                            connection_id: format!("heartbeat-{connection}"),
+                            agent_id: 11,
+                        });
+                        socket.send(Message::Text(serde_json::to_string(&ready).unwrap().into())).await.unwrap();
+                        let expiration = sleep(Duration::from_millis(250));
+                        tokio::pin!(expiration);
+                        let mut noise = tokio::time::interval(Duration::from_millis(20));
+                        let mut first_ping = None;
+                        loop {
+                            let message = tokio::select! {
+                                _ = &mut expiration => {
+                                    expirations.fetch_add(1, Ordering::SeqCst);
+                                    let _ = socket.close(Some(CloseFrame {
+                                        code: 4001.into(),
+                                        reason: "Heartbeat timeout".into(),
+                                    })).await;
+                                    return;
+                                }
+                                _ = noise.tick(), if matches!(reply, HeartbeatReply::WrongId | HeartbeatReply::ReplayFirst) => {
+                                    // 제어 프레임·다른 JSON 수신만으로 클라이언트의 PONG 대기가 연장되면 안 됩니다.
+                                    for frame in [
+                                        Message::Ping(Vec::new().into()),
+                                        Message::Pong(Vec::new().into()),
+                                        Message::Text(r#"{"type":"OTHER"}"#.into()),
+                                        Message::Text(r#"{"type":"HEARTBEAT","payload":{"kind":"PONG","ping_id":1}}"#.into()),
+                                    ] {
+                                        if socket.send(frame).await.is_err() { return; }
+                                    }
+                                    continue;
+                                }
+                                message = socket.next() => message,
+                            };
+                            let Some(Ok(message)) = message else { return };
+                            match message {
+                                Message::Text(text) => {
+                                    let message: ClientMessage = serde_json::from_str(&text).unwrap();
+                                    messages.lock().await.push((connection, message.clone()));
+                                    if let ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }) = message {
+                                        if matches!(reply, HeartbeatReply::ExpireFirstConnection) && connection == 1 {
+                                            continue;
+                                        }
+                                        expiration.as_mut().reset(Instant::now() + Duration::from_millis(250));
+                                        let first = first_ping.get_or_insert_with(|| ping_id.clone());
+                                        let response_id = match reply {
+                                            HeartbeatReply::WrongId => "unrelated-id".into(),
+                                            HeartbeatReply::ReplayFirst => first.clone(),
+                                            _ => ping_id,
+                                        };
+                                        let pong = serde_json::to_string(&ServerMessage::heartbeat_pong(response_id)).unwrap();
+                                        if socket.send(Message::Text(pong.into())).await.is_err() { return; }
+                                    }
+                                }
+                                Message::Ping(payload) => {
+                                    if socket.send(Message::Pong(payload)).await.is_err() { return; }
+                                }
+                                Message::Close(_) => return,
+                                _ => {}
+                            }
+                        }
+                    });
+                    while let Some(result) = clients.try_join_next() {
+                        result.unwrap();
+                    }
+                }
+            });
+            let config = Config {
+                server_url: format!("ws://{address}"),
+                auto_reconnect,
+                reconnect_initial_ms: 150,
+                reconnect_max_ms: 150,
+                ..Config::default()
+            };
+            let state = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)));
+            if matches!(reply, HeartbeatReply::ExpireFirstConnection) {
+                state.set_presence(PresenceStatus::Online);
+            }
+            let cancel = CancellationToken::new();
+            let timing = HeartbeatTiming {
+                interval: Duration::from_millis(40),
+                // 서버의 4001을 클라이언트 자체 PONG 만료보다 먼저 관측합니다.
+                pong_timeout: Duration::from_millis(
+                    if matches!(reply, HeartbeatReply::ExpireFirstConnection) {
+                        500
+                    } else {
+                        120
+                    },
+                ),
+            };
+            let runner = tokio::spawn(run_with_heartbeat(
+                config,
+                "test-heartbeat-token".into(),
+                state.clone(),
+                cancel.clone(),
+                timing,
+            ));
+            Self {
+                state,
+                cancel,
+                runner,
+                server,
+                attempts,
+                expirations,
+                messages,
+            }
+        }
+
+        async fn wait_status(&self, expected: ConnectionStatus) {
+            timeout(Duration::from_secs(3), async {
+                while self.state.status().await != expected {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        async fn wait_pings(&self, connection: usize, count: usize) -> Vec<String> {
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let pings: Vec<_> = self
+                        .messages
+                        .lock()
+                        .await
+                        .iter()
+                        .filter_map(|(seq, message)| {
+                            if *seq == connection
+                                && let ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }) =
+                                    message
+                            {
+                                Some(ping_id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if pings.len() >= count {
+                        return pings;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+
+        async fn stop(self) {
+            self.cancel.cancel();
+            timeout(Duration::from_secs(3), self.runner)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(self.state.status().await, ConnectionStatus::Disconnected);
+            assert_eq!(self.state.identity().await, None);
+            self.server.abort();
+            let _ = self.server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn json_heartbeat_keeps_connection_alive_past_server_expiration() {
+        let f = HeartbeatFixture::start(HeartbeatReply::Echo, true).await;
+        let pings = f.wait_pings(1, 8).await;
+        let unique: std::collections::HashSet<_> = pings.iter().collect();
+        assert_eq!(unique.len(), pings.len());
+        assert!(pings.iter().all(|id| uuid::Uuid::parse_str(id).is_ok()));
+        assert_eq!(f.state.status().await, ConnectionStatus::Connected);
+        assert_eq!(f.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(f.expirations.load(Ordering::SeqCst), 0);
+        assert_eq!(f.state.presence().await, None);
+        assert!(
+            f.messages
+                .lock()
+                .await
+                .iter()
+                .all(|(_, message)| matches!(message, ClientMessage::Heartbeat(_)))
+        );
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn unmatched_replayed_or_missing_json_pong_expires_despite_other_frames() {
+        for (reply, expected_pings) in [
+            (HeartbeatReply::WrongId, 1),
+            (HeartbeatReply::ReplayFirst, 2),
+        ] {
+            let f = HeartbeatFixture::start(reply, true).await;
+            f.wait_status(ConnectionStatus::Reconnecting).await;
+            assert_eq!(f.state.identity().await, None);
+            assert_eq!(f.wait_pings(1, expected_pings).await.len(), expected_pings);
+            assert_eq!(f.attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(f.expirations.load(Ordering::SeqCst), 0);
+            f.stop().await;
+        }
+        let f = HeartbeatFixture::start(HeartbeatReply::WrongId, false).await;
+        f.wait_status(ConnectionStatus::Disconnected).await;
+        assert_eq!(f.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(f.state.identity().await, None);
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn server_4001_timeout_reconnects_with_new_identity_and_presence() {
+        let f = HeartbeatFixture::start(HeartbeatReply::ExpireFirstConnection, true).await;
+        let old_ping = f.wait_pings(1, 1).await;
+        f.wait_status(ConnectionStatus::Reconnecting).await;
+        assert_eq!(f.state.identity().await, None);
+        assert_eq!(f.expirations.load(Ordering::SeqCst), 1);
+        let new_ping = f.wait_pings(2, 1).await;
+        assert_ne!(old_ping[0], new_ping[0]);
+        assert_eq!(f.state.status().await, ConnectionStatus::Connected);
+        assert_eq!(
+            f.state.identity().await.unwrap().connection_id,
+            "heartbeat-2"
+        );
+        for connection in [1, 2] {
+            assert!(
+                f.messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|(seq, message)| *seq == connection
+                        && *message == ClientMessage::agent_presence(PresenceStatus::Online))
+            );
+        }
+        f.stop().await;
+    }
 
     #[test]
     fn endpoint_url_normalizes_root_and_rejects_non_broker_paths() {

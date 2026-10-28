@@ -6,7 +6,7 @@
 
 중앙 서버의 보안 전략과 2026-10-27 작업 기록을 확인해 [중앙 WebSocket 연동 규칙](central-websocket-contract.md)에 Rust 적용 기준을 기록했습니다. `/ws/broker`의 Agent 토큰 인증, `BROKER_READY`, `AGENT_PRESENCE`, 동일 Agent 연결 교체·종료 보호는 문서에 정의돼 있으므로 해당 규칙을 따릅니다. 아래의 포괄적인 중앙 인증·메시지 협의 표기는 이 구체적인 규칙과 후속 항목을 구분해 읽습니다.
 
-중앙은 인증 Principal과 DB의 Agent 소유자·팀을 검증합니다. READY에는 `connection_id`와 숫자 `agent_id`만 있으며 사용자·팀 필드를 추가하는 계약은 없습니다. MCP 세션 principal에 필요한 `userId/teamId` 전달 경로와 최초 Agent 등록·토큰 발급 흐름의 연결은 별도 후속 항목입니다. 중앙 Heartbeat의 20초·20초·40초는 초기안이며 현재 Rust의 5초 Ping·15초 초과 무응답 판정과 정합성을 확인해야 합니다. presence는 공유 `CentralState::set_presence`로 게시하면 READY·변경·재접속 시 보고하도록 구현했으며, 실제 로컬 세션의 생성·bind·해제·만료 이벤트 연결과 업무 라우팅·수신함 ACK는 남아 있습니다.
+중앙은 인증 Principal과 DB의 Agent 소유자·팀을 검증합니다. READY에는 `connection_id`와 숫자 `agent_id`만 있으며 사용자·팀 필드를 추가하는 계약은 없습니다. MCP 세션 principal에 필요한 `userId/teamId` 전달 경로와 최초 Agent 등록·토큰 발급 흐름의 연결은 별도 후속 항목입니다. 현재 로컬 서버의 JSON `HEARTBEAT`·4001 만료 처리를 확인해 Rust에 PING 20초 간격·동일 ping_id PONG 최대 20초 대기·만료 후 재접속을 구현했습니다. 서버의 JSON PING 무수신 만료 기본값은 40초이며 실제 배포 설정·통합 환경 검증은 남아 있습니다. presence는 공유 `CentralState::set_presence`로 게시하면 READY·변경·재접속 시 보고하도록 구현했으며, 실제 로컬 세션의 생성·bind·해제·만료 이벤트 연결과 업무 라우팅·수신함 ACK는 남아 있습니다.
 
 ## 협의 상태와 결정 범위
 

@@ -3,7 +3,7 @@ use devlink_broker::{
     central::{self, CancellationToken, CentralIdentity, CentralState, ConnectionStatus},
     config::{self, Config},
     local::{self, Health, Runtime},
-    protocol::PresenceStatus,
+    protocol::{ClientMessage, HeartbeatPing, PresenceStatus, ServerMessage},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -409,7 +409,7 @@ enum Behavior {
     EmptyConnectionId,
     ZeroAgentId,
     LegacyAuthOk,
-    CloseUnauthorized4001,
+    CloseHeartbeatTimeout4001,
     CloseReplaced4002,
     ClosePolicyViolation1008,
 }
@@ -418,6 +418,8 @@ struct Mock {
     address: std::net::SocketAddr,
     attempts: Arc<AtomicUsize>,
     received: Arc<Mutex<Vec<String>>>,
+    heartbeat_pings: Arc<Mutex<Vec<(u64, String, Instant)>>>,
+    expirations: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 impl Mock {
@@ -426,8 +428,12 @@ impl Mock {
         let address = listener.local_addr().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let received = Arc::new(Mutex::new(Vec::new()));
+        let heartbeat_pings = Arc::new(Mutex::new(Vec::new()));
+        let expirations = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
         let received_clone = received.clone();
+        let heartbeat_pings_clone = heartbeat_pings.clone();
+        let expirations_clone = expirations.clone();
         let next_seq = Arc::new(AtomicU64::new(1));
 
         let task = tokio::spawn(async move {
@@ -436,6 +442,8 @@ impl Mock {
                 let (stream, _) = listener.accept().await.unwrap();
                 let attempts = attempts_clone.clone();
                 let received = received_clone.clone();
+                let heartbeat_pings = heartbeat_pings_clone.clone();
+                let expirations = expirations_clone.clone();
                 let seq = next_seq.fetch_add(1, Ordering::SeqCst);
 
                 clients.spawn(async move {
@@ -498,7 +506,7 @@ impl Mock {
                                 r#"{{"type":"BROKER_READY","payload":{{"connection_id":"conn-{seq}","agent_id":{agent_id}}}}}"#
                             )
                         }
-                        Behavior::CloseReplaced4002 | Behavior::ClosePolicyViolation1008 => {
+                        Behavior::CloseHeartbeatTimeout4001 | Behavior::CloseReplaced4002 | Behavior::ClosePolicyViolation1008 => {
                             format!(
                                 r#"{{"type":"BROKER_READY","payload":{{"connection_id":"conn-{seq}","agent_id":11}}}}"#
                             )
@@ -517,23 +525,6 @@ impl Mock {
                                 .to_string()
                         }
                         Behavior::LegacyAuthOk => r#"{"type":"auth_ok"}"#.to_string(),
-                        Behavior::CloseUnauthorized4001 => {
-                            let _ = socket
-                                .close(Some(CloseFrame {
-                                    code: 4001.into(),
-                                    reason: "Unauthorized".into(),
-                                }))
-                                .await;
-                            let _ = tokio::time::timeout(Duration::from_millis(500), async {
-                                while let Some(Ok(msg)) = socket.next().await {
-                                    if msg.is_close() {
-                                        break;
-                                    }
-                                }
-                            })
-                            .await;
-                            return;
-                        }
                         Behavior::Deny401 | Behavior::Deny403 => unreachable!(),
                     };
 
@@ -579,9 +570,51 @@ impl Mock {
                         _ => {}
                     }
 
-                    while let Some(Ok(message)) = socket.next().await {
+                    if matches!(behavior, Behavior::CloseHeartbeatTimeout4001) && seq == 1 {
+                        let _ = socket.close(Some(CloseFrame {
+                            code: 4001.into(),
+                            reason: "Heartbeat timeout".into(),
+                        })).await;
+                        return;
+                    }
+
+                    // 실제 중앙처럼 JSON PING만 40초 무수신 만료를 연장합니다.
+                    let heartbeat_expiration = sleep(Duration::from_secs(40));
+                    tokio::pin!(heartbeat_expiration);
+                    loop {
+                        let message = tokio::select! {
+                            _ = &mut heartbeat_expiration => {
+                                expirations.fetch_add(1, Ordering::SeqCst);
+                                let _ = socket.close(Some(CloseFrame {
+                                    code: 4001.into(),
+                                    reason: "Heartbeat timeout".into(),
+                                })).await;
+                                break;
+                            }
+                            message = socket.next() => message,
+                        };
+                        let Some(Ok(message)) = message else { break };
                         match message {
                             Message::Text(text) => {
+                                if let Ok(ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id })) =
+                                    serde_json::from_str::<ClientMessage>(&text)
+                                {
+                                    if ping_id.trim().is_empty() || ping_id.encode_utf16().count() > 128 {
+                                        let _ = socket.close(Some(CloseFrame {
+                                            code: 1008.into(),
+                                            reason: "Invalid HEARTBEAT PING".into(),
+                                        })).await;
+                                        break;
+                                    }
+                                    let received_at = Instant::now();
+                                    heartbeat_expiration.as_mut().reset(received_at + Duration::from_secs(40));
+                                    heartbeat_pings.lock().await.push((seq, ping_id.clone(), received_at));
+                                    let pong = serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id)).unwrap();
+                                    if socket.send(Message::Text(pong.into())).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 received.lock().await.push(text.to_string());
                             }
                             Message::Ping(payload) => {
@@ -601,6 +634,8 @@ impl Mock {
             address,
             attempts,
             received,
+            heartbeat_pings,
+            expirations,
             task,
         }
     }
@@ -703,12 +738,87 @@ async fn websocket_auth_disconnect_restart_and_reconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authentication_rejection_401_403_and_4001_stop_retries() {
-    for behavior in [
-        Behavior::Deny401,
-        Behavior::Deny403,
-        Behavior::CloseUnauthorized4001,
-    ] {
+async fn json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect() {
+    let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 11 }).await;
+    let f = Fixture::new();
+    f.configure(|config| config.server_url = format!("ws://{}", server.address));
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Connected).await;
+    let initial = f.health().await;
+    let started = Instant::now();
+
+    // 시간을 단축하지 않고 실제 CLI의 JSON PING 20초·PONG 대기 20초와
+    // Mock의 40초 무수신 만료를 사용합니다. 재접속으로 연결이 바뀌어도 실패합니다.
+    loop {
+        let health = f.health().await;
+        assert_eq!(health.central_server, ConnectionStatus::Connected);
+        assert_eq!(health.pid, initial.pid);
+        assert_eq!(health.instance_id, initial.instance_id);
+        assert_eq!(
+            server.attempts.load(Ordering::SeqCst),
+            1,
+            "Must keep the original WebSocket connection"
+        );
+        assert_eq!(server.expirations.load(Ordering::SeqCst), 0);
+        if started.elapsed() >= Duration::from_secs(45) {
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    {
+        let pings = server.heartbeat_pings.lock().await;
+        assert!(
+            pings.len() >= 2,
+            "Expected production JSON PINGs around 20 and 40 seconds"
+        );
+        assert!(pings.iter().all(|(seq, _, _)| *seq == 1));
+        assert_ne!(
+            pings[0].1, pings[1].1,
+            "Each heartbeat must use a new ping_id"
+        );
+        assert!(pings[1].2.duration_since(pings[0].2) >= Duration::from_secs(19));
+    }
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Heartbeat must not guess local Agent presence"
+    );
+    f.ok(&["stop"]);
+    assert!(!local::running(&f.path).unwrap());
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_timeout_4001_reconnects_only_when_enabled() {
+    for auto_reconnect in [true, false] {
+        let server = Mock::start("127.0.0.1:0", Behavior::CloseHeartbeatTimeout4001).await;
+        let f = Fixture::new();
+        f.configure(|config| {
+            config.server_url = format!("ws://{}", server.address);
+            config.auto_reconnect = auto_reconnect;
+        });
+        f.ok(&["start"]);
+        if auto_reconnect {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while server.attempts.load(Ordering::SeqCst) < 2 {
+                assert!(Instant::now() < deadline, "4001 must reconnect");
+                sleep(Duration::from_millis(10)).await;
+            }
+            f.wait_status(ConnectionStatus::Connected).await;
+            assert_eq!(server.attempts.load(Ordering::SeqCst), 2);
+        } else {
+            f.wait_status(ConnectionStatus::Disconnected).await;
+            sleep(Duration::from_millis(200)).await;
+            assert_eq!(server.attempts.load(Ordering::SeqCst), 1);
+        }
+        f.ok(&["stop"]);
+        server.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authentication_rejection_401_and_403_stop_retries() {
+    for behavior in [Behavior::Deny401, Behavior::Deny403] {
         let server = Mock::start("127.0.0.1:0", behavior).await;
         let f = Fixture::new();
         f.configure(|config| config.server_url = format!("ws://{}", server.address));

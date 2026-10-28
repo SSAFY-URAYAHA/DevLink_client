@@ -1,6 +1,6 @@
 # 중앙 WebSocket 연동 규칙과 Rust 적용 기준
 
-확인일: 2026-10-28 (Asia/Seoul). 중앙 서버 문서에 명시된 규칙을 Rust 브로커의 구현 기준으로 기록한다. 문서상의 규칙, 현재 Rust 구현, 초기안과 후속 연동 항목을 구분한다. 이 기록은 실제 중앙 서버와 Rust의 연동 완료를 의미하지 않는다.
+확인일: 2026-10-28 (Asia/Seoul). 중앙 서버 문서와 로컬 서버 소스에 명시된 규칙을 Rust 브로커의 구현 기준으로 기록한다. JSON Heartbeat·4001의 의미는 아래 서버 구현을 확인해 갱신했다. 이 기록은 실제 중앙 배포 환경과 Rust의 연동 완료를 의미하지 않는다.
 
 ## 1. 근거 문서와 적용 범위
 
@@ -8,6 +8,8 @@
 | --- | --- |
 | [중앙 서버 보안 전략](../../../DevLink_server/docs/security-strategy.md) | 사용자 세션과 Agent 토큰의 분리, WebSocket 인증, Principal 전달, 연결·접속 상태 처리, 인증 모듈의 남은 구현 |
 | [2026-10-27 중앙 실시간 연결·라우팅 작업 기록](../../../DevLink_server/docs/bogyeong/2026-10-27.md) | 사용자당 Agent 1개·활성 브로커 1개, Registry 교체·종료 보호, READY·PRESENCE 형식과 시점, DB 검증, Heartbeat 초기안, 업무 라우팅 후속 범위 |
+| [현재 로컬 서버 핸들러](../../../DevLink_server/src/main/java/com/devlink/server/handler/DevLinkWebSocketHandler.java)·[Registry](../../../DevLink_server/src/main/java/com/devlink/server/realtime/ConnectionRegistry.java) | JSON HEARTBEAT PING의 검증·수신 시각 갱신과 같은 ping_id의 PONG 응답. 제어 Ping이나 presence는 만료 감시 갱신을 대체하지 않음 |
+| [Heartbeat 서비스](../../../DevLink_server/src/main/java/com/devlink/server/service/BrokerHeartbeatService.java)·[설정](../../../DevLink_server/src/main/resources/application.yml) | 유효한 JSON PING 무수신 기본 40초·검사 기본 1초, 만료 시 4001 Heartbeat timeout |
 
 두 문서에 명시된 인증·연결·접속 상태 규칙을 우선 적용한다. 같은 Agent의 중앙 WebSocket 연결 교체와 MCP 로컬 세션의 `fresh/recover` 소유권은 각각 별도로 구현한다. 중앙 문서가 사용하는 활성 브로커 1개는 중앙 WebSocket 연결 기준이며, MCP 프로세스의 세션 수를 정하는 계약으로 확대 해석하지 않는다.
 
@@ -88,27 +90,43 @@ Rust는 상태 보고에 `agent_id`, 사용자·팀 식별자, 클라이언트 �
 - 실제 전달 가능 여부는 DB 상태와 Registry의 현재 열린 연결을 함께 확인한다.
 - 중앙 서버 재시작으로 메모리 연결 정보가 사라지면 브로커 재접속으로 다시 구성한다. 자동 재접속은 Rust 담당 범위다.
 
-현재 Rust의 종료 분류는 다음과 같다. 4002·1008은 위 중앙 문서와 대응하며, 403·4001의 처리도 Rust에 구현돼 있다. 제공된 두 중앙 문서만으로 403·4001의 모든 서버 발생 조건이 확인된 것은 아니다.
+현재 Rust의 종료 분류는 다음과 같다. 서버 `BrokerHeartbeatService`가 4001을 `Heartbeat timeout`에 사용하는 것을 확인했으므로 기존의 4001 인증 실패 분류를 수정했다. HTTP 401/403 인증 실패와 WebSocket Close 4001은 구분한다.
 
 | 응답·종료 | 현재 Rust 처리 |
 | --- | --- |
-| Upgrade 401·403 또는 Close 4001 | `AuthFailed`, 자동 재접속 중단 |
+| Upgrade HTTP 401·403 | `AuthFailed`, 자동 재접속 중단 |
+| Close 4001 (Heartbeat timeout) 또는 JSON PONG 응답 제한 초과 | `autoReconnect=true`이면 백오프 재접속, false이면 `Disconnected` |
 | Close 4002 | `Replaced`, 자동 재접속 중단 |
 | Close 1008 또는 잘못된 초기 READY | `ProtocolViolation`, 자동 재접속 중단 |
 | 일시적 단절·READY 시간 초과 | `autoReconnect` 설정에 따라 지수 백오프로 재접속 |
 | 브로커 종료 요청 | WebSocket·재접속 대기 취소 후 종료 |
 
-## 6. Heartbeat: 초기안과 현재 구현
+## 6. JSON Heartbeat와 만료 처리
 
-중앙 작업 기록은 Heartbeat와 무응답 연결 정리를 남은 작업으로 표시한다. 아래 중앙 수치는 **논의한 초기안**이며, 최종 합의·구현 완료로 기록하지 않는다.
+2026-10-27 문서는 하트비트를 초기안으로 남겼지만 현재 로컬 서버에는 JSON Heartbeat와 만료 정리가 구현돼 있다. Rust도 이 JSON 규칙을 따른다. 아래 서버 값은 로컬 소스의 기본값이며 배포 환경의 실제 설정을 확인한 것은 아니다.
+
+```json
+{"type":"HEARTBEAT","payload":{"kind":"PING","ping_id":"unique-ping-id"}}
+```
+
+서버는 같은 `ping_id`를 사용해 다음과 같이 응답한다.
+
+```json
+{"type":"HEARTBEAT","payload":{"kind":"PONG","ping_id":"unique-ping-id"}}
+```
 
 | 구분 | 기준 |
 | --- | --- |
-| 중앙 문서 초기안 | PING 20초 간격, PONG 대기 20초, 서버의 PING 무수신 판정 40초 |
-| 현재 Rust | READY 후 WebSocket Ping 5초 간격, 마지막 수신 후 15초 초과를 Heartbeat tick에서 감지하면 재접속 |
+| 현재 Rust | READY 후 첫 PING까지 20초, 이후 20초 간격 JSON PING. 각 PING의 동일 ping_id PONG을 전송 시점부터 최대 20초 대기 |
+| 현재 로컬 서버 | 등록 시점부터 감시. 유효한 JSON PING만 수신 시각 갱신, 기본 40초 이상 무수신이면 다음 검사에서 4001로 종료 |
+| 개발용 Rust Mock | 같은 JSON PING/PONG과 40초 무수신 만료·4001 적용. presence·제어 프레임으로 감시 시간 갱신하지 않음 |
 | MCP 로컬 세션 | MCP 갱신 기본 30초, 브로커 lease 90초. 중앙 Heartbeat와 별도 |
 
-현재 Rust의 무응답 판정은 Pong만이 아니라 수신 Text·Ping·Pong으로 마지막 수신 시각을 갱신한다. 중앙의 최종 Heartbeat 주기·응답 판정·종료 동작과 실제 연동할 때 정합성을 확인한다. 이번 문서 정리로 Rust 상수를 변경하지 않는다.
+각 PING은 UUID ping_id를 사용하고 응답 대기 중에는 새 PING으로 기존 요청·제한 시간을 덮어쓰지 않는다. 잘못된 형식·다른 ID·이전 PONG·일반 JSON·WebSocket 제어 Ping/Pong은 PONG 대기를 완료하거나 연장하지 않는다. 제어 Ping에는 전송 계층의 Pong을 응답하지만 이를 JSON Heartbeat로 인정하지 않는다. PONG이 만료되면 연결을 정리하고 재접속 설정을 따른다.
+
+재접속할 때는 이전 연결의 식별자·PONG 대기를 폐기하고 새 READY 후 최신 확인된 presence를 다시 보고한다. 4002 교체·1008 정책 위반·Upgrade 401/403은 계속 자동 재접속을 중단한다. 연결 유지·PONG 불일치/재사용·만료·4001 재접속과 autoReconnect=false의 로컬 검증은 [검증 기록](verification.md)을 참고한다.
+
+실제 주기의 연결 유지는 CLI 통합 테스트 `json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect`로 자동 검증한다. JSON PING 무수신 시 40초 만료·4001로 종료하는 Mock을 사용하고, 시간 단축 없이 45초간 Connected·연결 1회·만료 0회와 서로 다른 ping_id의 반복 수신을 확인한다. 재접속 후 Connected로 돌아온 경우는 연결 횟수 검사에서 실패한다. 기본 테스트 실행에 포함하며 실제 중앙 배포 환경 검증과는 구분한다.
 
 ## 7. MCP 신원·등록 및 업무 라우팅과의 경계
 
@@ -131,7 +149,7 @@ Rust는 상태 보고에 `agent_id`, 사용자·팀 식별자, 클라이언트 �
 1. 기존 READY·PRESENCE 규칙에 맞춰 3단계 로컬 세션 상태와 중앙 presence를 연결한다. MCP 세션 principal에 필요한 검증된 신원 전달 경로는 별도로 연결한다.
 2. 실제 중앙의 AgentTokenVerifier·Agent 토큰으로 Upgrade → READY → PRESENCE → DB 상태 갱신을 검증한다.
 3. 세션 해제·만료, 중앙 재시작·재접속, 동일 Agent 연결 교체와 오래된 이벤트가 새 상태에 영향을 주지 않는지 확인한다.
-4. 중앙 Heartbeat 최종값과 무응답 정리 계약을 확인하고 Rust 동작을 맞춘다.
+4. 구현한 JSON Heartbeat·4001 재접속을 실제 중앙 배포 설정·인증 환경에서도 확인한다.
 5. 중앙 업무 라우팅 계약에 맞춰 4단계 업무 API와 5단계 수신함·ACK를 구현한다.
 
 현재 구현 근거: [프로토콜 DTO](../crates/devlink-broker/src/protocol.rs), [중앙 연결 루프](../crates/devlink-broker/src/central.rs), [로컬 HTTP 라우터](../crates/devlink-broker/src/broker.rs), [MCP principal 스키마](../../packages/mcp-server/src/broker/schemas.ts).

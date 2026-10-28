@@ -1,5 +1,50 @@
 # 로컬 검증 기록
 
+## 2026-10-28: 실시간 45초 연결 유지 자동 회귀 추가
+
+`feature/rust/broekr_sessionapi`의 `6e6fd78` 이후 작업 트리에 `json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect`를 추가했습니다. 앞서 별도 실행으로 확인한 45초 유지 검증을 Rust CLI 통합 테스트로 저장했으며 `#[ignore]` 없이 기본 전체 테스트에 포함합니다.
+
+실제 CLI 실행 파일과 테스트 전용 설정·토큰·동적 포트를 사용합니다. 운영의 JSON PING 20초·PONG 대기 20초와 테스트 Mock의 JSON PING 무수신 만료 40초를 단축하지 않습니다. Mock은 유효한 JSON PING만 만료 시각을 갱신하고 같은 ID의 PONG을 응답합니다. presence·WebSocket 제어 Ping/Pong은 만료 시각을 갱신하지 않으며 무수신 시 Close 4001로 종료합니다.
+
+45초 동안 250ms 간격으로 health의 Connected·같은 PID/instanceId를 확인하고 WebSocket 연결 횟수 1회·만료 0회를 검사합니다. 약 20초·40초에 같은 연결에서 서로 다른 ping_id를 받았는지와 정상 stop 후 잠금 해제도 확인합니다. 중간에 끊겼다가 재접속해 Connected로 복구된 경우도 연결 횟수 검사로 실패합니다. 테스트만 다시 실행하려면 `rust/`에서 다음 명령을 사용합니다.
+
+```powershell
+cargo test --offline --locked -p devlink-cli --test cli_broker json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect -- --exact --test-threads=1
+```
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo check --offline --locked --workspace --all-targets` | 통과 |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 17개·통합 29개 통과, 실패·무시 0. 새 45초 테스트 포함 |
+
+Windows MSVC에서 전체 테스트를 승인된 샌드박스 외부에서 순차 실행했습니다. 통합 테스트 묶음은 142.88초가 걸렸습니다. 컴파일·Clippy에는 증분 캐시 hard link 대신 파일 복사를 사용하는 환경 경고가 있었고 종료 코드는 0입니다. 실제 중앙 배포 서버·운영 토큰·DB를 사용하는 검증은 아닙니다. 기존 스테이징은 유지했으며 이번 추가분은 별도 커밋·Push하지 않았습니다.
+
+## 2026-10-28: JSON Heartbeat·4001 만료 후 재접속 수정
+
+기준은 `feature/rust/session-api`의 `6e6fd78` 이후 작업 트리입니다. 현재 로컬 중앙 서버의 `DevLinkWebSocketHandler`·`ConnectionRegistry`·`BrokerHeartbeatService`·application.yml을 읽어 JSON PING/PONG, 동일 ping_id 응답, PING 무수신 기본 40초 만료와 Close 4001을 확인했습니다. 서버 파일은 수정하지 않았으며 이번 변경은 모두 `rust/`에 있습니다.
+
+Rust는 READY 후 JSON HEARTBEAT PING을 20초 간격으로 보내고 각 ping_id와 일치하는 PONG을 최대 20초 대기합니다. 응답 대기 중에는 새 요청으로 기존 대기를 덮어쓰지 않으며 다른 메시지·제어 프레임·잘못된/이전 ID의 PONG으로 제한 시간을 연장하지 않습니다. 4001과 PONG 만료는 재접속 설정을 따르고 HTTP 401/403, Close 4002·1008은 자동 재접속을 중단합니다. 개발용 Mock도 JSON PING/PONG·40초 만료·4001로 맞췄습니다.
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo check --offline --locked --workspace --all-targets` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 17개·통합 28개 통과, 실패 0 |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+
+Windows MSVC에서 실행했으며 ACL·HTTP·WebSocket을 사용하는 전체 테스트는 승인된 샌드박스 외부에서 실행했습니다. 컴파일·Clippy 시 증분 캐시 hard link 실패를 파일 복사로 대체하는 환경 경고가 있었으며 검사 종료 코드는 0입니다.
+
+새 단위 테스트는 실제 로컬 WebSocket 서버와 운영과 같은 연결 루프를 사용하고, private HeartbeatTiming만 PING 40ms·PONG 대기 120ms(서버 만료를 먼저 유도하는 경우 500ms)로 단축합니다. 공개 CLI·환경변수에 테스트 시간 옵션을 추가하지 않았습니다. 다음을 확인했습니다.
+
+- 유효한 JSON PING/PONG을 반복하면 서버의 최초 만료 시간 250ms를 넘겨 같은 연결이 유지되며 ping_id는 매번 새 UUID입니다. 하트비트만으로 미확인 presence를 ONLINE/OFFLINE으로 바꾸지 않습니다.
+- 잘못된 ID의 PONG 또는 이전 PONG 재사용, 잘못된 형식, 일반 JSON, 제어 Ping/Pong을 계속 받아도 미응답 PONG 대기가 만료됩니다. 대기 중 새 PING을 보내 이전 요청을 덮어쓰지 않습니다.
+- 서버의 만료 감시가 첫 연결을 4001로 종료하면 식별자를 정리하고 백오프 후 새 READY·새 ping_id로 복구하며 확인된 presence를 다시 보고합니다.
+- 실제 CLI 통합 테스트는 Close 4001에서 autoReconnect=true이면 재접속·Connected, false이면 Disconnected·추가 연결 없음, HTTP 401/403은 인증 실패·재시도 중단을 각각 확인합니다. 기존 4002·1008 중단 테스트도 통과했습니다.
+
+이 검증은 실제 로컬 소켓과 서버 계약을 재현한 Mock을 사용한 회귀 검증입니다. 실제 중앙 배포·운영 토큰·DB 갱신, 20초/40초 운영 주기의 실환경 장시간 유지, Rust 세션·업무 API 및 두 사용자 업무 왕복은 검증하지 않았습니다. MCP 전체 테스트·일반/릴리스 빌드·준비 상태 재현 도구는 이번 수정에서 재실행하지 않았습니다.
+
 ## 2026-10-28: 작업 현황 점검에서 재확인
 
 `feature/rust/broekr_sessionapi`의 HEAD `037810b`와 미커밋 presence·통합 검사 보완을 포함한 로컬 작업 트리에서 다음 결과를 재확인했습니다. 아래 검사는 문서 갱신 직전의 작업 현황 점검에서 실행했으며 문서 수정 후 기능 검사를 새로 실행했다는 의미는 아닙니다.
