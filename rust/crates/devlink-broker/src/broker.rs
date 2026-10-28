@@ -30,6 +30,8 @@ struct ApiState {
     status: SharedStatus,
     /// 프로세스 전체에 종료 시그널을 전파하는 토큰
     cancel: CancellationToken,
+    /// MCP 클라이언트용 로컬 인증 토큰
+    mcp_token: Arc<String>,
 }
 
 /// 브로커 종료 시 런타임 파일(runtime.json)을 자동으로 정리(삭제)하는 RAII 가드
@@ -56,12 +58,18 @@ pub async fn run(path: &Path) -> Result<()> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, config.local_port))
         .await
         .context("Cannot bind broker loopback port; check for a port conflict")?;
+    let bound_port = listener.local_addr()?.port();
+    let broker_url = format!("http://127.0.0.1:{bound_port}");
+
+    // MCP 자격 스냅샷 발행 또는 기존 토큰 재사용
+    let mcp_creds = crate::credentials::publish(path, &broker_url)?;
+    let mcp_token = Arc::new(mcp_creds.local_token);
 
     // 현재 실행 인스턴스 정보 생성 및 파일로 게시(publish)
     let runtime = Arc::new(Runtime {
         api_version: API_VERSION,
         pid: std::process::id(),
-        port: listener.local_addr()?.port(),
+        port: bound_port,
         instance_id: uuid::Uuid::new_v4().to_string(),
         control_token: uuid::Uuid::new_v4().to_string(),
     });
@@ -84,6 +92,7 @@ pub async fn run(path: &Path) -> Result<()> {
             runtime,
             status,
             cancel: cancel.clone(),
+            mcp_token,
         });
 
     // Graceful Shutdown 처리 (취소 토큰 수신 또는 OS 종료 시그널 감지 시)
@@ -128,10 +137,10 @@ pub fn central_token() -> Result<String> {
     Ok(token)
 }
 
-/// 로컬 HTTP 제어 요청의 Authorization 헤더와 Origin을 검증합니다.
+/// 로컬 HTTP 제어(shutdown) 요청의 Authorization 헤더와 Origin을 검증합니다.
 /// - 웹 브라우저에서의 무단 요청(CSRF 등)을 차단하기 위해 `Origin` 헤더가 있으면 거부합니다.
-/// - 런타임에 발급된 일회성 control_token과 Bearer 토큰이 일치해야 합니다.
-fn authorized(headers: &HeaderMap, state: &ApiState) -> bool {
+/// - shutdown 권한은 오직 CLI 런타임 제어 토큰(control_token)에만 부여되며, MCP local_token은 거부됩니다.
+fn authorized_control(headers: &HeaderMap, state: &ApiState) -> bool {
     if headers.contains_key("origin") {
         return false;
     }
@@ -143,14 +152,37 @@ fn authorized(headers: &HeaderMap, state: &ApiState) -> bool {
         })
 }
 
+/// 상태 조회(health) 요청의 Authorization 헤더와 Origin을 검증합니다.
+/// - 웹 브라우저에서의 무단 요청(CSRF 등)을 차단하기 위해 `Origin` 헤더가 있으면 거부합니다.
+/// - CLI control_token 및 MCP local_token 모두 조회가 허용됩니다.
+fn authorized_health(headers: &HeaderMap, state: &ApiState) -> bool {
+    if headers.contains_key("origin") {
+        return false;
+    }
+    headers
+        .get("authorization")
+        .and_then(|header| header.to_str().ok())
+        .is_some_and(|header| {
+            let token = match header.strip_prefix("Bearer ") {
+                Some(t) => t,
+                None => return false,
+            };
+            token == state.runtime.control_token.as_str() || token == state.mcp_token.as_str()
+        })
+}
+
 /// 표준 API 에러 응답 JSON을 생성합니다.
 fn error(code: StatusCode, message: &'static str) -> Response {
-    (code, Json(serde_json::json!({ "apiVersion": API_VERSION, "error": { "code": code.as_u16(), "message": message } }))).into_response()
+    (
+        code,
+        Json(serde_json::json!({ "apiVersion": API_VERSION, "error": { "code": code.as_u16(), "message": message } })),
+    )
+        .into_response()
 }
 
 /// `GET /health` 핸들러: 브로커의 프로세스 정보 및 중앙 서버 연결 상태 반환
 async fn health(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &state) {
+    if !authorized_health(&headers, &state) {
         return error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     Json(Health {
@@ -163,9 +195,9 @@ async fn health(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     .into_response()
 }
 
-/// `POST /shutdown` 핸들러: 브로커 정상 종료 요청 처리
+/// `POST /shutdown` 핸들러: 브로커 정상 종료 요청 처리 (오직 CLI control_token만 허용)
 async fn shutdown(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &state) {
+    if !authorized_control(&headers, &state) {
         return error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     state.cancel.cancel();

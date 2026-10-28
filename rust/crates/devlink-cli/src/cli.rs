@@ -35,6 +35,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<ConfigCommand>,
     },
+    /// MCP integration and credential management
+    Mcp {
+        #[command(subcommand)]
+        command: Option<McpCommand>,
+    },
     /// Internal command: run the broker loop in foreground (spawned by start)
     #[command(hide = true)]
     Broker,
@@ -51,6 +56,14 @@ pub enum ConfigCommand {
         /// New value for the configuration key
         value: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum McpCommand {
+    /// Print the absolute path of DEVLINK_BROKER_FILE for MCP Host configuration
+    Path,
+    /// Rotate the MCP local token (only allowed when broker is stopped)
+    Rotate,
 }
 
 /// CLI 진입점: 파싱된 CLI 명령어에 따라 적절한 로직을 라우팅하여 실행합니다.
@@ -96,6 +109,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         // 실행 중인 브로커 정상 종료 (Graceful shutdown)
         Commands::Stop => {
+            if std::fs::symlink_metadata(state_directory(&path)).is_ok() {
+                devlink_broker::credentials::verify_parent_safety(&state_directory(&path))?;
+            }
             if !state_directory(&path).exists() {
                 println!("Broker already stopped");
                 return Ok(());
@@ -117,6 +133,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             println!("Broker stopped");
         }
+        // MCP 자격 경로 조회 및 토큰 회전
+        Commands::Mcp { command } => match command.unwrap_or(McpCommand::Path) {
+            McpCommand::Path => {
+                println!("{}", devlink_broker::credentials::path(&path).display());
+            }
+            McpCommand::Rotate => {
+                devlink_broker::credentials::rotate(&path)?;
+                println!("MCP local token rotated; restart any running MCP server to apply");
+            }
+        },
         // 포그라운드에서 직접 브로커 통신 루프 실행 (start 명령어로 생성된 자식 프로세스가 실행)
         Commands::Broker => broker::run(&path).await?,
     }
