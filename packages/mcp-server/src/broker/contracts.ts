@@ -1,4 +1,4 @@
-import { z } from 'zod';
+export { principalSchema, sessionSchema, type BrokerSession } from './schemas.js';
 
 /** MCP-side v0.1 contract; verify these routes against the Rust broker before integration. */
 export const operationRoutes = {
@@ -12,16 +12,6 @@ export const operationRoutes = {
 } as const;
 export type BrokerOperation = keyof typeof operationRoutes;
 
-export const principalSchema = z.strictObject({
-  userId: z.string().min(1),
-  teamId: z.string().min(1),
-  agentId: z.string().min(1).optional(),
-});
-export const sessionSchema = z.strictObject({
-  sessionId: z.string().min(1),
-  principal: principalSchema,
-});
-export type BrokerSession = z.infer<typeof sessionSchema>;
 export type BrokerResult = { requestId: string; data: Record<string, unknown> };
 
 export type FaultCode =
@@ -29,7 +19,7 @@ export type FaultCode =
   | 'BROKER_UNAUTHORIZED' | 'BROKER_FORBIDDEN' | 'BROKER_REJECTED'
   | 'SESSION_REPLACED' | 'SESSION_CONFLICT' | 'SESSION_EXPIRED'
   | 'AGENT_UNREGISTERED' | 'CREDENTIAL_FILE_INVALID' | 'CLIENT_CLOSED'
-  | 'REQUEST_ABORTED';
+  | 'REQUEST_ABORTED' | 'BROKER_CONTEXT_INVALID' | 'SESSION_CONTEXT_CHANGED' | 'CALLER_CONTEXT_OVERRIDE';
 
 const messages: Record<FaultCode, string> = {
   BROKER_UNAVAILABLE: 'Local broker is unavailable.',
@@ -45,6 +35,9 @@ const messages: Record<FaultCode, string> = {
   CREDENTIAL_FILE_INVALID: 'The broker settings file is missing, invalid, or not private.',
   CLIENT_CLOSED: 'The MCP broker client has closed.',
   REQUEST_ABORTED: 'The local request was aborted; this does not cancel a central task.',
+  BROKER_CONTEXT_INVALID: 'The broker returned missing or inconsistent authenticated identity. Restart MCP after checking authentication.',
+  SESSION_CONTEXT_CHANGED: 'The session changed while the request was in flight; its business outcome is unknown.',
+  CALLER_CONTEXT_OVERRIDE: 'Tool arguments cannot override authenticated caller identity.',
 };
 
 export class BrokerFault extends Error {
@@ -56,11 +49,12 @@ export class BrokerFault extends Error {
   ) {
     super(messages[code]);
     this.name = 'BrokerFault';
-    this.outcome = ['BROKER_TIMEOUT', 'BROKER_UNAVAILABLE', 'BROKER_PROTOCOL_ERROR', 'REQUEST_ABORTED', 'CLIENT_CLOSED'].includes(code)
+    this.outcome = ['BROKER_TIMEOUT', 'BROKER_UNAVAILABLE', 'BROKER_PROTOCOL_ERROR', 'BROKER_CONTEXT_INVALID', 'SESSION_CONTEXT_CHANGED', 'REQUEST_ABORTED', 'CLIENT_CLOSED'].includes(code)
       ? 'unknown' : 'rejected';
   }
 }
 
 export const terminalSessionFaults = new Set<FaultCode>([
   'SESSION_REPLACED', 'SESSION_CONFLICT', 'BROKER_UNAUTHORIZED', 'BROKER_FORBIDDEN', 'CREDENTIAL_FILE_INVALID',
+  'BROKER_CONTEXT_INVALID',
 ]);

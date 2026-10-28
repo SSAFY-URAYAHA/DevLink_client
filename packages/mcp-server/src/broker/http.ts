@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { Agent, request as requestHttp } from 'node:http';
 import { z } from 'zod';
 import { BrokerFault, type FaultCode } from './contracts.js';
 import type { BrokerSettings } from './settings.js';
@@ -30,38 +31,40 @@ export class BrokerHttp {
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; controller.abort(); }, options.timeoutMs ?? this.timeoutMs);
     this.pending.add(controller);
+    // Credentials must never pass through an ambient HTTP(S)_PROXY or a global fetch dispatcher.
+    const agent = new Agent({ keepAlive: false, proxyEnv: {} });
     try {
       const body = JSON.stringify({ ...payload, requestId });
       if (Buffer.byteLength(body) > 131_072) throw new BrokerFault('BROKER_PROTOCOL_ERROR', requestId);
-      const response = await fetch(`${this.settings.brokerUrl}${path}`, {
-        method: options.method ?? 'POST', redirect: 'manual', signal: controller.signal,
-        headers: { authorization: `Bearer ${this.settings.localToken}`, 'content-type': 'application/json' }, body,
-      });
-      if (response.status >= 300 && response.status < 400) {
-        await response.body?.cancel();
-        throw new BrokerFault('BROKER_PROTOCOL_ERROR', requestId);
-      }
-      if (response.status === 401 || response.status === 403) {
-        await response.body?.cancel();
-        throw new BrokerFault(response.status === 401 ? 'BROKER_UNAUTHORIZED' : 'BROKER_FORBIDDEN', requestId);
-      }
-      const reader = response.body?.getReader();
-      const chunks: Uint8Array[] = [];
-      let length = 0;
-      if (reader) {
-        try {
-          while (true) {
-            const part = await reader.read();
-            if (part.done) break;
-            length += part.value.byteLength;
-            if (length > 262_144) { await reader.cancel(); throw new BrokerFault('BROKER_PROTOCOL_ERROR', requestId); }
-            chunks.push(part.value);
+      const response = await new Promise<{ status: number; body: Buffer }>((resolve, reject) => {
+        const request = requestHttp(`${this.settings.brokerUrl}${path}`, {
+          agent, method: options.method ?? 'POST', signal: controller.signal,
+          headers: { authorization: `Bearer ${this.settings.localToken}`, 'content-type': 'application/json' },
+        }, (incoming) => {
+          const status = incoming.statusCode ?? 0;
+          incoming.on('error', reject);
+          if ((status >= 300 && status < 400) || status === 401 || status === 403) {
+            reject(new BrokerFault(status === 401 ? 'BROKER_UNAUTHORIZED' : status === 403 ? 'BROKER_FORBIDDEN' : 'BROKER_PROTOCOL_ERROR', requestId));
+            incoming.destroy();
+            return;
           }
-        } finally { reader.releaseLock(); }
-      }
-      const parsed = envelopeSchema.safeParse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+          const chunks: Buffer[] = [];
+          let length = 0;
+          incoming.on('data', (chunk: Buffer) => {
+            length += chunk.length;
+            if (length > 262_144) {
+              reject(new BrokerFault('BROKER_PROTOCOL_ERROR', requestId));
+              incoming.destroy();
+            } else chunks.push(chunk);
+          });
+          incoming.on('end', () => resolve({ status, body: Buffer.concat(chunks) }));
+        });
+        request.on('error', reject);
+        request.end(body);
+      });
+      const parsed = envelopeSchema.safeParse(JSON.parse(response.body.toString('utf8')));
       if (!parsed.success || parsed.data.requestId !== requestId) throw new BrokerFault('BROKER_PROTOCOL_ERROR', requestId);
-      if (!response.ok || parsed.data.error) {
+      if (response.status < 200 || response.status >= 300 || parsed.data.error) {
         const remote = parsed.data.error;
         const code: FaultCode = response.status === 401 ? 'BROKER_UNAUTHORIZED'
           : response.status === 403 ? 'BROKER_FORBIDDEN'
@@ -80,6 +83,7 @@ export class BrokerHttp {
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', cancel);
       this.pending.delete(controller);
+      agent.destroy();
     }
   }
 

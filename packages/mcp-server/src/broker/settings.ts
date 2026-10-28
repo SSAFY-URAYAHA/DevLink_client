@@ -1,28 +1,25 @@
 import { execFile } from 'node:child_process';
+import { constants } from 'node:fs';
 import { lstat, open } from 'node:fs/promises';
 import { dirname, isAbsolute } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { BrokerFault } from './contracts.js';
+import { credentialSchema } from './schemas.js';
 
-const settingsSchema = z.strictObject({
-  schemaVersion: z.literal(1),
-  brokerUrl: z.string().url(),
-  localToken: z.string().min(16).max(4096).regex(/^[A-Za-z0-9._~-]+$/),
-  agentId: z.string().min(1).optional(),
-});
-export type BrokerSettings = Readonly<z.infer<typeof settingsSchema>>;
+export type BrokerSettings = Readonly<z.infer<typeof credentialSchema>>;
 
 export function validateSettings(value: unknown): BrokerSettings {
-  const parsed = settingsSchema.parse(value);
+  const result = credentialSchema.safeParse(value);
+  if (!result.success) throw new BrokerFault('CREDENTIAL_FILE_INVALID', 'settings');
+  const parsed = result.data;
   // URL normalizes forms such as 127.1 and integer hostnames; require the original literal too.
-  if (!/^http:\/\/127\.0\.0\.1:[0-9]+\/?$/.test(parsed.brokerUrl)) throw new Error('Invalid loopback literal');
   const url = new URL(parsed.brokerUrl);
-  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1'
     || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
-    throw new Error('Invalid loopback endpoint');
+    throw new BrokerFault('CREDENTIAL_FILE_INVALID', 'settings');
   }
-  return Object.freeze({ ...parsed, brokerUrl: url.origin });
+  return Object.freeze({ ...parsed, brokerUrl: parsed.brokerUrl.replace(/\/$/, '') });
 }
 
 /** CLI owns writing the snapshot. Reject links, broad permissions and oversized files. */
@@ -64,15 +61,22 @@ export async function readBrokerSettings(path: string): Promise<BrokerSettings> 
     if (!isAbsolute(path)) throw new Error('Absolute path required');
     await verifyPrivateFile(path);
     const before = await lstat(path);
-    const file = await open(path, 'r');
+    const file = await open(path, process.platform === 'win32' ? 'r' : constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const info = await file.stat();
-      if (!info.isFile() || info.size > 16_384 || before.ino !== info.ino) throw new Error('Snapshot changed');
-      const contents = await file.readFile('utf8');
-      if (Buffer.byteLength(contents) > 16_384) throw new Error('Oversized settings');
+      if (!info.isFile() || info.size > 16_384 || before.ino !== info.ino || before.dev !== info.dev) throw new Error('Snapshot changed');
+      if (process.platform !== 'win32' && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)) throw new Error('Not private');
+      const buffer = Buffer.alloc(16_385);
+      let length = 0;
+      while (length < buffer.length) {
+        const { bytesRead } = await file.read(buffer, length, buffer.length - length, null);
+        if (bytesRead === 0) break;
+        length += bytesRead;
+      }
+      if (length > 16_384) throw new Error('Oversized settings');
       const after = await file.stat();
       if (info.size !== after.size || info.mtimeMs !== after.mtimeMs) throw new Error('Snapshot changed');
-      return validateSettings(JSON.parse(contents));
+      return validateSettings(JSON.parse(buffer.subarray(0, length).toString('utf8')));
     } finally {
       await file.close();
     }
