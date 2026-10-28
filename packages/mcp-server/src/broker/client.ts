@@ -1,15 +1,19 @@
 import { randomUUID } from 'node:crypto';
+import { setMaxListeners } from 'node:events';
 import { BrokerFault, operationRoutes, terminalSessionFaults,
   type BrokerOperation, type BrokerResult, type FaultCode } from './contracts.js';
 import { identifierSchema, immutableSession, sessionSchema, type BrokerSession } from './schemas.js';
 import { BrokerHttp } from './http.js';
 import { readBrokerSettings, validateSettings, type BrokerSettings } from './settings.js';
 import type { Logger } from '../logger.js';
+import { safeIdentifier, type Correlation } from './faults.js';
+import { CallBudget, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, validateTimeout } from './call-budget.js';
 
 export interface BrokerClientOptions {
   settingsPath?: string;
   settings?: BrokerSettings;
   requestTimeoutMs?: number;
+  callTimeoutMs?: number;
   shutdownTimeoutMs?: number;
   heartbeatMs?: number;
   retryBaseMs?: number;
@@ -18,17 +22,6 @@ export interface BrokerClientOptions {
 }
 type CallOptions = { signal?: AbortSignal; mcpRequestId?: string | number };
 const actorFields = ['userId', 'teamId', 'agentId', 'sessionId', 'principal', 'context'];
-
-function cancellable<T>(result: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return result;
-  return new Promise<T>((resolve, reject) => {
-    const cancel = () => reject(new BrokerFault('REQUEST_ABORTED', 'registration'));
-    if (signal.aborted) cancel();
-    else signal.addEventListener('abort', cancel, { once: true });
-    void result.then((value) => { signal.removeEventListener('abort', cancel); resolve(value); },
-      (error: unknown) => { signal.removeEventListener('abort', cancel); reject(error); });
-  });
-}
 
 /** One client per MCP process; only authenticated broker responses may change identity. */
 export class BrokerClient {
@@ -49,8 +42,14 @@ export class BrokerClient {
   private retryCount = 0;
   private closed = false;
   private closePromise: Promise<void> | undefined;
+  private readonly lifetime = new AbortController();
 
-  constructor(private readonly options: BrokerClientOptions = {}) {}
+  constructor(private readonly options: BrokerClientOptions = {}) {
+    validateTimeout(options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+    validateTimeout(options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS);
+    validateTimeout(options.shutdownTimeoutMs ?? 1000);
+    setMaxListeners(0, this.lifetime.signal);
+  }
 
   get pendingCount(): number { return this.http?.pendingCount ?? 0; }
   get state(): string { return this.closed ? 'closed' : this.terminal ?? (this.session?.principal.agentId ? 'bound' : this.session ? 'unbound' : 'inactive'); }
@@ -90,7 +89,7 @@ export class BrokerClient {
     if (terminalSessionFaults.has(error.code)) {
       this.terminal = error.code;
       this.discard();
-    } else if (['BROKER_UNAVAILABLE', 'BROKER_TIMEOUT', 'SESSION_EXPIRED'].includes(error.code)) {
+    } else if (['BROKER_UNAVAILABLE', 'BROKER_CONNECTION_CLOSED', 'BROKER_TIMEOUT', 'SESSION_EXPIRED'].includes(error.code)) {
       this.discard();
       this.retry();
     }
@@ -183,83 +182,113 @@ export class BrokerClient {
     return result;
   }
 
-  private async waitForRegistration(signal?: AbortSignal): Promise<void> {
+  private async waitForRegistration(budget: CallBudget): Promise<void> {
     while (this.registrationTail) {
-      await cancellable(this.registrationTail, signal);
+      await budget.wait(this.registrationTail);
     }
   }
 
   async execute(operation: BrokerOperation, args: Record<string, unknown>, options: CallOptions = {}): Promise<BrokerResult> {
     const requestId = randomUUID();
     const callOptions = { ...options };
+    const budget = new CallBudget(requestId, this.options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS, callOptions.signal, this.lifetime.signal);
+    const trace: Correlation = {};
     this.options.logger?.debug('broker.call_started', { requestId, operation });
     try {
+      budget.check();
       if (!Object.hasOwn(operationRoutes, operation)) throw new BrokerFault('BROKER_PROTOCOL_ERROR', requestId);
       const input = structuredClone(args);
+      const taskId = safeIdentifier(input.taskId);
+      if (taskId && !['create_task', 'register_agent'].includes(operation)) trace.taskId = taskId;
       if (actorFields.some((field) => Object.hasOwn(input, field))) throw new BrokerFault('CALLER_CONTEXT_OVERRIDE', requestId);
-      if (callOptions.signal?.aborted) throw new BrokerFault('REQUEST_ABORTED', requestId);
-      const run = () => this.perform(operation, input, requestId, callOptions);
+      const run = () => this.perform(operation, input, requestId, callOptions, budget, trace);
       let result: BrokerResult;
-      if (operation === 'register_agent') result = await cancellable(this.enqueueRegistration(run), callOptions.signal);
+      if (operation === 'register_agent') result = await budget.wait(this.enqueueRegistration(run));
       else {
-        await this.waitForRegistration(callOptions.signal);
+        await this.waitForRegistration(budget);
         result = await run();
       }
       this.options.logger?.debug('broker.call_succeeded', { requestId, operation });
       return result;
     } catch (error) {
-      const fault = error instanceof BrokerFault ? new BrokerFault(error.code, requestId, error.taskId)
-        : new BrokerFault('BROKER_PROTOCOL_ERROR', requestId);
+      const mapped = budget.map(error);
+      const fault = new BrokerFault(mapped instanceof BrokerFault ? mapped.code : 'BROKER_PROTOCOL_ERROR', requestId, trace.taskId, {
+        ...(trace.requestKey ? { requestKey: trace.requestKey } : {}), outcome: mapped instanceof BrokerFault ? mapped.outcome : 'unknown',
+        ...(callOptions.mcpRequestId !== undefined ? { mcpRequestId: callOptions.mcpRequestId } : {}),
+      });
       this.options.logger?.error('broker.call_failed', { requestId, operation, code: fault.code });
       throw fault;
-    }
+    } finally { budget.dispose(); }
   }
 
-  private async perform(operation: BrokerOperation, args: Record<string, unknown>, requestId: string, options: CallOptions): Promise<BrokerResult> {
+  private async perform(operation: BrokerOperation, args: Record<string, unknown>, requestId: string, options: CallOptions,
+    budget: CallBudget, trace: Correlation): Promise<BrokerResult> {
     let snapshot: BrokerSession | undefined;
     let binding = false;
     try {
-      if (options.signal?.aborted) throw new BrokerFault('REQUEST_ABORTED', requestId);
-      snapshot = await this.ensureSession();
+      budget.check();
+      snapshot = await budget.wait(this.ensureSession());
       if (operation !== 'register_agent' && !snapshot.principal.agentId) throw new BrokerFault('AGENT_UNREGISTERED', requestId);
       this.assertCurrent(snapshot, requestId);
-      if (options.signal?.aborted) throw new BrokerFault('REQUEST_ABORTED', requestId);
-      const http = await this.transport();
-      const signalOptions = options.signal ? { signal: options.signal } : {};
-      const data = await http.request(operationRoutes[operation], {
+      budget.check();
+      const http = await budget.wait(this.transport());
+      budget.check();
+      const signalOptions = { signal: budget.signal };
+      const response = await http.exchange(operationRoutes[operation], {
         requestId, operation, arguments: args,
         context: { ...snapshot.principal, sessionId: snapshot.sessionId },
         ...(options.mcpRequestId !== undefined ? { mcpRequestId: options.mcpRequestId } : {}),
-      }, signalOptions);
-      if (this.closed) throw new BrokerFault('CLIENT_CLOSED', requestId);
+      }, signalOptions).catch((error: unknown) => {
+        if (error instanceof BrokerFault) {
+          if (error.requestKey) trace.requestKey = error.requestKey;
+          if (error.taskId) trace.taskId = error.taskId;
+        }
+        throw error;
+      });
+      const { data } = response;
+      if (response.requestKey) trace.requestKey = response.requestKey;
+      const savedTaskId = safeIdentifier(data.taskId);
+      if (savedTaskId) trace.taskId = savedTaskId;
+      let issuedAgentId: string | undefined;
       if (operation === 'register_agent') {
         const agent = identifierSchema.safeParse(data.agentId);
         const expectedAgentId = this.agentId ?? this.pendingAgentId;
         if (!agent.success || (expectedAgentId && expectedAgentId !== agent.data)) throw new BrokerFault('BROKER_CONTEXT_INVALID', requestId);
-        // An issued ID survives lease loss, but is not verified binding until bind succeeds.
+        // Preserve an ID that actually arrived, even if the overall budget just expired.
         if (!this.agentId) this.pendingAgentId = agent.data;
+        issuedAgentId = agent.data;
+      }
+      budget.check();
+      if (this.closed) throw new BrokerFault('CLIENT_CLOSED', requestId);
+      if (operation === 'register_agent') {
         this.assertCurrent(snapshot, requestId);
         binding = true;
         const bound = await http.request(`/v1/sessions/${encodeURIComponent(snapshot.sessionId)}/bind`, {
-          requestId: randomUUID(), agentId: agent.data, instanceId: this.instanceId,
+          requestId: randomUUID(), agentId: issuedAgentId, instanceId: this.instanceId,
         }, signalOptions);
+        budget.check();
         this.assertCurrent(snapshot, requestId);
         const session = this.checkedSession(bound, requestId, true);
-        if (session.sessionId !== snapshot.sessionId || session.principal.agentId !== agent.data) throw new BrokerFault('BROKER_CONTEXT_INVALID', requestId);
+        if (session.sessionId !== snapshot.sessionId || session.principal.agentId !== issuedAgentId) throw new BrokerFault('BROKER_CONTEXT_INVALID', requestId);
         this.publish(session);
       }
       this.retryCount = 0;
-      return { requestId, data };
+      return { requestId, data,
+        ...(options.mcpRequestId !== undefined ? { mcpRequestId: options.mcpRequestId } : {}),
+        ...(trace.requestKey ? { requestKey: trace.requestKey } : {}),
+      };
     } catch (error) {
+      // A caller's budget is not evidence that the shared broker session failed.
       if (snapshot) this.observe(error, snapshot);
       if (binding && this.session === snapshot) { this.discard(snapshot); this.retry(); }
-      throw error;
+      throw budget.map(error);
     }
   }
 
   close(): Promise<void> {
     this.closePromise ??= (async () => {
       this.closed = true;
+      this.lifetime.abort();
       const session = this.session;
       this.discard();
       this.http?.close();
