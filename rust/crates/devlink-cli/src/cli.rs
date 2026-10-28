@@ -109,6 +109,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         // 실행 중인 브로커 정상 종료 (Graceful shutdown)
         Commands::Stop => {
+            if std::fs::symlink_metadata(state_directory(&path)).is_ok() {
+                devlink_broker::credentials::verify_parent_safety(&state_directory(&path))?;
+            }
             if !state_directory(&path).exists() {
                 println!("Broker already stopped");
                 return Ok(());

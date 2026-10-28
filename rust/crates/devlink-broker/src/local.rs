@@ -28,7 +28,10 @@ impl Runtime {
         state_directory(config).join("runtime.json")
     }
     pub fn load(config: &Path) -> Result<Self> {
-        let bytes = fs::read(Self::path(config)).context("Cannot read broker runtime metadata")?;
+        crate::credentials::verify_parent_safety(&state_directory(config))?;
+        let runtime_path = Self::path(config);
+        crate::credentials::ensure_safe_target_if_exists(&runtime_path)?;
+        let bytes = fs::read(runtime_path).context("Cannot read broker runtime metadata")?;
         let runtime: Self = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("Invalid broker runtime metadata"))?;
         if runtime.api_version != API_VERSION
@@ -103,10 +106,14 @@ pub struct Health {
 /// A held OS lock is authoritative. PID files alone are unsafe because PIDs can be reused.
 pub fn running(config_path: &Path) -> Result<bool> {
     let state = state_directory(config_path);
+    if fs::symlink_metadata(&state).is_ok() {
+        crate::credentials::verify_parent_safety(&state)?;
+    }
     if !state.exists() {
         return Ok(false);
     }
     let path = state.join("broker.lock");
+    crate::credentials::ensure_safe_target_if_exists(&path)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -116,6 +123,7 @@ pub fn running(config_path: &Path) -> Result<bool> {
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => {
             // Remove stale discovery data while holding the same lock required by a new broker.
+            crate::credentials::ensure_safe_target_if_exists(&Runtime::path(config_path))?;
             match fs::remove_file(Runtime::path(config_path)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -131,6 +139,7 @@ pub fn running(config_path: &Path) -> Result<bool> {
 }
 
 pub fn publish(config: &Path, runtime: &Runtime) -> Result<()> {
-    fs::create_dir_all(state_directory(config)).context("Cannot create broker state directory")?;
+    crate::credentials::ensure_safe_parent_directory(&state_directory(config))?;
+    crate::credentials::ensure_safe_target_if_exists(&Runtime::path(config))?;
     config::atomic_json(&Runtime::path(config), runtime)
 }

@@ -65,11 +65,17 @@ pub fn generate_token() -> String {
 }
 
 /// 브로커 URL 형식 검증 (`http://127.0.0.1:<port>` 형식, 슬래시/경로/쿼리/사용자정보 금지)
+/// - 포트는 선행 0이나 부호(`+`)가 없는 순수 ASCII 숫자(`[1-9][0-9]*`)여야 합니다.
+/// - WHATWG URL 표준에서 `http:` 기본 포트인 80은 `url.port`가 빈 문자열로 정규화되어
+///   MCP `validateSettings`가 거부하므로 포트 80은 허용하지 않습니다.
 pub fn is_valid_broker_url(url: &str) -> bool {
     if let Some(port_str) = url.strip_prefix("http://127.0.0.1:")
+        && !port_str.is_empty()
+        && !port_str.starts_with('0')
+        && port_str.bytes().all(|b| b.is_ascii_digit())
         && let Ok(port) = port_str.parse::<u16>()
     {
-        return port > 0;
+        return port > 0 && port != 80;
     }
     false
 }
@@ -100,6 +106,31 @@ pub fn validate(creds: &McpCredentials) -> Result<()> {
     Ok(())
 }
 
+/// 자격 파일 대상이 이미 존재하는 경우 일반 파일인지(심볼릭 링크·reparse point·디렉터리 아님) 확인합니다.
+pub(crate) fn ensure_safe_target_if_exists(target: &Path) -> Result<bool> {
+    match fs::symlink_metadata(target) {
+        Ok(meta) => {
+            ensure!(
+                !meta.is_symlink(),
+                "Credential file must not be a symbolic link"
+            );
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+                ensure!(
+                    (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+                    "Credential file must not be a reparse point"
+                );
+            }
+            ensure!(meta.is_file(), "Credential path must be a regular file");
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).context("Cannot inspect credential file"),
+    }
+}
+
 /// 자격 파일 및 부모 디렉터리의 경로 안전성 검증
 /// - 일반 파일 여부, 심볼릭 링크 거부, 16KiB 이하 크기 확인
 /// - 부모 디렉터리 존재 및 심볼릭 링크 거부 확인
@@ -109,6 +140,15 @@ pub fn verify_path_safety(file_path: &Path) -> Result<()> {
         !meta.is_symlink(),
         "Credential file must not be a symbolic link"
     );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+        ensure!(
+            (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+            "Credential file must not be a reparse point"
+        );
+    }
     ensure!(meta.is_file(), "Credential path must be a regular file");
     ensure!(
         meta.len() <= MAX_CREDENTIALS_SIZE,
@@ -372,6 +412,7 @@ pub fn write_atomic_private(target: &Path, creds: &McpCredentials) -> Result<()>
         .parent()
         .context("Target path has no parent directory")?;
     ensure_safe_parent_directory(parent)?;
+    ensure_safe_target_if_exists(target)?;
     set_private_permissions(parent)?;
 
     let json_bytes = serde_json::to_vec_pretty(creds)?;
@@ -410,16 +451,30 @@ pub fn write_atomic_private(target: &Path, creds: &McpCredentials) -> Result<()>
 /// 기존 자격 파일을 검증하고 로드합니다.
 pub fn load(config_path: &Path) -> Result<McpCredentials> {
     let cred_path = path(config_path);
-    if !cred_path.exists() {
+    if !ensure_safe_target_if_exists(&cred_path)? {
         bail!("MCP credentials file does not exist");
     }
     verify_path_safety(&cred_path)?;
     verify_private_permissions(&cred_path)?;
 
-    let mut file = File::open(&cred_path).context("Cannot open MCP credential file")?;
+    let file = File::open(&cred_path).context("Cannot open MCP credential file")?;
+    let meta = file
+        .metadata()
+        .context("Cannot inspect opened MCP credential file")?;
+    ensure!(meta.is_file(), "Credential path must be a regular file");
+    ensure!(
+        meta.len() <= MAX_CREDENTIALS_SIZE,
+        "Credential file exceeds maximum size limit (16KiB)"
+    );
+
     let mut content = Vec::new();
-    file.read_to_end(&mut content)
+    file.take(MAX_CREDENTIALS_SIZE + 1)
+        .read_to_end(&mut content)
         .context("Cannot read MCP credential file")?;
+    ensure!(
+        content.len() <= MAX_CREDENTIALS_SIZE as usize,
+        "Credential file exceeds maximum size limit (16KiB)"
+    );
 
     let creds: McpCredentials = serde_json::from_slice(&content)
         .map_err(|_| anyhow::anyhow!("Invalid MCP credential file JSON schema"))?;
@@ -438,9 +493,16 @@ pub fn publish(config_path: &Path, broker_url: &str) -> Result<McpCredentials> {
         .parent()
         .context("Credential path has no parent")?;
     ensure_safe_parent_directory(parent)?;
+    let target_exists = ensure_safe_target_if_exists(&cred_path).map_err(|_| {
+        anyhow::anyhow!(
+            "Existing MCP credential file at '{}' is invalid or has insecure permissions; \
+             use 'devlink mcp rotate' or remove the file manually to recover",
+            cred_path.display()
+        )
+    })?;
     set_private_permissions(parent)?;
 
-    let local_token = if cred_path.exists() {
+    let local_token = if target_exists {
         match load(config_path) {
             Ok(existing) => {
                 if existing.broker_url == broker_url {
@@ -476,6 +538,8 @@ pub fn publish(config_path: &Path, broker_url: &str) -> Result<McpCredentials> {
 pub fn rotate(config_path: &Path) -> Result<McpCredentials> {
     let state_dir = crate::config::state_directory(config_path);
     ensure_safe_parent_directory(&state_dir)?;
+    let cred_path = path(config_path);
+    let target_exists = ensure_safe_target_if_exists(&cred_path)?;
     set_private_permissions(&state_dir)?;
 
     // start/stop과 충돌을 방지하기 위해 control.lock 획득
@@ -489,22 +553,9 @@ pub fn rotate(config_path: &Path) -> Result<McpCredentials> {
     // 이중 확인을 위한 broker.lock 획득 시도
     let _broker_guard = crate::config::lock(&state_dir.join("broker.lock"))?;
 
-    let cred_path = path(config_path);
-    let broker_url = if cred_path.exists() {
-        if let Ok(content) = fs::read(&cred_path) {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&content) {
-                if let Some(url) = val.get("brokerUrl").and_then(|u| u.as_str()) {
-                    if is_valid_broker_url(url) {
-                        url.to_string()
-                    } else {
-                        default_broker_url(config_path)?
-                    }
-                } else {
-                    default_broker_url(config_path)?
-                }
-            } else {
-                default_broker_url(config_path)?
-            }
+    let broker_url = if target_exists {
+        if let Ok(existing) = load(config_path) {
+            existing.broker_url
         } else {
             default_broker_url(config_path)?
         }
@@ -524,7 +575,7 @@ pub fn rotate(config_path: &Path) -> Result<McpCredentials> {
 
 fn default_broker_url(config_path: &Path) -> Result<String> {
     let config = crate::config::Config::load(config_path).unwrap_or_default();
-    let port = if config.local_port == 0 {
+    let port = if config.local_port == 0 || config.local_port == 80 {
         43127
     } else {
         config.local_port
@@ -594,6 +645,79 @@ mod tests {
         assert_eq!(creds, loaded);
     }
 
+    #[test]
+    fn credential_read_enforces_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let broker_url = "http://127.0.0.1:43127";
+        let creds = publish(&config_path, broker_url).expect("initial publish must succeed");
+        let cred_path = path(&config_path);
+
+        let initial_len = fs::metadata(&cred_path)
+            .expect("must read initial credential metadata")
+            .len() as usize;
+        assert!(
+            initial_len < MAX_CREDENTIALS_SIZE as usize,
+            "initial credential file must be smaller than 16,384 bytes"
+        );
+
+        let padding_len = (MAX_CREDENTIALS_SIZE as usize) - initial_len;
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&cred_path)
+                .expect("must open credential file for appending");
+            f.write_all(&vec![b' '; padding_len])
+                .expect("must pad credential file to 16,384 bytes");
+            f.sync_all().expect("must sync 16,384-byte credential file");
+        }
+
+        let exact_len = fs::metadata(&cred_path)
+            .expect("must read 16,384-byte credential metadata")
+            .len();
+        assert_eq!(
+            exact_len, MAX_CREDENTIALS_SIZE,
+            "credential file size must be exactly 16,384 bytes"
+        );
+
+        let loaded = load(&config_path).expect("load must succeed at exactly 16,384 bytes");
+        assert!(
+            loaded == creds,
+            "loaded credentials at 16,384 bytes must match published credentials"
+        );
+
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&cred_path)
+                .expect("must open credential file for +1 byte append");
+            f.write_all(b" ")
+                .expect("must append one byte to reach 16,385 bytes");
+            f.sync_all().expect("must sync 16,385-byte credential file");
+        }
+
+        let before_bytes =
+            fs::read(&cred_path).expect("must read 16,385-byte credential file before load");
+        assert_eq!(
+            before_bytes.len(),
+            (MAX_CREDENTIALS_SIZE as usize) + 1,
+            "credential file size must be 16,385 bytes"
+        );
+
+        let over_limit_result = load(&config_path);
+        assert!(
+            over_limit_result.is_err(),
+            "load must reject 16,385-byte credential file"
+        );
+
+        let after_bytes =
+            fs::read(&cred_path).expect("must read 16,385-byte credential file after load");
+        assert!(
+            before_bytes == after_bytes,
+            "credential file content must remain unchanged after rejected load"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn test_windows_verify_private_permissions_three_cases() {
@@ -636,17 +760,43 @@ mod tests {
         assert!(res3.is_err(), "Case 3 expected error, got Ok");
     }
 
+    #[test]
+    fn broker_url_validation_matches_mcp_reader() {
+        assert!(is_valid_broker_url("http://127.0.0.1:43127"));
+        assert!(is_valid_broker_url("http://127.0.0.1:1"));
+        assert!(is_valid_broker_url("http://127.0.0.1:79"));
+        assert!(is_valid_broker_url("http://127.0.0.1:81"));
+        assert!(is_valid_broker_url("http://127.0.0.1:65535"));
+
+        // Port 80 is normalized to empty url.port by WHATWG URL in MCP reader and rejected
+        assert!(!is_valid_broker_url("http://127.0.0.1:80"));
+        assert!(!is_valid_broker_url("http://127.0.0.1:+81"));
+        assert!(!is_valid_broker_url("http://127.0.0.1:+43127"));
+        assert!(!is_valid_broker_url("http://127.0.0.1:0"));
+        assert!(!is_valid_broker_url("http://127.0.0.1:080"));
+        assert!(!is_valid_broker_url("http://127.0.0.1:043127"));
+        assert!(!is_valid_broker_url("http://127.0.0.1:65536"));
+        assert!(!is_valid_broker_url("http://127.0.0.1:43127/"));
+        assert!(!is_valid_broker_url("http://localhost:43127"));
+    }
+
     #[cfg(windows)]
     fn get_sddl(path: &Path) -> String {
         use std::os::windows::process::CommandExt;
-        let script = format!("(Get-Acl -LiteralPath '{}').Sddl", path.display());
+        const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$p = $env:DEVLINK_SDDL_PATH
+$acl = if ([System.IO.Directory]::Exists($p)) { [System.IO.Directory]::GetAccessControl($p) } else { [System.IO.File]::GetAccessControl($p) }
+[Console]::Write($acl.GetSecurityDescriptorSddlForm('All'))
+"#;
         let output = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+            .env("DEVLINK_SDDL_PATH", path)
             .stdin(std::process::Stdio::null())
             .creation_flags(0x08000000)
             .output()
             .expect("Failed to get SDDL");
-        assert!(output.status.success(), "powershell Get-Acl failed");
+        assert!(output.status.success(), "powershell SDDL query failed");
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
@@ -701,11 +851,16 @@ mod tests {
         }
         let _cleanup = JunctionCleanup(&junction_path);
 
-        // publish 호출: junction 부모 경로로 인해 거부되어야 함
+        // publish 및 rotate 호출: junction 부모 경로로 인해 거부되어야 함
         let res = publish(&config_path, "http://127.0.0.1:43127");
         assert!(
             res.is_err(),
             "publish must return Err when parent directory is a junction"
+        );
+        let rotate_res = rotate(&config_path);
+        assert!(
+            rotate_res.is_err(),
+            "rotate must return Err when parent directory is a junction"
         );
 
         // 링크 대상에 자격 파일이 생성되지 않았는지 확인

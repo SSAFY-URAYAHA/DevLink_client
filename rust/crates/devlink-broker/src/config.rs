@@ -102,6 +102,11 @@ impl Config {
         if !(100..=60000).contains(&self.auth_timeout_ms) {
             bail!("authTimeoutMs must be between 100 and 60000");
         }
+        if self.local_port == 80 {
+            bail!(
+                "localPort cannot be 80 because HTTP default port is rejected by MCP endpoint validation"
+            );
+        }
         Ok(())
     }
 
@@ -146,7 +151,8 @@ pub fn state_directory(config_path: &Path) -> PathBuf {
 /// 프로세스 간 상호 배제를 위한 파일 락을 획득합니다 (`fs2::FileExt::try_lock_exclusive`).
 /// 중복 실행이나 동시 설정 수정을 방지합니다.
 pub fn lock(path: &Path) -> Result<File> {
-    fs::create_dir_all(directory(path)).context("Cannot create lock directory")?;
+    crate::credentials::ensure_safe_parent_directory(directory(path))?;
+    crate::credentials::ensure_safe_target_if_exists(path)?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -197,7 +203,11 @@ pub fn init(path: &Path) -> Result<bool> {
 /// - 파일 락을 획득한 후 안전하게 수정하며, 유효성 검사 통과 시 원자적으로 저장합니다.
 pub fn set(path: &Path, key: &str, raw: &str) -> Result<()> {
     let _guard = lock(&state_directory(path).join("control.lock"))?;
-    let mut value = serde_json::to_value(Config::load(path)?)?;
+    let bytes = fs::read(path).context("Cannot read config; run devlink init first")?;
+    let existing: Config = serde_json::from_slice(&bytes).map_err(|_| {
+        anyhow::anyhow!("Invalid config JSON, unknown field or incorrect value type")
+    })?;
+    let mut value = serde_json::to_value(existing)?;
     let field = value.get_mut(key).context("Unknown config key")?;
     *field = if field.is_string() {
         raw.into()
