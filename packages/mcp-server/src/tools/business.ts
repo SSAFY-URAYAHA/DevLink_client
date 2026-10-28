@@ -6,7 +6,8 @@ import { defineTool, type RegisteredDefinition } from './registry.js';
 const id = z.string().trim().min(1).max(128);
 const text = z.string().trim().min(1).max(16_000);
 const taskStatus = z.enum(['PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED']);
-const brokerOutput = z.strictObject({ requestId: z.string(), data: z.record(z.string(), z.unknown()) });
+const brokerOutput = z.strictObject({ requestId: z.string(), mcpRequestId: z.union([z.string(), z.number()]).optional(),
+  requestKey: z.string().optional(), data: z.record(z.string(), z.unknown()) });
 
 /** Draft DTOs until the currently empty Notion API templates are agreed with tool owners. */
 export function businessTools(broker: Pick<BrokerClient, 'execute'>): RegisteredDefinition[] {

@@ -150,7 +150,7 @@ test('a lost session response retries with the same instance and recovery mode',
     if (path === '/v1/sessions' && first) { first = false; res.destroy(); return true; }
     return false;
   });
-  await assert.rejects(client.execute('get_tasks', {}), code('BROKER_UNAVAILABLE'));
+  await assert.rejects(client.execute('get_tasks', {}), code('BROKER_CONNECTION_CLOSED'));
   await client.execute('get_tasks', {});
   const calls = broker.calls.filter((c) => c.path === '/v1/sessions');
   assert.deepEqual(calls.map((c) => c.body.mode), ['fresh', 'recover']);

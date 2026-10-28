@@ -82,12 +82,13 @@ test('invalid inputs and actor overrides are rejected before any session or brok
 });
 
 test('all business errors use the same safe result envelope and preserve a known task ID', async (t) => {
-  const adapter = { async execute() { throw new BrokerFault('BROKER_REJECTED', 'correlated-request', 'known-task'); } };
+  let originalId;
+  const adapter = { async execute(operation, args, options) { originalId = options.mcpRequestId; throw new BrokerFault('BROKER_REJECTED', 'correlated-request', 'known-task'); } };
   const { client } = await connected(t, { brokerClient: adapter });
   for (const [name, args] of Object.entries(samples)) {
     const result = await client.callTool({ name, arguments: args });
     assert.equal(result.isError, true);
-    assert.deepEqual(result.structuredContent.error, { code: 'BROKER_REJECTED', message: 'The broker rejected the operation.', requestId: 'correlated-request', outcome: 'rejected', taskId: 'known-task' });
+    assert.deepEqual(result.structuredContent.error, { code: 'BROKER_REJECTED', category: 'domain', message: 'The broker rejected the operation.', mcpRequestId: originalId, requestId: 'correlated-request', outcome: 'rejected', taskId: 'known-task' });
     assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
   }
 });
