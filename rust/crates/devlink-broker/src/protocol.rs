@@ -11,6 +11,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Shared receive limit, also used when validating newly created task payloads.
+pub const MAX_CENTRAL_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// 로컬 Agent와 브로커 사이의 접속 상태 (`ONLINE` 또는 `OFFLINE`)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

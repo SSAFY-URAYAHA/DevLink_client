@@ -564,6 +564,43 @@ impl SessionManager {
         .await
     }
 
+    /// 비즈니스 액터(호출 주체)의 유효성을 실시간 세션 레지스트리에서 검증
+    ///
+    /// 호출자가 전달한 컨텍스트를 그대로 신뢰하지 않고, 브로커에 등록된 실제 활성 세션 상태와 대조합니다.
+    /// 세션 만료 시간(lease)을 갱신하지 않고 세션 소유권 및 중앙 서버 신원 일치 여부만 확인합니다.
+    pub async fn authorize(
+        &self,
+        id: &Identifier,
+        expected: &Principal,
+    ) -> Result<Principal, SessionError> {
+        let mut registry = self.registry.lock().await;
+        self.with_context(&mut registry, |registry, current| {
+            // 만료된 세션 정리
+            registry.expire(Instant::now());
+            if registry.closed {
+                return Err(SessionError::Expired);
+            }
+            // 세션 존재 여부 확인
+            let entry = registry.sessions.get(id).ok_or(SessionError::Expired)?;
+            // 새 세션으로 대체(replaced)되었는지 확인
+            if entry.replaced {
+                return Err(SessionError::Replaced);
+            }
+            // 에이전트가 정상 바인딩/등록되어 있는지 확인
+            if entry.view.principal.agent_id.is_none() {
+                return Err(SessionError::AgentUnregistered);
+            }
+            // 세션에 등록된 Principal(사용자, 팀, 에이전트)과 요청된 Principal이 정확히 일치하는지 검증
+            if &entry.view.principal != expected {
+                return Err(SessionError::Identity(IdentityError::Forbidden));
+            }
+            // 중앙 서버(WebSocket)와의 신원 연결 상태와 일치하는지 검증
+            check_current_principal(&entry.view.principal, current)?;
+            Ok(entry.view.principal.clone())
+        })
+        .await
+    }
+
     /// 세션 명시적 해제 및 OFFLINE presence 전파
     pub async fn release(
         &self,

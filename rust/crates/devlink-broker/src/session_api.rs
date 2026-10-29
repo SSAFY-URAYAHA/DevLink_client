@@ -83,8 +83,13 @@ fn validation(id: &str, status: StatusCode) -> Response {
 }
 
 /// SessionError를 MCP 표준 HTTP 상태 코드 및 에러 코드로 변환
-fn session_failure(id: &str, error: SessionError) -> Response {
-    let (status, code, scope) = match error {
+pub(crate) fn session_failure(id: &str, error: SessionError) -> Response {
+    let (status, code, scope) = session_error(error);
+    failure(id, status, code, scope)
+}
+
+pub(crate) fn session_error(error: SessionError) -> (StatusCode, &'static str, &'static str) {
+    match error {
         SessionError::Expired => (StatusCode::CONFLICT, "SESSION_EXPIRED", "session"),
         SessionError::Replaced => (StatusCode::CONFLICT, "SESSION_REPLACED", "session"),
         SessionError::Conflict => (StatusCode::CONFLICT, "SESSION_CONFLICT", "session"),
@@ -102,13 +107,12 @@ fn session_failure(id: &str, error: SessionError) -> Response {
         SessionError::Identity(IdentityError::Forbidden) => {
             (StatusCode::FORBIDDEN, "FORBIDDEN", "domain")
         }
-    };
-    failure(id, status, code, scope)
+    }
 }
 
 /// 공통 HTTP 요청 파싱 및 인증/보안 헤더 검증
-async fn read<T: serde::de::DeserializeOwned>(
-    api: &Api,
+pub(crate) async fn read_authenticated<T: serde::de::DeserializeOwned>(
+    token: &str,
     request: Request,
 ) -> Result<T, Box<Response>> {
     let fallback_id = uuid::Uuid::new_v4().to_string();
@@ -126,7 +130,7 @@ async fn read<T: serde::de::DeserializeOwned>(
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.strip_prefix("Bearer ") == Some(api.token.as_str()));
+        .is_some_and(|v| v.strip_prefix("Bearer ") == Some(token));
     if !authorized {
         return Err(Box::new(failure(
             &fallback_id,
@@ -186,7 +190,7 @@ async fn read<T: serde::de::DeserializeOwned>(
 
 /// POST /v1/sessions: 신규 세션 발급 또는 기존 세션 복구
 async fn claim(State(api): State<Api>, request: Request) -> Response {
-    let body: ClaimRequest = match read(&api, request).await {
+    let body: ClaimRequest = match read_authenticated(&api.token, request).await {
         Ok(body) => body,
         Err(response) => return *response,
     };
@@ -204,7 +208,7 @@ async fn claim(State(api): State<Api>, request: Request) -> Response {
 
 /// POST /v1/sessions/:id/bind: 세션에 Agent 식별자 바인딩 (활성화 및 중앙 ONLINE 전파)
 async fn bind(State(api): State<Api>, Path(id): Path<String>, request: Request) -> Response {
-    let body: BindRequest = match read(&api, request).await {
+    let body: BindRequest = match read_authenticated(&api.token, request).await {
         Ok(body) => body,
         Err(response) => return *response,
     };
@@ -226,7 +230,7 @@ async fn bind(State(api): State<Api>, Path(id): Path<String>, request: Request) 
 
 /// POST /v1/sessions/:id/heartbeat: 세션 임대 기간(TTL 90초) 갱신
 async fn heartbeat(State(api): State<Api>, Path(id): Path<String>, request: Request) -> Response {
-    let body: LeaseRequest = match read(&api, request).await {
+    let body: LeaseRequest = match read_authenticated(&api.token, request).await {
         Ok(body) => body,
         Err(response) => return *response,
     };
@@ -242,7 +246,7 @@ async fn heartbeat(State(api): State<Api>, Path(id): Path<String>, request: Requ
 
 /// DELETE /v1/sessions/:id: 세션 명시적 해제 (소유권 정리 및 중앙 OFFLINE 전파)
 async fn release(State(api): State<Api>, Path(id): Path<String>, request: Request) -> Response {
-    let body: LeaseRequest = match read(&api, request).await {
+    let body: LeaseRequest = match read_authenticated(&api.token, request).await {
         Ok(body) => body,
         Err(response) => return *response,
     };

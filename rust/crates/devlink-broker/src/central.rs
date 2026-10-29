@@ -7,8 +7,8 @@ use crate::{
     config::Config,
     inbox::Inbox,
     protocol::{
-        ClientMessage, HeartbeatPong, PresenceStatus, ServerMessage, TaskAckPayload,
-        TaskCreatedMessage,
+        ClientMessage, HeartbeatPong, MAX_CENTRAL_MESSAGE_BYTES, PresenceStatus, ServerMessage,
+        TaskAckPayload, TaskCreatedMessage,
     },
 };
 use anyhow::{Result, bail, ensure};
@@ -495,8 +495,8 @@ async fn session(
 
     // 웹소켓 프레임 및 메시지 최대 크기 제한 (64KB)
     let ws_config = WebSocketConfig::default()
-        .max_message_size(Some(64 * 1024))
-        .max_frame_size(Some(64 * 1024));
+        .max_message_size(Some(MAX_CENTRAL_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_CENTRAL_MESSAGE_BYTES));
 
     // 중앙 서버에 비동기 웹소켓 Upgrade 연결 (5초 타임아웃)
     let connection = tokio::select! {

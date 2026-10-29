@@ -34,6 +34,109 @@ use tokio_tungstenite::{
 const TOKEN: &str = "test-only-secret-never-print";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_creates_tasks_with_agent_bearer_and_reuses_request_key_after_restart() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.configure(|config| config.server_url = format!("ws://{}", listener.local_addr().unwrap()));
+    let saved = Arc::new(Mutex::new(std::collections::HashMap::<String, u64>::new()));
+    let saved_copy = saved.clone();
+    let server = tokio::spawn(async move {
+        let mut clients = JoinSet::new();
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let saved = saved_copy.clone();
+            clients.spawn(async move {
+                let mut method = [0;3];
+                while stream.peek(&mut method).await.unwrap() < 3 { sleep(Duration::from_millis(1)).await; }
+                if &method == b"GET" {
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    socket.send(Message::Text(serde_json::json!({"type":"BROKER_READY","payload":{
+                        "connection_id":"cli-task-connection","agent_id":12,"user_id":3,"team_id":1
+                    }}).to_string().into())).await.unwrap();
+                    while let Some(Ok(frame)) = socket.next().await {
+                        match frame {
+                            Message::Text(text) => if let Ok(ClientMessage::Heartbeat(HeartbeatPing::Ping{ping_id})) = serde_json::from_str(&text) {
+                                socket.send(Message::Text(serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id)).unwrap().into())).await.unwrap();
+                            },
+                            Message::Close(_) => break,
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0;1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0 && bytes.len() < 16 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
+                };
+                let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap().to_lowercase();
+                assert!(headers.starts_with("post /api/v1/tasks/1 http/1.1\r\n"));
+                assert!(headers.contains(&format!("authorization: bearer {TOKEN}\r\n")));
+                assert!(!headers.contains("cookie:") && !headers.contains("origin:"));
+                let size: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                assert!(size <= 128 * 1024);
+                while bytes.len() - header_end < size {
+                    let mut chunk = [0;1024]; let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0); bytes.extend_from_slice(&chunk[..count]);
+                }
+                let command: serde_json::Value = serde_json::from_slice(&bytes[header_end..header_end+size]).unwrap();
+                assert_eq!(command["requesterAgentId"],12); assert_eq!(command["receiverAgentId"],13);
+                let key = command["requestKey"].as_str().unwrap().to_string();
+                let mut tasks = saved.lock().await;
+                let replayed = tasks.contains_key(&key);
+                let id = *tasks.entry(key).or_insert(101);
+                drop(tasks);
+                let response = serde_json::json!({"success":true,"data":{"taskId":id,"receiverAgentId":13,
+                    "status":"PENDING","version":1,"replayed":replayed,"delivery":{"status":"ACK_PENDING","reasonCode":null}},"code":null,"message":null}).to_string();
+                let status = if replayed {"200 OK"} else {"201 Created"};
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+            });
+            while let Some(result) = clients.try_join_next() {
+                result.unwrap();
+            }
+        }
+    });
+    let mut original_key = None;
+    for attempt in 0..2 {
+        f.ok(&["start"]);
+        f.wait_status(ConnectionStatus::Connected).await;
+        let runtime = Runtime::load(&f.path).unwrap();
+        let credentials = devlink_broker::credentials::load(&f.path).unwrap();
+        let client = runtime.client().unwrap();
+        let session: serde_json::Value = client.post(runtime.url("/v1/sessions")).bearer_auth(&credentials.local_token)
+            .json(&serde_json::json!({"requestId":"claim","instanceId":"creator","mode":"fresh","agentId":"12"}))
+            .send().await.unwrap().json().await.unwrap();
+        let mut context = session["data"]["principal"].clone();
+        context["sessionId"] = session["data"]["sessionId"].clone();
+        let response = client.post(runtime.url("/v1/tasks/create")).bearer_auth(&credentials.local_token)
+            .json(&serde_json::json!({"requestId":"stable-cli-task","operation":"create_task","context":context,
+                "arguments":{"recipientAgentId":"13","title":"작업","description":"CLI 생성 검증"}}))
+            .send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["data"]["taskId"], "101");
+        assert_eq!(body["data"]["replayed"], attempt == 1);
+        if let Some(key) = &original_key {
+            assert_eq!(&body["requestKey"], key);
+        } else {
+            original_key = Some(body["requestKey"].clone());
+        }
+        assert!(
+            !body.to_string().contains(TOKEN)
+                && !body.to_string().contains(&credentials.local_token)
+        );
+        f.ok(&["stop"]);
+    }
+    assert_eq!(saved.lock().await.len(), 1);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_persists_tasks_before_ack_and_deduplicates_after_restart() {
     let f = Fixture::new();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

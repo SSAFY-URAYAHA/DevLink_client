@@ -1,0 +1,416 @@
+//! 중앙 서버 Task REST API 전송 클라이언트
+//!
+//! WebSocket 접속 origin으로부터 HTTP/HTTPS 엔드포인트를 도출하며,
+//! Bearer 인증 토큰을 안전하게 주입하고 로그, URL, 에러 메시지에 인증 정보가 누출되지 않도록 보장합니다.
+
+use crate::{central::endpoint_url, protocol::MAX_CENTRAL_MESSAGE_BYTES};
+use anyhow::{Context, Result, ensure};
+use reqwest::{
+    Client,
+    header::{AUTHORIZATION, HeaderValue},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::time::Duration;
+
+/// 요청 본문 최대 크기 제한 (128 KB)
+pub const REQUEST_LIMIT: usize = 128 * 1024;
+/// 응답 본문 최대 수신 제한 (256 KB)
+const RESPONSE_LIMIT: usize = 256 * 1024;
+
+/// 중앙 서버로 전달되는 작업 생성 커맨드 DTO
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateTaskCommand {
+    /// 멱등성 보장을 위한 클라이언트 고유 요청 키
+    pub request_key: String,
+    /// 요청자(발신) 에이전트 ID
+    pub requester_agent_id: u64,
+    /// 대상(수신) 에이전트 ID
+    pub receiver_agent_id: u64,
+    /// 프롬프트 본문 (제목, 설명 등 JSON 직렬화된 문자열)
+    pub prompt: String,
+}
+
+/// 문자열 형태의 ID가 유효한 양의 64비트 정수(Java Long 호환)인지 검증 및 파싱
+pub fn numeric_id(value: &str) -> Option<u64> {
+    let id = value.parse::<u64>().ok()?;
+    (id > 0 && id <= i64::MAX as u64 && id.to_string() == value).then_some(id)
+}
+
+impl CreateTaskCommand {
+    /// 메시지가 중앙 서버 WebSocket/HTTP 전송 제한 내에 들어가는지 검증
+    ///
+    /// TASK_CREATED 엔벨로프, 식별자, 타임스탬프 등을 위한 여유 공간(1024바이트)을 확보합니다.
+    pub fn fits_delivery(&self) -> bool {
+        serde_json::to_vec(&self.prompt)
+            .is_ok_and(|bytes| bytes.len() <= MAX_CENTRAL_MESSAGE_BYTES - 1024)
+    }
+
+    /// 커맨드 필드의 필수값 및 크기 제약 조건 검증
+    pub fn valid(&self) -> bool {
+        !self.request_key.trim().is_empty()
+            && self.request_key.encode_utf16().count() <= 64
+            && numeric_id(&self.requester_agent_id.to_string()).is_some()
+            && numeric_id(&self.receiver_agent_id.to_string()).is_some()
+            && !self.prompt.trim().is_empty()
+            && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= REQUEST_LIMIT)
+    }
+}
+
+/// 작업 생성 과정에서 발생하는 에러 표현 구조체
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskError {
+    pub code: &'static str,
+    pub status: u16,
+    pub scope: &'static str,
+    pub outcome: &'static str,
+    pub task_id: Option<u64>,
+}
+
+impl TaskError {
+    /// 도메인 검증 실패 또는 명시적 거부 에러 생성
+    pub fn rejected(code: &'static str, status: u16) -> Self {
+        Self {
+            code,
+            status,
+            scope: "domain",
+            outcome: "rejected",
+            task_id: None,
+        }
+    }
+    /// 네트워크 타임아웃 또는 중앙 서버 불가 시 unknown 에러 생성
+    pub fn unknown(code: &'static str) -> Self {
+        Self {
+            code,
+            status: 502,
+            scope: "transport",
+            outcome: "unknown",
+            task_id: None,
+        }
+    }
+}
+
+/// 중앙 서버 Task API와 통신하는 HTTP 클라이언트
+#[derive(Clone)]
+pub struct TaskClient {
+    client: Client,
+    origin: url::Url,
+    authorization: HeaderValue,
+    timeout: Duration,
+}
+
+impl std::fmt::Debug for TaskClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskClient")
+            .field("authorization", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TaskClient {
+    /// 중앙 서버 origin URL 문자열 반환
+    pub fn origin(&self) -> String {
+        self.origin.to_string()
+    }
+    /// 기본 타임아웃(5초)으로 TaskClient 초기화
+    pub fn new(server_url: &str, token: &str) -> Result<Self> {
+        Self::with_timeout(server_url, token, Duration::from_secs(5))
+    }
+
+    /// 지정된 타임아웃과 함께 TaskClient 초기화 및 보안 헤더 설정
+    pub fn with_timeout(server_url: &str, token: &str, timeout: Duration) -> Result<Self> {
+        ensure!(
+            !token.trim().is_empty() && token.len() <= 8192,
+            "Invalid central Agent token"
+        );
+        ensure!(
+            !timeout.is_zero() && timeout <= Duration::from_secs(300),
+            "Invalid central REST timeout"
+        );
+        let mut origin =
+            url::Url::parse(&endpoint_url(server_url)?).context("Invalid central origin")?;
+        let scheme = if origin.scheme() == "wss" {
+            "https"
+        } else {
+            "http"
+        };
+        origin
+            .set_scheme(scheme)
+            .map_err(|_| anyhow::anyhow!("Invalid central REST scheme"))?;
+        origin.set_path("/");
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| anyhow::anyhow!("Invalid central Agent token header"))?;
+        authorization.set_sensitive(true);
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .referer(false)
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .build()
+            .map_err(|_| anyhow::anyhow!("Cannot initialize central REST client"))?;
+        Ok(Self {
+            client,
+            origin,
+            authorization,
+            timeout,
+        })
+    }
+
+    /// 중앙 서버에 작업 생성 요청을 전송하고 결과를 반환
+    pub async fn create(
+        &self,
+        team_id: u64,
+        command: &CreateTaskCommand,
+    ) -> Result<Value, TaskError> {
+        if numeric_id(&team_id.to_string()).is_none()
+            || !command.valid()
+            || !command.fits_delivery()
+        {
+            return Err(TaskError::rejected("VALIDATION_FAILED", 400));
+        }
+        tokio::time::timeout(self.timeout, self.exchange(team_id, command))
+            .await
+            .unwrap_or_else(|_| Err(TaskError::unknown("CENTRAL_TIMEOUT")))
+    }
+
+    /// HTTP POST 통신 및 중앙 서버 응답 엔벨로프 검증 수행
+    async fn exchange(
+        &self,
+        team_id: u64,
+        command: &CreateTaskCommand,
+    ) -> Result<Value, TaskError> {
+        let mut url = self.origin.clone();
+        url.set_path(&format!("/api/v1/tasks/{team_id}"));
+        let mut response = self
+            .client
+            .post(url)
+            .header(AUTHORIZATION, self.authorization.clone())
+            .json(command)
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let status = response.status().as_u16();
+        // These denials remain definitive even if the error body is malformed.
+        if status == 401 {
+            return Err(TaskError::rejected("CENTRAL_UNAUTHENTICATED", 503));
+        }
+        if status == 403 {
+            return Err(TaskError::rejected("FORBIDDEN", 403));
+        }
+        if (300..400).contains(&status) {
+            return Err(TaskError::unknown("CENTRAL_PROTOCOL_ERROR"));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > RESPONSE_LIMIT as u64)
+        {
+            return Err(TaskError::unknown("CENTRAL_PROTOCOL_ERROR"));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+            if bytes.len() + chunk.len() > RESPONSE_LIMIT {
+                return Err(TaskError::unknown("CENTRAL_PROTOCOL_ERROR"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let envelope: CentralEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|_| TaskError::unknown("CENTRAL_PROTOCOL_ERROR"))?;
+        let known_id = envelope
+            .data
+            .as_ref()
+            .and_then(|data| known_task_id(data, command.receiver_agent_id));
+        let protocol_error = || TaskError {
+            task_id: known_id,
+            ..TaskError::unknown("CENTRAL_PROTOCOL_ERROR")
+        };
+        if !(200..300).contains(&status) || !envelope.success {
+            if let Some(id) = known_id {
+                let mut error = TaskError::unknown("CENTRAL_RESULT_UNKNOWN");
+                error.task_id = Some(id);
+                return Err(error);
+            }
+            return Err(central_error(status, envelope.code.as_deref()));
+        }
+        if !matches!(status, 200 | 201) {
+            return Err(protocol_error());
+        }
+        let data: CreatedTask = serde_json::from_value(envelope.data.unwrap_or(Value::Null))
+            .map_err(|_| protocol_error())?;
+        if numeric_id(&data.task_id.to_string()).is_none()
+            || data.receiver_agent_id != command.receiver_agent_id
+            || data.version > i64::MAX as u64
+            || data.replayed != (status == 200)
+            || !matches!(
+                data.status.as_str(),
+                "PENDING" | "IN_PROGRESS" | "COMPLETED" | "FAILED"
+            )
+        {
+            return Err(protocol_error());
+        }
+        if let Some(delivery) = &data.delivery {
+            delivery.validate().map_err(|_| protocol_error())?;
+        }
+        Ok(
+            json!({"taskId":data.task_id.to_string(),"receiverAgentId":data.receiver_agent_id.to_string(),
+            "status":data.status,"version":data.version,"replayed":data.replayed,
+            "requestKey":command.request_key,"delivery":data.delivery}),
+        )
+    }
+}
+
+/// HTTP 전송 오류를 표준 TaskError로 변환
+fn transport_error(error: reqwest::Error) -> TaskError {
+    TaskError::unknown(if error.is_timeout() {
+        "CENTRAL_TIMEOUT"
+    } else {
+        "CENTRAL_UNAVAILABLE"
+    })
+}
+
+/// 응답 본문에서 기발급된 taskId 및 receiverAgentId가 존재하는지 추출
+fn known_task_id(value: &Value, receiver: u64) -> Option<u64> {
+    let id = value.get("taskId")?.as_u64()?;
+    (numeric_id(&id.to_string()).is_some() && value.get("receiverAgentId")?.as_u64()? == receiver)
+        .then_some(id)
+}
+
+/// 중앙 서버가 반환한 HTTP 상태 코드 및 비즈니스 에러 코드를 로컬 TaskError로 매핑
+fn central_error(status: u16, code: Option<&str>) -> TaskError {
+    if status >= 500 {
+        return TaskError::unknown("CENTRAL_UNAVAILABLE");
+    }
+    match code {
+        Some("VALIDATION_FAILED") => TaskError::rejected("VALIDATION_FAILED", 400),
+        Some("RESOURCE_NOT_FOUND") => TaskError::rejected("RECEIVER_NOT_FOUND", 404),
+        Some("RECEIVER_OFFLINE") => TaskError::rejected("RECEIVER_OFFLINE", 409),
+        Some("REQUEST_KEY_CONFLICT") => TaskError::rejected("REQUEST_KEY_CONFLICT", 409),
+        // A concurrent insert conflict may refer to a task already committed.
+        Some("DUPLICATE_REQUEST") => TaskError::unknown("CENTRAL_RESULT_UNKNOWN"),
+        _ => TaskError::unknown("CENTRAL_PROTOCOL_ERROR"),
+    }
+}
+
+#[derive(Deserialize)]
+struct CentralEnvelope {
+    success: bool,
+    data: Option<Value>,
+    code: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreatedTask {
+    task_id: u64,
+    receiver_agent_id: u64,
+    status: String,
+    version: u64,
+    replayed: bool,
+    delivery: Option<Delivery>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Delivery {
+    status: String,
+    reason_code: Option<String>,
+}
+
+impl Delivery {
+    fn validate(&self) -> Result<(), TaskError> {
+        let valid = match self.status.as_str() {
+            "ACK_PENDING" | "ACK_RECEIVED" => self.reason_code.is_none(),
+            "DELIVERY_NOT_SENT" | "DELIVERY_UNKNOWN" => {
+                self.reason_code.as_deref().is_some_and(|code| {
+                    matches!(
+                        code,
+                        "RECEIVER_OFFLINE"
+                            | "CONNECTION_UNAVAILABLE"
+                            | "CONNECTION_REPLACED"
+                            | "TRANSPORT_ERROR"
+                            | "TASK_NOT_PENDING"
+                            | "ACK_TIMEOUT"
+                            | "CONNECTION_CLOSED"
+                            | "HISTORY_RECORD_FAILED"
+                            | "ROUTING_ERROR"
+                            | "HISTORY_READ_FAILED"
+                    )
+                })
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(TaskError::unknown("CENTRAL_PROTOCOL_ERROR"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepted_prompt_boundary_fits_the_actual_task_created_wire() {
+        use crate::protocol::{ServerMessage, TaskCreatedPayload};
+        let mut command = CreateTaskCommand {
+            request_key: "request".into(),
+            requester_agent_id: i64::MAX as u64,
+            receiver_agent_id: i64::MAX as u64,
+            prompt: "x".repeat(MAX_CENTRAL_MESSAGE_BYTES - 1024 - 2),
+        };
+        assert!(command.fits_delivery());
+        let wire = ServerMessage::TaskCreated {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            payload: TaskCreatedPayload {
+                task_id: i64::MAX as u64,
+                team_id: i64::MAX as u64,
+                requester_agent_id: command.requester_agent_id,
+                receiver_agent_id: command.receiver_agent_id,
+                prompt: command.prompt.clone(),
+                created_at: "+999999999-12-31T23:59:59.999999999".into(),
+            },
+        };
+        assert!(serde_json::to_vec(&wire).unwrap().len() <= MAX_CENTRAL_MESSAGE_BYTES);
+        command.prompt.push('x');
+        assert!(!command.fits_delivery());
+    }
+
+    #[test]
+    fn task_origin_and_header_keep_transport_credentials_private() {
+        let secret = "synthetic-secret-agent-token";
+        let client = TaskClient::new("wss://central.example:8443/ws/broker", secret).unwrap();
+        assert_eq!(client.origin(), "https://central.example:8443/");
+        assert!(client.authorization.is_sensitive());
+        assert!(!format!("{client:?}").contains(secret));
+        for invalid in [
+            "https://central.example",
+            "ws://user:password@central.example",
+            "ws://central.example/other",
+            "ws://central.example/?token=secret",
+        ] {
+            assert!(TaskClient::new(invalid, secret).is_err());
+        }
+        assert!(TaskClient::new("ws://central.example", "bad\r\nheader").is_err());
+        assert!(TaskClient::with_timeout("ws://central.example", secret, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn numeric_ids_are_canonical_positive_java_longs() {
+        for invalid in [
+            "0",
+            "-1",
+            "+1",
+            "01",
+            " 1",
+            "9223372036854775808",
+            "agent-1",
+        ] {
+            assert_eq!(numeric_id(invalid), None);
+        }
+        assert_eq!(numeric_id("9223372036854775807"), Some(i64::MAX as u64));
+    }
+}

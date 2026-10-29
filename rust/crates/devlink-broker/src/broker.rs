@@ -66,6 +66,10 @@ pub async fn run(path: &Path) -> Result<()> {
     let mcp_creds = crate::credentials::publish(path, &broker_url)?;
     let mcp_token = Arc::new(mcp_creds.local_token);
     let inbox = crate::inbox::Inbox::open(path)?;
+    // 작업 생성 요청 영속화 및 멱등성 로그 초기화
+    let task_requests = crate::task_requests::TaskRequests::open(path)?;
+    // 중앙 서버 Task API 전송을 위한 HTTP 클라이언트 초기화 (중앙 토큰 주입)
+    let task_client = crate::task_client::TaskClient::new(&config.server_url, &token)?;
 
     // 현재 실행 인스턴스 정보 생성 및 파일로 게시(publish)
     let runtime = Arc::new(Runtime {
@@ -107,7 +111,19 @@ pub async fn run(path: &Path) -> Result<()> {
             cancel: cancel.clone(),
             mcp_token: mcp_token.clone(),
         })
-        .merge(crate::session_api::router(mcp_token, sessions));
+        // 세션 관리 API 라우터 병합 (/v1/sessions/*)
+        .merge(crate::session_api::router(
+            mcp_token.clone(),
+            sessions.clone(),
+        ))
+        // 작업 생성 API 라우터 병합 (/v1/tasks/create)
+        .merge(crate::task_api::router(
+            mcp_token,
+            sessions,
+            task_client,
+            task_requests,
+            cancel.clone(),
+        ));
 
     // Graceful Shutdown 처리 (취소 토큰 수신 또는 OS 종료 시그널 감지 시)
     let shutdown_token = cancel.clone();
