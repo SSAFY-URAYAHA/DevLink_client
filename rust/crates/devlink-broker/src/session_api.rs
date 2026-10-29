@@ -88,6 +88,15 @@ pub(crate) fn session_failure(id: &str, error: SessionError) -> Response {
     failure(id, status, code, scope)
 }
 
+fn control_session_failure(id: &str, error: SessionError) -> Response {
+    // MCP reserves control-route HTTP 403 for terminal local credential errors.
+    // Keep the existing business-route status mapping unchanged.
+    if matches!(error, SessionError::Identity(IdentityError::Forbidden)) {
+        return failure(id, StatusCode::UNPROCESSABLE_ENTITY, "FORBIDDEN", "domain");
+    }
+    session_failure(id, error)
+}
+
 pub(crate) fn session_error(error: SessionError) -> (StatusCode, &'static str, &'static str) {
     match error {
         SessionError::Expired => (StatusCode::CONFLICT, "SESSION_EXPIRED", "session"),
@@ -202,7 +211,7 @@ async fn claim(State(api): State<Api>, request: Request) -> Response {
         Ok(session) => {
             Json(json!({ "requestId": body.request_id, "data": session })).into_response()
         }
-        Err(error) => session_failure(body.request_id.as_str(), error),
+        Err(error) => control_session_failure(body.request_id.as_str(), error),
     }
 }
 
@@ -224,7 +233,7 @@ async fn bind(State(api): State<Api>, Path(id): Path<String>, request: Request) 
         Ok(session) => {
             Json(json!({ "requestId": body.request_id, "data": session })).into_response()
         }
-        Err(error) => session_failure(body.request_id.as_str(), error),
+        Err(error) => control_session_failure(body.request_id.as_str(), error),
     }
 }
 
@@ -240,7 +249,7 @@ async fn heartbeat(State(api): State<Api>, Path(id): Path<String>, request: Requ
     };
     match api.sessions.heartbeat(&id, &body.instance_id).await {
         Ok(()) => Json(json!({ "requestId": body.request_id, "data": {} })).into_response(),
-        Err(error) => session_failure(body.request_id.as_str(), error),
+        Err(error) => control_session_failure(body.request_id.as_str(), error),
     }
 }
 
@@ -256,6 +265,6 @@ async fn release(State(api): State<Api>, Path(id): Path<String>, request: Reques
     };
     match api.sessions.release(&id, &body.instance_id).await {
         Ok(()) => Json(json!({ "requestId": body.request_id, "data": {} })).into_response(),
-        Err(error) => session_failure(body.request_id.as_str(), error),
+        Err(error) => control_session_failure(body.request_id.as_str(), error),
     }
 }

@@ -85,7 +85,12 @@ pub async fn run(path: &Path) -> Result<()> {
     // 취소 토큰 및 중앙 서버 연결 상태 초기화
     let cancel = CancellationToken::new();
     let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
-    let central_state = CentralState::new(status).with_inbox(inbox);
+    let central_state = CentralState::new(status)
+        .with_inbox(inbox)
+        .with_context_client(crate::agent_context::ContextClient::new(
+            &config.server_url,
+            &token,
+        )?);
     let sessions = SessionManager::new(
         Arc::new(ReadyIdentityProvider::new(central_state.clone())),
         central_state.clone(),

@@ -1,3 +1,4 @@
+pub mod agent_context;
 pub mod broker;
 pub mod central;
 pub mod config;

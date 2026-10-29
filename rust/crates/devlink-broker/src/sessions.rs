@@ -135,6 +135,9 @@ pub trait IdentityProvider: Send + Sync {
     fn requires_current_ready(&self) -> bool {
         false
     }
+    fn requires_live_check(&self) -> bool {
+        false
+    }
 }
 
 /// Trust only identity supplied by the authenticated current central connection.
@@ -178,12 +181,55 @@ fn ready_principal(
 }
 
 impl IdentityProvider for ReadyIdentityProvider {
+    fn requires_live_check(&self) -> bool {
+        self.central.context_client.is_some()
+    }
     fn requires_current_ready(&self) -> bool {
         true
     }
 
     fn resolve<'a>(&'a self, agent: Option<&'a Identifier>) -> IdentityFuture<'a> {
         Box::pin(async move {
+            if let Some(client) = &self.central.context_client {
+                let (generation, status, identity) = self.central.context_snapshot().await;
+                if status != ConnectionStatus::Connected {
+                    return Err(if status == ConnectionStatus::AuthFailed {
+                        IdentityError::Unauthenticated
+                    } else {
+                        IdentityError::Unavailable
+                    });
+                }
+                let identity = identity.ok_or(IdentityError::Unauthenticated)?;
+                let context = match client.get().await {
+                    Ok(context) => context,
+                    Err(error) => {
+                        if error == IdentityError::Unauthenticated {
+                            self.central
+                                .confirm_context(generation, &identity, None)
+                                .await;
+                        }
+                        return Err(error);
+                    }
+                };
+                if context.agent_id != identity.agent_id
+                    || identity
+                        .user_id
+                        .is_some_and(|id| id != context.owner_user_id)
+                    || identity.team_id.is_some_and(|id| id != context.team_id)
+                {
+                    self.central
+                        .confirm_context(generation, &identity, None)
+                        .await;
+                    return Err(IdentityError::Forbidden);
+                }
+                if !self
+                    .central
+                    .confirm_context(generation, &identity, Some(&context))
+                    .await
+                {
+                    return Err(IdentityError::Unavailable);
+                }
+            }
             self.central
                 .with_ready_context(|status, identity, _| {
                     let mut principal = ready_principal(status, identity)?;
@@ -483,8 +529,18 @@ impl SessionManager {
         self.central
             .with_ready_context(|status, identity, epoch| {
                 registry.sync_subject(epoch);
-                let result = operation(registry, Some(ready_principal(status, identity)));
-                registry.publish_presence(&self.central);
+                let current = ready_principal(status, identity);
+                let confirmed = current.is_ok();
+                let result = operation(registry, Some(current));
+                // A legacy reconnect must not republish old ONLINE ownership
+                // before live context confirms the current WS subject.
+                if self.identity.requires_live_check() && !confirmed {
+                    if registry.observed {
+                        self.central.set_presence(PresenceStatus::Offline);
+                    }
+                } else {
+                    registry.publish_presence(&self.central);
+                }
                 result
             })
             .await
@@ -554,6 +610,9 @@ impl SessionManager {
         id: &Identifier,
         instance: &Identifier,
     ) -> Result<(), SessionError> {
+        if self.identity.requires_live_check() {
+            self.resolve(None).await?;
+        }
         let mut registry = self.registry.lock().await;
         let now = Instant::now();
         self.with_context(&mut registry, |registry, current| {

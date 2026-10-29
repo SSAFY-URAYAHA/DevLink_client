@@ -595,6 +595,49 @@ async fn bad_local_credentials_and_storage_failure_never_call_central() {
 // DEVLINK_MCP_BUILD to that path. The harness uses its existing node_modules.
 // Reuse the HTTP fixtures above; READY identity is prepared, not received over WS.
 #[tokio::test]
+#[ignore = "requires Node >=24, DEVLINK_MCP_BUILD and a real 90-second lease wait"]
+async fn actual_mcp_session_ownership_expiry_and_identity_rejection() {
+    let build = std::env::var_os("DEVLINK_MCP_BUILD").expect("set DEVLINK_MCP_BUILD");
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir_in(workspace.join("target")).unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_secs(2)).await;
+    let mut command = tokio::process::Command::new("node");
+    command
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/mcp_sessions.mjs"
+        ))
+        .arg(&build)
+        .arg(&broker.url)
+        .env("DEVLINK_TEST_LOCAL_TOKEN", LOCAL)
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let output = timeout(Duration::from_secs(120), command.output())
+        .await
+        .expect("MCP session harness timed out")
+        .expect("cannot start Node");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["passed"], true);
+    // Only the three explicit successful calls reach the fixture. Rejected
+    // identity, replaced owner and expired session never create central tasks.
+    assert_eq!(remote.state.calls.lock().await.len(), 3);
+    assert_eq!(remote.state.saved.lock().await.len(), 3);
+    assert_eq!(
+        broker.central.presence().await,
+        Some(devlink_broker::protocol::PresenceStatus::Offline)
+    );
+    broker.stop().await;
+}
+
+#[tokio::test]
 #[ignore = "requires Node >=24 and current MCP build at DEVLINK_MCP_BUILD"]
 async fn actual_mcp_tools_use_rust_sessions_and_mock_central() {
     let build = std::env::var_os("DEVLINK_MCP_BUILD").expect("set DEVLINK_MCP_BUILD");

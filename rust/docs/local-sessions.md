@@ -1,5 +1,9 @@
 # 로컬 MCP 세션 API
 
+2026-10-29 후속 연결: 기본 CLI의 ReadyIdentityProvider에 기존 중앙 `/api/v1/agent/context` 실시간 조회를 연결했다. claim/bind/heartbeat는 현재 WS와 REST 신원을 대조하며 READY의 user/team 누락만으로는 더 이상 차단되지 않는다. 아래의 미구성·legacy 차단 설명은 과거 기록이다. [현재 신원 공급 정책](ready-identity.md)의 최신 절을 따른다.
+
+2026-10-29 세션 계약 보완: 신원/Agent 불일치는 `422 FORBIDDEN / domain`으로 반환한다. MCP 소비자는 세션 경로의 HTTP 403을 로컬 자격의 영구 거부로 취급하므로 도메인 거부에 403을 사용하지 않는다. Origin 거부는 기존 `403 LOCAL_AUTH_FORBIDDEN`을 유지한다. 현재 구현·검증 범위와 중앙 차단 사항은 [세션 스토리 검증](session-story-verification.md)을 따른다.
+
 2026-10-29 갱신: 기본 CLI에 [READY 기반 신원 공급부](ready-identity.md)를 연결했다. 아래 2026-10-28 미구성 공급부 설명은 당시 기록이다. 현재 중앙의 user_id/team_id/agent_id가 있는 READY와 Connected 상태에서는 로컬 세션 생성·bind가 가능하며, legacy READY는 계속 CENTRAL_UNAUTHENTICATED다. 신원이 바뀌면 기존 세션을 만료시키고, 같은 신원 재접속은 lease 안의 소유권을 유지한다. 이 공급부와 실제 로컬 HTTP/WebSocket·CLI는 Mock으로 검증하며 운영 중앙 연동 완료를 뜻하지 않는다.
 
 2026-10-28 (Asia/Seoul). 기존 [MCP 계약](../../packages/mcp-server/docs/broker-contract-v0.1.md)의 로컬 세션 관리 부분을 구현했습니다. 중앙 신원 조회·Agent 등록·토큰 발급과 업무 API는 별도 후속 항목입니다.
@@ -50,7 +54,7 @@
 | 409 | AGENT_UNREGISTERED / session | 살아 있는 unbound 세션의 recover claim으로 bind를 우회하려는 경우 |
 | 503 | CENTRAL_UNAUTHENTICATED / domain | 검증된 신원 공급부 미연결 또는 중앙 인증 필요 |
 | 503 | CENTRAL_UNAVAILABLE / transport | 신원 공급부 오류·5초 제한 초과. outcome은 unknown |
-| 403 | FORBIDDEN / domain | 검증된 사용자·팀·Agent와 claim/bind 불일치 |
+| 422 | FORBIDDEN / domain | 검증된 사용자·팀·Agent와 claim/bind 불일치. 로컬 자격 거부와 구분 |
 
 성공 DTO는 작게 제한된 식별자들로만 구성돼 256KiB 응답 상한 안에 있습니다. 지원하지 않는 HTTP 메서드는 Axum의 405이며 성공으로 해석하지 않습니다. 세션 경로 등록이나 OPTIONS의 405는 실제 중앙 인증·업무 준비 완료를 뜻하지 않습니다.
 

@@ -100,6 +100,7 @@ struct StateInner {
 /// 새 연결의 상태 및 식별 정보(`connection_id`, `agent_id`)를 덮어쓰지 못하도록 보호하는 상태 관리 구조체
 #[derive(Clone)]
 pub struct CentralState {
+    pub(crate) context_client: Option<crate::agent_context::ContextClient>,
     inner: Arc<RwLock<StateInner>>,
     status: SharedStatus,
     identity: SharedIdentity,
@@ -134,6 +135,7 @@ impl CentralState {
             identity,
             presence,
             inbox: None,
+            context_client: None,
             subject_changes: watch::channel(0).0,
         }
     }
@@ -141,6 +143,57 @@ impl CentralState {
     pub fn with_inbox(mut self, inbox: Inbox) -> Self {
         self.inbox = Some(inbox);
         self
+    }
+
+    pub fn with_context_client(mut self, client: crate::agent_context::ContextClient) -> Self {
+        self.context_client = Some(client);
+        self
+    }
+
+    pub(crate) async fn context_snapshot(
+        &self,
+    ) -> (u64, ConnectionStatus, Option<CentralIdentity>) {
+        let guard = self.inner.read().await;
+        (guard.generation, guard.status, guard.identity.clone())
+    }
+
+    pub(crate) async fn confirm_context(
+        &self,
+        generation: u64,
+        expected: &CentralIdentity,
+        context: Option<&crate::agent_context::AgentContext>,
+    ) -> bool {
+        let mut guard = self.inner.write().await;
+        if guard.generation != generation
+            || guard.status != ConnectionStatus::Connected
+            || guard.identity.as_ref() != Some(expected)
+        {
+            return false;
+        }
+        let mut identity = expected.clone();
+        identity.user_id = context.map(|c| c.owner_user_id);
+        identity.team_id = context.map(|c| c.team_id);
+        let subject = identity
+            .user_id
+            .zip(identity.team_id)
+            .map(|(u, t)| (u, t, identity.agent_id));
+        if guard.subject != subject {
+            guard.subject = subject;
+            guard.subject_epoch = guard.subject_epoch.saturating_add(1);
+            if self.presence.borrow().is_some() {
+                self.set_presence(PresenceStatus::Offline);
+            }
+            self.subject_changes.send_replace(guard.subject_epoch);
+        }
+        guard.identity = Some(identity.clone());
+        *self.identity.write().await = Some(identity);
+        if context.is_none() {
+            // A revoked or contradictory context cannot be reinterpreted as a
+            // legacy READY on the same WS principal. A new connection is required.
+            guard.status = ConnectionStatus::AuthFailed;
+            *self.status.write().await = ConnectionStatus::AuthFailed;
+        }
+        true
     }
 
     /// 새 연결 세션을 시작하며 세대(generation)를 증가시키고 이전 연결의 식별 정보를 즉시 무효화합니다.
@@ -231,7 +284,15 @@ impl SessionHandle {
             .user_id
             .zip(identity.team_id)
             .map(|(user, team)| (user, team, identity.agent_id));
-        if guard.subject != subject {
+        let same_legacy_agent = subject.is_none()
+            && self.state.context_client.is_some()
+            && guard
+                .subject
+                .is_some_and(|(_, _, agent)| agent == identity.agent_id);
+        // Missing user/team can preserve ownership only for the same Agent.
+        // An authenticated A -> B -> A READY sequence must fence A even when
+        // no REST context request happens while B is connected.
+        if guard.subject != subject && !same_legacy_agent {
             guard.subject = subject;
             guard.subject_epoch = guard.subject_epoch.saturating_add(1);
             // Never advertise old local ownership for a different authenticated subject.
@@ -239,6 +300,12 @@ impl SessionHandle {
                 self.state.set_presence(PresenceStatus::Offline);
             }
             self.state.subject_changes.send_replace(guard.subject_epoch);
+        }
+        if subject.is_none()
+            && self.state.context_client.is_some()
+            && self.state.presence.borrow().is_some()
+        {
+            self.state.set_presence(PresenceStatus::Offline);
         }
         guard.identity = Some(identity.clone());
         *self.state.identity.write().await = Some(identity);

@@ -74,7 +74,12 @@ export class BrokerHttp {
       const response = await new Promise<{ status: number; body: Buffer }>((resolve, reject) => {
         const request = requestHttp(`${this.settings.brokerUrl}${path}`, {
           agent, method: options.method ?? 'POST', signal: controller.signal,
-          headers: { authorization: `Bearer ${this.settings.localToken}`, 'content-type': 'application/json' },
+          headers: {
+            authorization: `Bearer ${this.settings.localToken}`, 'content-type': 'application/json',
+            // Node does not automatically frame a DELETE body like POST. Rust
+            // needs the JSON instanceId/requestId for authenticated release.
+            'content-length': Buffer.byteLength(body),
+          },
         }, (incoming) => {
           const status = incoming.statusCode ?? 0;
           responseStatus = status;
