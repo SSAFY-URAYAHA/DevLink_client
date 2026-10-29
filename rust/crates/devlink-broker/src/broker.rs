@@ -8,6 +8,7 @@ use crate::{
     central::{self, CentralState, ConnectionStatus},
     config::{self, Config, state_directory},
     local::{self, API_VERSION, Health, Runtime, SERVICE},
+    sessions::{ReadyIdentityProvider, SessionManager},
 };
 use anyhow::{Context, Result};
 use axum::{
@@ -64,6 +65,11 @@ pub async fn run(path: &Path) -> Result<()> {
     // MCP 자격 스냅샷 발행 또는 기존 토큰 재사용
     let mcp_creds = crate::credentials::publish(path, &broker_url)?;
     let mcp_token = Arc::new(mcp_creds.local_token);
+    let inbox = crate::inbox::Inbox::open(path)?;
+    // 작업 생성 요청 영속화 및 멱등성 로그 초기화
+    let task_requests = crate::task_requests::TaskRequests::open(path)?;
+    // 중앙 서버 Task API 전송을 위한 HTTP 클라이언트 초기화 (중앙 토큰 주입)
+    let task_client = crate::task_client::TaskClient::new(&config.server_url, &token)?;
 
     // 현재 실행 인스턴스 정보 생성 및 파일로 게시(publish)
     let runtime = Arc::new(Runtime {
@@ -79,7 +85,12 @@ pub async fn run(path: &Path) -> Result<()> {
     // 취소 토큰 및 중앙 서버 연결 상태 초기화
     let cancel = CancellationToken::new();
     let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
-    let central_state = CentralState::new(status);
+    let central_state = CentralState::new(status).with_inbox(inbox);
+    let sessions = SessionManager::new(
+        Arc::new(ReadyIdentityProvider::new(central_state.clone())),
+        central_state.clone(),
+    );
+    let expiration = tokio::spawn(sessions.clone().run_expiration(cancel.clone()));
 
     // 중앙 서버와 통신하는 비동기 태스크 시작
     let central = tokio::spawn(central::run_with_state(
@@ -98,8 +109,21 @@ pub async fn run(path: &Path) -> Result<()> {
             runtime,
             central: central_state,
             cancel: cancel.clone(),
+            mcp_token: mcp_token.clone(),
+        })
+        // 세션 관리 API 라우터 병합 (/v1/sessions/*)
+        .merge(crate::session_api::router(
+            mcp_token.clone(),
+            sessions.clone(),
+        ))
+        // 작업 생성 API 라우터 병합 (/v1/tasks/create)
+        .merge(crate::task_api::router(
             mcp_token,
-        });
+            sessions,
+            task_client,
+            task_requests,
+            cancel.clone(),
+        ));
 
     // Graceful Shutdown 처리 (취소 토큰 수신 또는 OS 종료 시그널 감지 시)
     let shutdown_token = cancel.clone();
@@ -128,6 +152,10 @@ pub async fn run(path: &Path) -> Result<()> {
     let abort = central.abort_handle();
     if timeout(Duration::from_secs(2), central).await.is_err() {
         abort.abort();
+    }
+    let abort_expiration = expiration.abort_handle();
+    if timeout(Duration::from_secs(1), expiration).await.is_err() {
+        abort_expiration.abort();
     }
     result.context("Broker HTTP server failed")
 }

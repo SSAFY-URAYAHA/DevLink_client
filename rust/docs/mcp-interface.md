@@ -1,12 +1,12 @@
 # MCP 실행 구조·로컬 통신 인터페이스
 
-상태: **기존 MCP v0.1 규칙을 Rust 구현 기준으로 채택. 자격 파일·토큰 관리·권한 분리는 구현됐으며 세션·업무 API와 실제 상호 검증은 미완료**. 작성일 2026-10-26, 규칙 채택일 2026-10-27, 구현 현황 갱신일 2026-10-28 (Asia/Seoul).
+상태: **자격·로컬 세션 API 4개·소유권·만료·presence 연결 구현. 중앙 신원 공급부·업무 API·실제 Host 왕복은 후속 항목**. 작성일 2026-10-26, MCP 규칙 채택일 2026-10-27, 구현 현황 갱신일 2026-10-28 (Asia/Seoul).
 
 ## 2026-10-28 중앙 WebSocket 규칙 확인
 
 중앙 서버의 보안 전략과 2026-10-27 작업 기록을 확인해 [중앙 WebSocket 연동 규칙](central-websocket-contract.md)에 Rust 적용 기준을 기록했습니다. `/ws/broker`의 Agent 토큰 인증, `BROKER_READY`, `AGENT_PRESENCE`, 동일 Agent 연결 교체·종료 보호는 문서에 정의돼 있으므로 해당 규칙을 따릅니다. 아래의 포괄적인 중앙 인증·메시지 협의 표기는 이 구체적인 규칙과 후속 항목을 구분해 읽습니다.
 
-중앙은 인증 Principal과 DB의 Agent 소유자·팀을 검증합니다. READY에는 `connection_id`와 숫자 `agent_id`만 있으며 사용자·팀 필드를 추가하는 계약은 없습니다. MCP 세션 principal에 필요한 `userId/teamId` 전달 경로와 최초 Agent 등록·토큰 발급 흐름의 연결은 별도 후속 항목입니다. 현재 로컬 서버의 JSON `HEARTBEAT`·4001 만료 처리를 확인해 Rust에 PING 20초 간격·동일 ping_id PONG 최대 20초 대기·만료 후 재접속을 구현했습니다. 서버의 JSON PING 무수신 만료 기본값은 40초이며 실제 배포 설정·통합 환경 검증은 남아 있습니다. presence는 공유 `CentralState::set_presence`로 게시하면 READY·변경·재접속 시 보고하도록 구현했으며, 실제 로컬 세션의 생성·bind·해제·만료 이벤트 연결과 업무 라우팅·수신함 ACK는 남아 있습니다.
+중앙은 인증 Principal과 DB의 Agent 소유자·팀을 검증합니다. READY에는 `connection_id`와 숫자 `agent_id`만 있으며 사용자·팀 필드를 추가하는 계약은 없습니다. MCP 세션 principal에 필요한 `userId/teamId` 전달 경로와 최초 Agent 등록·토큰 발급 흐름은 별도 후속 항목입니다. 현재 Rust는 JSON HEARTBEAT PING 20초·동일 ping_id PONG 최대 20초 대기·만료 후 재접속을 구현했습니다. 세션 생성·bind·해제·만료는 같은 CentralState의 set_presence에 연결했고 실제 로컬 WebSocket으로 보고를 검증합니다. 기본 IdentityProvider는 미구성이므로 실제 CLI의 세션 생성은 503 CENTRAL_UNAUTHENTICATED입니다. 업무 라우팅·수신함 ACK와 운영 중앙 검증은 남아 있습니다.
 
 ## 협의 상태와 결정 범위
 
@@ -16,9 +16,9 @@
 
 | 핵심 항목                      | 채택 범위                                                                       | Rust 구현 기준                                                                                                                                    | 남은 결정·구현                                                                                                                  |
 | ------------------------------ | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| 세션 활성화와 재시작 후 소유권 | 지연 활성화, fresh/recover, 세션 등록 멱등성, 선복구 소유권, 갱신·만료·해제     | 유효한 업무 도구 요청부터 세션 활성화. 인증된 fresh는 기존 소유자 교체 가능, recover는 자기 세션·빈 슬롯만 확보. 재시작 전 소유자는 보존하지 않음 | Rust 세션 API 신규 구현. Agent ID 영속 저장·재사용 경로와 중앙 등록 응답 유실 시 중복 방지 방식은 추가 결정 필요                |
+| 세션 활성화와 재시작 후 소유권 | fresh/recover, instanceId 멱등성, 선복구 소유권, 갱신·90초 만료·해제 | 로컬 HTTP 4개 경로·소유권·만료·presence 구현. 진단·거부된 요청은 활성화하지 않음 | 실제 중앙 신원 공급부·Agent 소유 검증, Agent ID 영속 재사용·등록 멱등성, 실제 MCP Host 상호 검증 필요 |
 | CLI 설정 파일과 자격 수명주기  | MCP 스키마 v1, DEVLINK_BROKER_FILE, 비공개 파일 검사, 토큰 유지·회전            | `.devlink-runtime/broker.json` 원자 발행·토큰 유지·중지 중 회전·OS 권한 검사 구현. CLI runtime의 controlToken과 MCP localToken 분리 | Host별 프로필·신원 분리 정책, Agent ID 영속 재사용, 동적 포트에서 주소 변경 후 재시작 흐름과 Unix 실행 검증 필요 |
-| HTTP 계약과 중앙 위임 경계     | loopback HTTP, /v1 세션·7개 업무 경로, JSON·오류 해석, timeout·업무 재전송 금지 | MCP 계약·현재 클라이언트와 호환되는 API 제공. 신원은 브로커·중앙이 검증하며 로컬 만료·timeout으로 중앙 작업 상태를 변경하지 않음                  | Rust에는 /health, /shutdown만 구현. 세부 HTTP 상태 매핑·고정/동적 포트 운영·중앙 인증 및 메시지 매핑·결과 확인 경로는 보완 필요 |
+| HTTP 계약과 중앙 위임 경계 | loopback HTTP, 세션·업무 DTO, timeout·업무 재전송 금지 | health/shutdown 및 MCP localToken 전용 세션 4개 경로·오류 envelope 구현 | 업무 7개 경로·중앙 인증/DTO 매핑·실제 결과 조회와 프로필/포트 운영 정책 보완 필요 |
 
 검토 기준으로 유지하는 큰 구조는 CLI의 브로커 제어, Host의 stdio MCP 제어, MCP→로컬 HTTP→브로커→중앙 전달, 중앙 토큰의 브로커 관리입니다. 브로커 장애에도 MCP 진단을 유지하고, 오류를 이유로 공유 브로커를 자동 기동·종료하지 않는 방향을 유지합니다.
 
@@ -42,7 +42,7 @@
 
 - 현재 자격 파일은 `--config`의 설정 디렉터리 아래 `.devlink-runtime/broker.json`이며 runtime과 별도 파일로 발행합니다. 별도 디렉터리는 별도 브로커·자격을 사용합니다. 하나의 브로커에서 Host별 프로필·토큰·신원을 관리하는 제품 정책과 자격 삭제 수명 주기는 후속 항목입니다.
 - 중앙에서 검증된 Agent ID의 저장·재사용, 중앙 등록 성공 응답 유실 시 중복 방지. 현재 MCP는 읽기와 프로세스 메모리 보관만 수행하며 `config.agent`를 등록 ID로 간주하지 않습니다.
-- CLI/MCP 자격 분리와 `/shutdown` 권한은 구현됐습니다. 이 권한 경계를 세션·업무 API에도 적용하고 검증된 중앙 신원과 연결해야 합니다. 현재 Rust 발행 스키마에는 `agentId`가 없습니다.
+- CLI/MCP 자격 분리와 `/shutdown` 권한은 구현됐고 세션 API는 MCP localToken만 허용합니다. 업무 API 권한과 검증된 중앙 신원은 후속 연결 항목입니다. 현재 Rust 발행 스키마에는 `agentId`가 없습니다.
 - 기본 포트 43127을 포함한 실제 포트 운영과 `localPort: 0` 허용 범위. 재시작 중 주소가 달라지면 현재 MCP의 자동 복구 전제와 맞지 않습니다.
 - 중앙 인증 정보·메시지·업무 DTO와의 매핑, 등록 멱등성·timeout 후 결과 확인 방법, 세부 HTTP 상태 매핑. 중앙 서버 계약을 따르며 필요한 정보가 없을 때 임의 신원을 만들지 않습니다.
 - Host 지원·등록 범위, 설치 경로, Node 사전 설치/동봉, 기존 설정 병합·백업·복구. 현재 MCP의 Node 24 이상 요구사항과 제품 설치 방식을 구분합니다.
@@ -67,7 +67,7 @@ CLI와 브로커는 동일 실행 파일을 다른 모드로 실행하되 별도
 
 ## 현재 구현된 로컬 연결과 발견
 
-이 절은 2026-10-28 현재 코드의 동작입니다. 자격 파일·토큰·권한 분리는 구현됐으며 세션·업무 API는 후속 작업입니다.
+이 절은 2026-10-28 현재 코드의 동작입니다. 자격·세션 API는 구현됐으며 중앙 신원 공급부·업무 API가 후속 작업입니다. 세션 세부 계약은 [로컬 세션 API](local-sessions.md)를 따릅니다.
 
 - 전송: HTTP/1.1 JSON, IPv4 `127.0.0.1`에만 바인딩. 기본 포트 43127, `localPort: 0`이면 자동 할당. MCP URL 검증과 맞추기 위해 포트 80은 거부합니다.
 - 발견: Rust CLI는 설정 디렉터리 아래의 `.devlink-runtime/runtime.json`을 읽고 MCP는 같은 디렉터리의 `broker.json`을 읽습니다. `devlink [--config <FILE>] mcp path`는 자격 파일 경로만 출력하며 파일을 생성하지 않습니다. 브로커 기동 시 스냅샷을 발행합니다. `broker.lock`과 `control.lock`도 `.devlink-runtime/`에 저장하며, 설정 디렉터리당 한 인스턴스입니다. 구버전 브로커는 업그레이드 전에 구버전 CLI로 종료해야 합니다.
@@ -87,6 +87,10 @@ OS 잠금은 실행 여부의 기준이며 런타임 파일의 PID만 보고 프
 | ---------------- | ------------------------------------------------------ | ------------------------------------------- |
 | `GET /health`    | CLI controlToken 및 MCP localToken으로 상태 조회 | 200, 아래 Health JSON                       |
 | `POST /shutdown` | CLI controlToken만 허용. MCP localToken은 401 | 202, `{"apiVersion":1,"status":"stopping"}` |
+| `POST /v1/sessions` | MCP localToken·검증된 신원으로 생성/복구 | 200, requestId와 data의 sessionId/principal |
+| `POST /v1/sessions/{id}/bind` | 같은 instanceId·검증된 사용자/팀/Agent | 200, requestId와 data의 같은 세션·bound principal |
+| `POST /v1/sessions/{id}/heartbeat` | MCP localToken·같은 세션/instanceId | 200, requestId와 빈 data |
+| `DELETE /v1/sessions/{id}` | MCP localToken·같은 세션/instanceId | 200, requestId와 빈 data |
 
 ```json
 {
@@ -98,7 +102,7 @@ OS 잠금은 실행 여부의 기준이며 런타임 파일의 PID만 보고 프
 }
 ```
 
-요청 본문은 두 경로 모두 사용하지 않습니다. Health의 상태 enum은 README에 정의되어 있습니다. 인증 실패는 401, 알 수 없는 경로는 404이며 다음 JSON을 반환합니다. 지원하지 않는 HTTP method는 axum 기본 405 응답이므로 본문 형식을 가정하지 않습니다.
+health/shutdown은 요청 본문을 사용하지 않습니다. Health의 상태 enum은 README에 정의되어 있습니다. 두 제어 경로의 인증 실패 401과 기본 404는 아래 legacy JSON입니다. 세션 경로는 이를 사용하지 않고 MCP 계약의 requestId+data/error envelope를 반환합니다. 기본 신원 공급부는 미구성이므로 세션 생성은 503 CENTRAL_UNAUTHENTICATED입니다. 지원하지 않는 HTTP method는 Axum 기본 405 응답이므로 본문 형식을 가정하지 않습니다.
 
 ```json
 {
@@ -113,7 +117,7 @@ OS 잠금은 실행 여부의 기준이며 런타임 파일의 PID만 보고 프
 
 기존 초안의 `devlink_status`·`BROKER_NOT_RUNNING` 예시 대신 현재 MCP의 `devlink_ping`, 7개 업무 도구 및 `BROKER_UNAVAILABLE` 등 실제 오류 해석을 기준으로 합니다. 브로커가 없을 때 MCP가 임의로 실행하지 않고 사용자에게 `devlink start`를 안내하는 구조를 유지합니다.
 
-현재 Rust에는 세션·업무 `/v1/...` API가 **구현되지 않았습니다**. MCP에는 업무 도구와 클라이언트가 있으며, 채택한 계약에 맞는 Rust API·중앙 매핑을 구현해야 합니다. 실행 취소·로그 구독을 이번 MCP 계약 채택만으로 추가 범위에 포함하지 않습니다.
+Rust 세션 API 4개·소유권·90초 만료·presence는 구현됐습니다. 테스트용 신원으로 성공·충돌·실제 로컬 WebSocket 보고를 검증하며 실제 CLI에서는 중앙 신원 공급부가 연결될 때까지 세션 생성을 거부합니다. 업무 API 7개는 미구현입니다. 실행 취소·로그 구독을 이번 세션 구현만으로 추가 범위에 포함하지 않습니다.
 
 | 협의 항목                      | 결정할 내용                                                                     |
 | ------------------------------ | ------------------------------------------------------------------------------- |
@@ -123,10 +127,9 @@ OS 잠금은 실행 여부의 기준이며 런타임 파일의 PID만 보고 프
 
 후속 협의에서는 기존 MCP 규칙 자체를 미확정으로 되돌리지 않고 위 잔여 결정·담당 범위·수용 검증 결과를 기록합니다. 현재 제어 API를 MCP 프로토콜 엔드포인트로 사용하면 안 되며, MCP 서버는 별도 프로토콜 어댑터입니다.
 
-## 다음 구현: Rust 세션 API
+## Rust 세션 API 구현과 남은 연결
 
-1. `POST /v1/sessions`의 지연 활성화·instanceId 멱등성·fresh/recover 소유권과 `POST /v1/sessions/:sessionId/bind`의 Agent 소유 검증을 구현합니다.
-2. `POST /v1/sessions/:sessionId/heartbeat`, `DELETE /v1/sessions/:sessionId`, 브로커 시계 기준 lease 90초와 오래된 갱신·해제 차단을 구현합니다. MCP heartbeat 기본 30초는 중앙 WebSocket Ping/Pong과 별도입니다.
-3. 검증된 로컬 세션 상태를 `CentralState::set_presence`에 연결합니다. 생성·bind·해제·만료에서 어떤 상태가 확인됐는지 판단하며 단순 세션 생성만으로 ONLINE을 추측하지 않습니다.
-4. 중앙에서 검증된 `userId/teamId` 전달 경로를 연결합니다. READY의 agent_id나 클라이언트 입력만으로 사용자·팀 신원을 만들지 않습니다. 실제 중앙 신원 연결 전에는 세션 로직의 로컬 검증과 실제 MCP 연동 완료를 구분합니다.
-5. 실제 Rust와 MCP로 생성·bind·갱신·해제, 선복구 충돌·교체·만료·재시작을 검증한 뒤 업무 API 7개와 중앙 라우팅·수신함·ACK 연동을 진행합니다.
+1. 구현 완료: 생성·bind·heartbeat·해제, instanceId 멱등성, fresh/recover·교체·충돌, 브로커 시계 90초 lease, 오래된 요청 차단과 presence 연결.
+2. 공급부 분리: IdentityProvider는 중앙이 검증한 Principal을 반환해야 합니다. 기본 구현은 CENTRAL_UNAUTHENTICATED이며 요청·설정·READY를 신원으로 추측하지 않습니다.
+3. 다음 연결: 중앙 신원 조회 API/메시지·REST 인증, Agent 소유권 검증, 최초 등록/토큰 발급 순서를 합의한 뒤 실제 공급부를 구현합니다. 초기 신원 취득과 이후 폐기/팀 변경 정책도 포함합니다.
+4. 실제 MCP Host·중앙 신원으로 생성·bind·갱신·해제·충돌·만료·재시작을 검증한 뒤 업무 API 7개와 중앙 라우팅·수신함·ACK를 연결합니다.

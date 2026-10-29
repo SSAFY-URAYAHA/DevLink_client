@@ -33,6 +33,200 @@ use tokio_tungstenite::{
 
 const TOKEN: &str = "test-only-secret-never-print";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_creates_tasks_with_agent_bearer_and_reuses_request_key_after_restart() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.configure(|config| config.server_url = format!("ws://{}", listener.local_addr().unwrap()));
+    let saved = Arc::new(Mutex::new(std::collections::HashMap::<String, u64>::new()));
+    let saved_copy = saved.clone();
+    let server = tokio::spawn(async move {
+        let mut clients = JoinSet::new();
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let saved = saved_copy.clone();
+            clients.spawn(async move {
+                let mut method = [0;3];
+                while stream.peek(&mut method).await.unwrap() < 3 { sleep(Duration::from_millis(1)).await; }
+                if &method == b"GET" {
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    socket.send(Message::Text(serde_json::json!({"type":"BROKER_READY","payload":{
+                        "connection_id":"cli-task-connection","agent_id":12,"user_id":3,"team_id":1
+                    }}).to_string().into())).await.unwrap();
+                    while let Some(Ok(frame)) = socket.next().await {
+                        match frame {
+                            Message::Text(text) => if let Ok(ClientMessage::Heartbeat(HeartbeatPing::Ping{ping_id})) = serde_json::from_str(&text) {
+                                socket.send(Message::Text(serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id)).unwrap().into())).await.unwrap();
+                            },
+                            Message::Close(_) => break,
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0;1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0 && bytes.len() < 16 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
+                };
+                let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap().to_lowercase();
+                assert!(headers.starts_with("post /api/v1/tasks/1 http/1.1\r\n"));
+                assert!(headers.contains(&format!("authorization: bearer {TOKEN}\r\n")));
+                assert!(!headers.contains("cookie:") && !headers.contains("origin:"));
+                let size: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                assert!(size <= 128 * 1024);
+                while bytes.len() - header_end < size {
+                    let mut chunk = [0;1024]; let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0); bytes.extend_from_slice(&chunk[..count]);
+                }
+                let command: serde_json::Value = serde_json::from_slice(&bytes[header_end..header_end+size]).unwrap();
+                assert_eq!(command["requesterAgentId"],12); assert_eq!(command["receiverAgentId"],13);
+                let key = command["requestKey"].as_str().unwrap().to_string();
+                let mut tasks = saved.lock().await;
+                let replayed = tasks.contains_key(&key);
+                let id = *tasks.entry(key).or_insert(101);
+                drop(tasks);
+                let response = serde_json::json!({"success":true,"data":{"taskId":id,"receiverAgentId":13,
+                    "status":"PENDING","version":1,"replayed":replayed,"delivery":{"status":"ACK_PENDING","reasonCode":null}},"code":null,"message":null}).to_string();
+                let status = if replayed {"200 OK"} else {"201 Created"};
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+            });
+            while let Some(result) = clients.try_join_next() {
+                result.unwrap();
+            }
+        }
+    });
+    let mut original_key = None;
+    for attempt in 0..2 {
+        f.ok(&["start"]);
+        f.wait_status(ConnectionStatus::Connected).await;
+        let runtime = Runtime::load(&f.path).unwrap();
+        let credentials = devlink_broker::credentials::load(&f.path).unwrap();
+        let client = runtime.client().unwrap();
+        let session: serde_json::Value = client.post(runtime.url("/v1/sessions")).bearer_auth(&credentials.local_token)
+            .json(&serde_json::json!({"requestId":"claim","instanceId":"creator","mode":"fresh","agentId":"12"}))
+            .send().await.unwrap().json().await.unwrap();
+        let mut context = session["data"]["principal"].clone();
+        context["sessionId"] = session["data"]["sessionId"].clone();
+        let response = client.post(runtime.url("/v1/tasks/create")).bearer_auth(&credentials.local_token)
+            .json(&serde_json::json!({"requestId":"stable-cli-task","operation":"create_task","context":context,
+                "arguments":{"recipientAgentId":"13","title":"작업","description":"CLI 생성 검증"}}))
+            .send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["data"]["taskId"], "101");
+        assert_eq!(body["data"]["replayed"], attempt == 1);
+        if let Some(key) = &original_key {
+            assert_eq!(&body["requestKey"], key);
+        } else {
+            original_key = Some(body["requestKey"].clone());
+        }
+        assert!(
+            !body.to_string().contains(TOKEN)
+                && !body.to_string().contains(&credentials.local_token)
+        );
+        f.ok(&["stop"]);
+    }
+    assert_eq!(saved.lock().await.len(), 1);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_persists_tasks_before_ack_and_deduplicates_after_restart() {
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("ws://{}", listener.local_addr().unwrap());
+    f.configure(|config| config.server_url = origin.clone());
+    let path = f.path.clone();
+    let origin_copy = origin.clone();
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        for attempt in 1..=2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let event_id = format!("cli-task-{attempt}");
+            for message in [
+                serde_json::json!({"type":"BROKER_READY","payload":{"connection_id":format!("cli-{attempt}"),"agent_id":12}}),
+                serde_json::json!({"type":"TASK_CREATED","event_id":event_id,"payload":{
+                    "task_id":101,"team_id":1,"requester_agent_id":10,"receiver_agent_id":12,
+                    "prompt":"Synthetic CLI receipt test", "created_at":"2026-10-29T09:00:00"
+                }}),
+            ] {
+                socket
+                    .send(Message::Text(message.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            while let Some(Ok(frame)) = socket.next().await {
+                match frame {
+                    Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text)
+                        .unwrap()
+                    {
+                        ClientMessage::Ack(ack) => {
+                            assert_eq!(ack.event_id, event_id);
+                            assert_eq!(
+                                devlink_broker::inbox::Inbox::open(&path)
+                                    .unwrap()
+                                    .list_for(&origin_copy, 12)
+                                    .unwrap()
+                                    .len(),
+                                1
+                            );
+                            events.send(ack.event_id).unwrap();
+                        }
+                        ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }) => {
+                            socket
+                                .send(Message::Text(
+                                    serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id))
+                                        .unwrap()
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                        }
+                        _ => {}
+                    },
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        }
+    });
+    f.ok(&["start"]);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "cli-task-1"
+    );
+    let snapshot = std::fs::read(devlink_broker::inbox::Inbox::path(&f.path)).unwrap();
+    assert!(!String::from_utf8_lossy(&snapshot).contains(TOKEN));
+    f.ok(&["stop"]);
+    f.ok(&["start"]);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "cli-task-2"
+    );
+    assert_eq!(
+        std::fs::read(devlink_broker::inbox::Inbox::path(&f.path)).unwrap(),
+        snapshot
+    );
+    f.ok(&["stop"]);
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     path: PathBuf,
@@ -402,6 +596,7 @@ async fn unhealthy_live_broker_is_not_reported_as_stopped() {
 #[derive(Clone, Copy)]
 enum Behavior {
     Ready { agent_id: u64 },
+    VerifiedReady,
     Deny401,
     Deny403,
     Silent,
@@ -501,6 +696,9 @@ impl Mock {
                     };
 
                     let ready_text = match behavior {
+                        Behavior::VerifiedReady => format!(
+                            r#"{{"type":"BROKER_READY","payload":{{"connection_id":"conn-{seq}","agent_id":11,"user_id":3,"team_id":1}}}}"#
+                        ),
                         Behavior::Ready { agent_id } => {
                             format!(
                                 r#"{{"type":"BROKER_READY","payload":{{"connection_id":"conn-{seq}","agent_id":{agent_id}}}}}"#
@@ -789,6 +987,105 @@ async fn json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_routes_require_verified_identity_and_reject_cli_control_token() {
+    let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 11 }).await;
+    let f = Fixture::new();
+    f.configure(|config| config.server_url = format!("ws://{}", server.address));
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Connected).await;
+    let runtime = Runtime::load(&f.path).unwrap();
+    let credentials = devlink_broker::credentials::load(&f.path).unwrap();
+    let client = runtime.client().unwrap();
+    let payload = serde_json::json!({"requestId":"production-claim","instanceId":"mcp-instance","mode":"fresh"});
+    let response = client
+        .post(runtime.url("/v1/sessions"))
+        .bearer_auth(&credentials.local_token)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"requestId":"production-claim","error":{"code":"CENTRAL_UNAUTHENTICATED","scope":"domain","outcome":"rejected"}})
+    );
+    assert!(!body.to_string().contains(&credentials.local_token));
+    let response = client
+        .post(runtime.url("/v1/sessions"))
+        .bearer_auth(&runtime.control_token)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+    assert_eq!(f.health().await.central_server, ConnectionStatus::Connected);
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Rejected claims must not activate presence"
+    );
+    f.ok(&["stop"]);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_uses_ready_identity_for_real_local_sessions() {
+    let server = Mock::start("127.0.0.1:0", Behavior::VerifiedReady).await;
+    let f = Fixture::new();
+    f.configure(|config| config.server_url = format!("ws://{}", server.address));
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Connected).await;
+    let runtime = Runtime::load(&f.path).unwrap();
+    let credentials = devlink_broker::credentials::load(&f.path).unwrap();
+    let client = runtime.client().unwrap();
+    let response = client.post(runtime.url("/v1/sessions"))
+        .bearer_auth(&credentials.local_token)
+        .json(&serde_json::json!({"requestId":"verified-claim","instanceId":"verified-host","mode":"fresh","agentId":"11"}))
+        .send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["data"]["principal"],
+        serde_json::json!({"userId":"3","teamId":"1","agentId":"11"})
+    );
+    let session = body["data"]["sessionId"].as_str().unwrap();
+    assert!(!body.to_string().contains(&credentials.local_token));
+    let messages = server.wait_messages(1).await;
+    assert_eq!(
+        messages[0],
+        serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"ONLINE"}})
+    );
+    let response = client.post(runtime.url("/v1/sessions"))
+        .bearer_auth(&credentials.local_token)
+        .json(&serde_json::json!({"requestId":"wrong-agent","instanceId":"other-host","mode":"fresh","agentId":"12"}))
+        .send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 403);
+    let response = client
+        .post(runtime.url(&format!("/v1/sessions/{session}/heartbeat")))
+        .bearer_auth(&credentials.local_token)
+        .json(&serde_json::json!({"requestId":"verified-renew","instanceId":"verified-host"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let response = client
+        .delete(runtime.url(&format!("/v1/sessions/{session}")))
+        .bearer_auth(&credentials.local_token)
+        .json(&serde_json::json!({"requestId":"verified-release","instanceId":"verified-host"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let messages = server.wait_messages(2).await;
+    assert_eq!(
+        messages[1],
+        serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"OFFLINE"}})
+    );
+    f.ok(&["stop"]);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeat_timeout_4001_reconnects_only_when_enabled() {
     for auto_reconnect in [true, false] {
         let server = Mock::start("127.0.0.1:0", Behavior::CloseHeartbeatTimeout4001).await;
@@ -1013,6 +1310,8 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         Some(CentralIdentity {
             connection_id: "conn-1".into(),
             agent_id: 42,
+            user_id: None,
+            team_id: None,
         })
     );
     sleep(Duration::from_millis(80)).await;
@@ -1057,6 +1356,8 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         Some(CentralIdentity {
             connection_id: "conn-1".into(),
             agent_id: 42,
+            user_id: None,
+            team_id: None,
         })
     );
     {
@@ -1102,6 +1403,8 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         Some(CentralIdentity {
             connection_id: "conn-1".into(),
             agent_id: 99,
+            user_id: None,
+            team_id: None,
         })
     );
     {

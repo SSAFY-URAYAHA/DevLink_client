@@ -1,5 +1,78 @@
 # 로컬 검증 기록
 
+## 2026-10-29: READY 신원 확장·실제 로컬 세션 공급부
+
+`83169e8` 이후 작업 트리에 합의된 READY user_id/team_id와 ReadyIdentityProvider를 연결했습니다. 중앙에서 받은 숫자 ID를 MCP Principal 문자열로 변환하며, 잘못된/누락 신원·다른 Agent를 거부합니다. 같은 신원의 재접속은 세션을 유지하고, 사용자·팀·Agent 변경과 A → B → A 경합은 subject epoch로 이전 소유권을 무효화합니다. 상세 동작은 [READY 신원 문서](ready-identity.md)를 참고하세요.
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 36개·세션 통합 7개·수신 통합 3개·CLI 통합 32개, 총 78개 통과. 실패·무시 0 |
+| `git diff --check` | 통과 |
+
+Windows MSVC에서 임시 디렉터리와 로컬 Mock으로 검증했습니다. 기존 Windows ACL·로컬 소켓 제한에 따라 테스트는 승인된 샌드박스 외부에서 실행했습니다. 단위 묶음 9.75초, 세션 통합 0.05초, 수신 통합 1.66초, CLI 통합 119.08초입니다. 45초 실제 주기 Heartbeat 회귀, 수신함·ACK·재시작·기존 인증 분리 회귀도 포함합니다.
+
+추가 검증은 숫자 신원 pair·null/부분 누락/범위 거부, legacy READY의 세션 거부, 다른 Agent claim/bind 거부, 같은 신원 reconnect의 세션 유지, 신원 변경 후 이전 세션 heartbeat/delete 차단과 요청 없는 소유권 정리입니다. 실제 WebSocket READY → HTTP claim → bind → ONLINE, 실제 CLI의 claim → heartbeat → delete → OFFLINE도 확인했습니다. toolType은 임의 생성하지 않습니다.
+
+업무 REST 인증은 Agent Bearer 방향을 문서화했으며 토큰 발급·업무/복구 API의 경로와 DTO를 임의로 추가하지 않았습니다. 중앙 서버·MCP TypeScript·의존성은 변경하지 않았고 이번 작업의 커밋·Push는 하지 않았습니다. 실제 운영 토큰·중앙 배포·DB·MCP Host 왕복과 Unix 실행은 미검증입니다.
+
+## 2026-10-29: 작업 수신함·저장 후 ACK
+
+사용자 요청으로 동일 작업 트리를 재검증했습니다. 포맷·Clippy(-D warnings)·전체 73개 테스트·git diff --check가 다시 통과했습니다. 실패·무시 0이며 단위 10.00초, 세션 통합 0.04초, 작업 수신 통합 1.60초, CLI 통합 121.88초입니다. 기존에 확인한 Windows ACL·로컬 소켓 제약에 따라 테스트는 승인된 샌드박스 외부에서 실행했습니다. 실제 중앙·MCP Host 연동은 이번 재검증에도 포함하지 않았고, 기능 코드는 추가 수정하지 않았습니다.
+
+rust/ 작업 트리에 중앙 TASK_CREATED/ACK DTO, `.devlink-runtime/inbox.json` 원자 저장, 중앙 URL·수신 Agent·task_id 중복 판별, 저장 후 ACK와 InboxFailed 상태를 추가했습니다. 생성·수락·완료·실행·MCP 업무 API·운영 신원 공급부는 이번 변경 범위가 아닙니다. [동작·Mock 실행·후속 계약](task-inbox.md)을 참고하세요.
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo check --offline --locked --workspace --all-targets` | 초기 구현 컴파일 통과. 최종 변경은 아래 Clippy와 전체 테스트로 컴파일 검증 |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 33개·세션 통합 6개·작업 수신 통합 3개·CLI 통합 31개, 총 73개 통과. 실패·무시 0 |
+
+Windows MSVC에서 실행했습니다. 처음 샌드박스 내부 테스트는 기존 테스트까지 파일 접근·ACL·로컬 통신 제한으로 실패했고, 자동 승인된 샌드박스 외부에서 전체 검사를 다시 실행해 통과했습니다. 단위 묶음 9.69초, 작업 수신 묶음 1.59초, CLI 묶음 116.41초이며 기본 45초 Heartbeat 회귀를 포함합니다. 증분 캐시 hard link 대신 파일 복사를 사용하는 환경 경고는 검사 실패가 아닙니다.
+
+추가한 검증은 다음과 같습니다.
+
+- 중앙 wire와 동일한 최상위 event_id의 TASK_CREATED 및 payload 내부 event_id/task_id의 ACK.
+- ACK 수신 시 디스크에 이미 존재하는 기록을 별도 Inbox 인스턴스로 확인.
+- 재접속·재시작·새 event_id의 재전달에도 수신함 항목 1개와 현재 event_id ACK 유지.
+- 중앙 URL·수신 Agent 격리, payload 충돌 시 원본 보존·ACK 차단.
+- 손상·누락 snapshot, 잘못된 수신자·저장 대상·용량 초과에서 ACK하지 않음.
+- 디스크 writer를 막아도 반복 JSON PING/PONG이 유지되고 저장 완료 전에는 ACK하지 않음.
+- 실제 CLI start → 작업 저장·ACK → stop/start → 재수신·ACK와 snapshot 불변 확인.
+
+새 의존성은 추가하지 않았습니다. TypeScript MCP·중앙 서버·공유 계약은 변경하지 않았고 커밋·Push도 하지 않았습니다. 실제 중앙 토큰·DB·MCP Host의 왕복, Unix 실행, 중앙 5초 ACK 제한 아래의 운영 성능은 미검증입니다.
+
+## 2026-10-28: 로컬 세션 API·소유권·만료·presence 구현
+
+기준은 feature/rust/session-api의 `b8bd142` 이후 작업 트리입니다. 사용자 요청에 따라 rust/ 안에서만 구현했고 커밋·Push는 진행하지 않았습니다. 중앙 신원 조회·등록/토큰 발급·업무 API는 이번 범위에서 제외합니다.
+
+세션 생성·bind·heartbeat·해제 HTTP API, MCP localToken 전용 인증, requestId+data/error envelope, 입력 상한·공유 식별자 검증을 추가했습니다. 세션 관리자는 instanceId 멱등성·fresh 교체·recover 충돌·브로커 시계 90초 만료·오래된 갱신/해제 차단을 구현합니다. 요청 전 정리와 1초 주기 만료 태스크를 사용하며, 확인된 bound 소유자 유무로 CentralState presence를 같은 잠금 안에서 갱신합니다.
+
+IdentityProvider는 교체 가능한 비동기 인터페이스입니다. 기본 CLI에는 UnconfiguredIdentityProvider를 연결하므로 생성은 503 CENTRAL_UNAUTHENTICATED로 닫히고 가짜 principal이나 ONLINE을 만들지 않습니다. 테스트 내부에서만 검증된 신원을 주입해 성공 흐름을 확인합니다. 실제 구현 계약과 후속 연결은 [로컬 세션 API](local-sessions.md)를 참고합니다.
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo check --offline --locked --workspace --all-targets` | 통과 |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 27개·세션 HTTP/WebSocket 통합 6개·CLI 통합 30개 통과, 실패·무시 0 |
+
+Windows MSVC에서 ACL·로컬 HTTP/WebSocket 전체 테스트를 승인된 샌드박스 외부에서 순차 실행했습니다. 세션 HTTP 묶음은 0.10초, CLI 묶음은 131.51초였으며 기존 45초 실제 주기 Heartbeat 회귀도 포함합니다. 컴파일·Clippy에는 증분 캐시 hard link 대신 파일 복사를 사용하는 환경 경고가 있었고 검사 종료 코드는 0입니다.
+
+새 검증은 다음을 포함합니다.
+
+- 공유 principal/session 신원 fixture, Unicode 128개 경계와 null/추가 필드 거부.
+- 동일 인스턴스 동시 claim 멱등성, 서로 다른 recover 경쟁의 단일 소유자, fresh 교체·이전 세션의 갱신/해제/재claim 차단.
+- 재시작 전 소유권 미보존, 브로커 시계 90초 경계·갱신, 요청 없는 백그라운드 만료. 경계 검사는 내부 monotonic 시각으로 수행하고 주기 정리는 테스트 내부 lease만 단축했습니다.
+- unbound bind 충돌·사용자/팀/Agent 변경 거부, 해제·종료 이후 지연된 신원 응답으로 세션 부활 방지.
+- 실제 HTTP의 생성→bind→heartbeat→DELETE, requestId·principal·오류 scope/outcome, 인증·Origin·크기·Content-Type·잘못된 JSON·중복 필드·행위자/시각 덮어쓰기 거부.
+- 같은 실제 로컬 WebSocket에서 unbound 생성 OFFLINE→bind ONLINE→해제 OFFLINE 보고.
+- 실제 CLI에서 MCP 토큰의 세션 생성은 신원 미구성 503, CLI controlToken은 세션 API 401이며 health·중앙 연결·정상 종료는 유지.
+
+MCP 전체 테스트·릴리스 빌드, 실제 중앙 인증·토큰·DB, 실제 MCP Host와의 업무 왕복은 이번에 실행하지 않았습니다. 기존 TypeScript·중앙 서버·공유 계약 파일은 수정하지 않았고, 새로운 의존성이나 운영용 신원 우회 설정은 추가하지 않았습니다.
+
 ## 2026-10-28: 실시간 45초 연결 유지 자동 회귀 추가
 
 `feature/rust/broekr_sessionapi`의 `6e6fd78` 이후 작업 트리에 `json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect`를 추가했습니다. 앞서 별도 실행으로 확인한 45초 유지 검증을 Rust CLI 통합 테스트로 저장했으며 `#[ignore]` 없이 기본 전체 테스트에 포함합니다.

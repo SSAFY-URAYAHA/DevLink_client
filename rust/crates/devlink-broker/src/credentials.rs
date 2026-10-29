@@ -28,7 +28,8 @@ pub const MAX_PUBLISH_ACL_CHECKS: u32 = 3;
 /// Keep the CLI's original startup/health margin in addition to these checks.
 pub fn startup_validation_allowance() -> std::time::Duration {
     if cfg!(windows) {
-        ACL_CHECK_TIMEOUT * MAX_PUBLISH_ACL_CHECKS
+        // Existing inbox and task request snapshots each add one ACL check.
+        ACL_CHECK_TIMEOUT * (MAX_PUBLISH_ACL_CHECKS + 2)
     } else {
         std::time::Duration::ZERO
     }
