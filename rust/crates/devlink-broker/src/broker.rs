@@ -8,6 +8,7 @@ use crate::{
     central::{self, CentralState, ConnectionStatus},
     config::{self, Config, state_directory},
     local::{self, API_VERSION, Health, Runtime, SERVICE},
+    sessions::{SessionManager, UnconfiguredIdentityProvider},
 };
 use anyhow::{Context, Result};
 use axum::{
@@ -80,6 +81,11 @@ pub async fn run(path: &Path) -> Result<()> {
     let cancel = CancellationToken::new();
     let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
     let central_state = CentralState::new(status);
+    let sessions = SessionManager::new(
+        Arc::new(UnconfiguredIdentityProvider),
+        central_state.clone(),
+    );
+    let expiration = tokio::spawn(sessions.clone().run_expiration(cancel.clone()));
 
     // 중앙 서버와 통신하는 비동기 태스크 시작
     let central = tokio::spawn(central::run_with_state(
@@ -98,8 +104,9 @@ pub async fn run(path: &Path) -> Result<()> {
             runtime,
             central: central_state,
             cancel: cancel.clone(),
-            mcp_token,
-        });
+            mcp_token: mcp_token.clone(),
+        })
+        .merge(crate::session_api::router(mcp_token, sessions));
 
     // Graceful Shutdown 처리 (취소 토큰 수신 또는 OS 종료 시그널 감지 시)
     let shutdown_token = cancel.clone();
@@ -128,6 +135,10 @@ pub async fn run(path: &Path) -> Result<()> {
     let abort = central.abort_handle();
     if timeout(Duration::from_secs(2), central).await.is_err() {
         abort.abort();
+    }
+    let abort_expiration = expiration.abort_handle();
+    if timeout(Duration::from_secs(1), expiration).await.is_err() {
+        abort_expiration.abort();
     }
     result.context("Broker HTTP server failed")
 }

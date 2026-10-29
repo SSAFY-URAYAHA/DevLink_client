@@ -1,0 +1,913 @@
+//! 로컬 MCP 세션 임대 및 소유권 관리 엔진
+//!
+//! - MCP 클라이언트(AI 도구)와의 로컬 세션을 브로커 시계 기준으로 90초 동안 유지합니다.
+//! - 중앙 서버의 사용자/팀 인증 및 Agent 소유권 검증 결과를 기반으로 Principal을 바인딩합니다.
+//! - fresh 모드 시 기존 세션을 안전하게 펜싱(대체)하고, recover 모드 시 선착순 복구를 보장합니다.
+//! - 활성 세션 바인딩 여부에 따라 중앙 WebSocket에 실시간 presence(ONLINE/OFFLINE)를 전파합니다.
+
+use crate::{central::CentralState, protocol::PresenceStatus};
+use serde::{Deserialize, Deserializer, Serialize, de::Error};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use tokio::{
+    sync::Mutex,
+    time::{Instant, timeout},
+};
+use tokio_util::sync::CancellationToken;
+
+/// 세션 임대 기본 유효 시간 (90초)
+pub const LEASE_DURATION: Duration = Duration::from_secs(90);
+
+pub(crate) fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// 공통 식별자 타입 (최대 128자, 제어 문자 및 유니코드 공백 제외)
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct Identifier(String);
+
+impl Identifier {
+    pub fn parse(value: impl Into<String>) -> Result<Self, &'static str> {
+        let value = value.into();
+        if value.is_empty()
+            || value.chars().count() > 128
+            || value.chars().any(|c| {
+                matches!(
+                    c as u32,
+                    0x00..=0x20 | 0x7f..=0x9f | 0xa0 | 0x1680 | 0x2000..=0x200a |
+                    0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff
+                )
+            })
+        {
+            return Err("Invalid identifier");
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn random() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Identifier {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+/// 지원하는 AI 도구 유형 (Codex, Claude Code)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolType {
+    Codex,
+    ClaudeCode,
+}
+
+/// 검증된 사용자/팀 및 바인딩된 Agent 식별 정보
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Principal {
+    pub user_id: Identifier,
+    pub team_id: Identifier,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub agent_id: Option<Identifier>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tool_type: Option<ToolType>,
+}
+
+impl Principal {
+    fn same_user_team(&self, other: &Self) -> bool {
+        self.user_id == other.user_id && self.team_id == other.team_id
+    }
+}
+
+/// 클라이언트에 노출되는 활성 세션 정보
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Session {
+    pub session_id: Identifier,
+    pub principal: Principal,
+}
+
+/// 세션 획득 모드
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaimMode {
+    /// 신규 세션 생성 (동일 Agent의 이전 세션이 있으면 펜싱 및 교체)
+    Fresh,
+    /// 기존 세션 복구 (이전 세션이 살아있으면 재사용, 없으면 선착순 복구)
+    Recover,
+}
+
+/// 중앙 신원 검증 에러 유형
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityError {
+    Unauthenticated,
+    Unavailable,
+    Forbidden,
+}
+
+pub type IdentityFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Principal, IdentityError>> + Send + 'a>>;
+
+/// 중앙 신원 및 Agent 소유권 확인 인터페이스
+pub trait IdentityProvider: Send + Sync {
+    fn resolve<'a>(&'a self, agent_id: Option<&'a Identifier>) -> IdentityFuture<'a>;
+}
+
+/// 중앙 신원 연동 전 기본 프로바이더 (Unauthenticated 처리)
+pub struct UnconfiguredIdentityProvider;
+
+impl IdentityProvider for UnconfiguredIdentityProvider {
+    fn resolve<'a>(&'a self, _agent_id: Option<&'a Identifier>) -> IdentityFuture<'a> {
+        Box::pin(async { Err(IdentityError::Unauthenticated) })
+    }
+}
+
+/// 세션 처리 중 발생하는 도메인 오류
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionError {
+    /// 세션 만료 (TTL 90초 초과)
+    Expired,
+    /// 더 새로운 fresh 세션에 의해 대체(펜싱)됨
+    Replaced,
+    /// 인스턴스/Agent 충돌 (다른 인스턴스가 이미 슬롯 점유 등)
+    Conflict,
+    /// 요청한 Agent가 등록/바인딩되지 않음
+    AgentUnregistered,
+    /// 중앙 신원 검증 실패
+    Identity(IdentityError),
+}
+
+/// 세션 레지스트리 내부 저장 항목
+struct Entry {
+    view: Session,
+    instance_id: Identifier,
+    expires_at: Instant,
+    replaced: bool,
+}
+
+/// 인메모리 세션 레지스트리
+#[derive(Default)]
+struct Registry {
+    /// sessionId -> Entry
+    sessions: HashMap<Identifier, Entry>,
+    /// instanceId -> sessionId (인스턴스별 단일 활성 세션 매핑)
+    instances: HashMap<Identifier, Identifier>,
+    /// agentId -> sessionId (Agent별 활성 소유 세션 매핑)
+    owners: HashMap<Identifier, Identifier>,
+    /// 세션 등록 이력 유무 (최초 관측 전에는 presence 미발행)
+    observed: bool,
+    /// 브로커 종료로 레지스트리 폐쇄 여부
+    closed: bool,
+}
+
+impl Registry {
+    /// 만료된 세션 정리
+    fn expire(&mut self, now: Instant) {
+        self.sessions.retain(|_, entry| entry.expires_at > now);
+        self.instances
+            .retain(|_, id| self.sessions.contains_key(id));
+        self.owners
+            .retain(|_, id| self.sessions.get(id).is_some_and(|e| !e.replaced));
+    }
+
+    /// 활성 Agent 소유자 존재 여부에 따라 중앙 presence 발행
+    fn publish_presence(&self, central: &CentralState) {
+        if self.observed {
+            central.set_presence(if self.owners.is_empty() {
+                PresenceStatus::Offline
+            } else {
+                PresenceStatus::Online
+            });
+        }
+    }
+
+    /// 현재 인스턴스가 소유한 유효한 세션인지 검증
+    fn current(&self, id: &Identifier, instance: &Identifier) -> Result<&Entry, SessionError> {
+        let entry = self.sessions.get(id).ok_or(SessionError::Expired)?;
+        if &entry.instance_id != instance {
+            return Err(SessionError::Conflict);
+        }
+        if entry.replaced {
+            return Err(SessionError::Replaced);
+        }
+        Ok(entry)
+    }
+
+    /// 세션 획득 로직 처리
+    fn claim(
+        &mut self,
+        instance: Identifier,
+        mode: ClaimMode,
+        requested_agent: Option<&Identifier>,
+        principal: Principal,
+        now: Instant,
+        lease: Duration,
+    ) -> Result<Session, SessionError> {
+        if self.closed {
+            return Err(SessionError::Expired);
+        }
+        // 동일 instanceId로 이미 발급된 세션이 있는 경우 (멱등적 갱신)
+        if let Some(id) = self.instances.get(&instance) {
+            let entry = self.current(id, &instance)?;
+            if !entry.view.principal.same_user_team(&principal) {
+                return Err(SessionError::Identity(IdentityError::Forbidden));
+            }
+            if requested_agent.is_some()
+                && entry.view.principal.agent_id.as_ref() != requested_agent
+            {
+                return Err(if entry.view.principal.agent_id.is_none() {
+                    SessionError::AgentUnregistered
+                } else {
+                    SessionError::Conflict
+                });
+            }
+            if principal.agent_id.is_some() && entry.view.principal.agent_id != principal.agent_id {
+                return Err(SessionError::Conflict);
+            }
+            let id = id.clone();
+            let entry = self.sessions.get_mut(&id).unwrap();
+            entry.expires_at = now + lease;
+            return Ok(entry.view.clone());
+        }
+        // 다른 인스턴스가 동일 Agent를 이미 점유 중인 경우
+        if let Some(agent) = &principal.agent_id
+            && let Some(owner_id) = self.owners.get(agent)
+        {
+            if !self
+                .sessions
+                .get(owner_id)
+                .unwrap()
+                .view
+                .principal
+                .same_user_team(&principal)
+            {
+                return Err(SessionError::Identity(IdentityError::Forbidden));
+            }
+            // recover 모드에서는 이미 존재하는 활성 슬롯을 빼앗을 수 없음
+            if matches!(mode, ClaimMode::Recover) {
+                return Err(SessionError::Conflict);
+            }
+            // fresh 모드인 경우 이전 세션을 펜싱(replaced) 처리
+            self.sessions.get_mut(owner_id).unwrap().replaced = true;
+        }
+        // 신규 세션 등록
+        let id = Identifier::random();
+        let view = Session {
+            session_id: id.clone(),
+            principal,
+        };
+        if let Some(agent) = &view.principal.agent_id {
+            self.owners.insert(agent.clone(), id.clone());
+        }
+        self.instances.insert(instance.clone(), id.clone());
+        self.sessions.insert(
+            id,
+            Entry {
+                view: view.clone(),
+                instance_id: instance,
+                expires_at: now + lease,
+                replaced: false,
+            },
+        );
+        self.observed = true;
+        Ok(view)
+    }
+
+    /// 세션에 검증된 Agent 바인딩
+    fn bind(
+        &mut self,
+        id: &Identifier,
+        instance: &Identifier,
+        principal: Principal,
+        now: Instant,
+        lease: Duration,
+    ) -> Result<Session, SessionError> {
+        let entry = self.current(id, instance)?;
+        if !entry.view.principal.same_user_team(&principal) {
+            return Err(SessionError::Identity(IdentityError::Forbidden));
+        }
+        let agent = principal
+            .agent_id
+            .as_ref()
+            .ok_or(SessionError::Identity(IdentityError::Forbidden))?;
+        if let Some(previous) = &entry.view.principal.agent_id
+            && previous != agent
+        {
+            return Err(SessionError::Conflict);
+        }
+        if self.owners.get(agent).is_some_and(|owner| owner != id) {
+            return Err(SessionError::Conflict);
+        }
+        if entry.view.principal.tool_type.is_some() && principal.tool_type.is_none() {
+            return Err(SessionError::Identity(IdentityError::Forbidden));
+        }
+        self.owners.insert(agent.clone(), id.clone());
+        let entry = self.sessions.get_mut(id).unwrap();
+        entry.view.principal = principal;
+        entry.expires_at = now + lease;
+        Ok(entry.view.clone())
+    }
+
+    /// 세션 임대 기간 연장 (하트비트)
+    fn renew(
+        &mut self,
+        id: &Identifier,
+        instance: &Identifier,
+        now: Instant,
+        lease: Duration,
+    ) -> Result<(), SessionError> {
+        self.current(id, instance)?;
+        self.sessions.get_mut(id).unwrap().expires_at = now + lease;
+        Ok(())
+    }
+
+    /// 세션 명시적 해제
+    fn release(&mut self, id: &Identifier, instance: &Identifier) -> Result<(), SessionError> {
+        self.current(id, instance)?;
+        let entry = self.sessions.remove(id).unwrap();
+        self.instances.remove(&entry.instance_id);
+        if let Some(agent) = &entry.view.principal.agent_id
+            && self.owners.get(agent) == Some(id)
+        {
+            self.owners.remove(agent);
+        }
+        Ok(())
+    }
+}
+
+/// 외부에서 접근하는 세션 관리자 (Thread-safe)
+#[derive(Clone)]
+pub struct SessionManager {
+    registry: Arc<Mutex<Registry>>,
+    identity: Arc<dyn IdentityProvider>,
+    central: CentralState,
+    lease: Duration,
+}
+
+impl SessionManager {
+    pub fn new(identity: Arc<dyn IdentityProvider>, central: CentralState) -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(Registry::default())),
+            identity,
+            central,
+            lease: LEASE_DURATION,
+        }
+    }
+
+    /// 중앙 신원 해석 및 요청 Agent 일치 여부 검증
+    async fn resolve(&self, agent: Option<&Identifier>) -> Result<Principal, SessionError> {
+        let principal = timeout(Duration::from_secs(5), self.identity.resolve(agent))
+            .await
+            .map_err(|_| SessionError::Identity(IdentityError::Unavailable))?
+            .map_err(SessionError::Identity)?;
+        if agent.is_some() && principal.agent_id.as_ref() != agent {
+            return Err(SessionError::Identity(IdentityError::Forbidden));
+        }
+        Ok(principal)
+    }
+
+    /// 세션 생성 또는 복구 (신원 확인 후 레지스트리 갱신 및 presence 전파)
+    pub async fn claim(
+        &self,
+        instance: Identifier,
+        mode: ClaimMode,
+        agent: Option<Identifier>,
+    ) -> Result<Session, SessionError> {
+        let principal = self.resolve(agent.as_ref()).await?;
+        let mut registry = self.registry.lock().await;
+        let now = Instant::now();
+        registry.expire(now);
+        let result = registry.claim(instance, mode, agent.as_ref(), principal, now, self.lease);
+        registry.publish_presence(&self.central);
+        result
+    }
+
+    /// 세션에 Agent 바인딩 (활성화 및 ONLINE presence 전파)
+    pub async fn bind(
+        &self,
+        id: &Identifier,
+        instance: &Identifier,
+        agent: Identifier,
+    ) -> Result<Session, SessionError> {
+        // 비동기 작업 전 세션 유효성을 먼저 확인하여 만료된 요청 차단
+        {
+            let mut registry = self.registry.lock().await;
+            registry.expire(Instant::now());
+            registry.publish_presence(&self.central);
+            registry.current(id, instance)?;
+        }
+        let principal = self.resolve(Some(&agent)).await?;
+        let mut registry = self.registry.lock().await;
+        let now = Instant::now();
+        registry.expire(now);
+        let result = registry.bind(id, instance, principal, now, self.lease);
+        registry.publish_presence(&self.central);
+        result
+    }
+
+    /// 세션 임대 기간 연장 (heartbeat)
+    pub async fn heartbeat(
+        &self,
+        id: &Identifier,
+        instance: &Identifier,
+    ) -> Result<(), SessionError> {
+        let mut registry = self.registry.lock().await;
+        let now = Instant::now();
+        registry.expire(now);
+        registry.publish_presence(&self.central);
+        registry.renew(id, instance, now, self.lease)
+    }
+
+    /// 세션 명시적 해제 및 OFFLINE presence 전파
+    pub async fn release(
+        &self,
+        id: &Identifier,
+        instance: &Identifier,
+    ) -> Result<(), SessionError> {
+        let mut registry = self.registry.lock().await;
+        registry.expire(Instant::now());
+        registry.publish_presence(&self.central);
+        registry.release(id, instance)?;
+        registry.publish_presence(&self.central);
+        Ok(())
+    }
+
+    /// 만료 주기 실행
+    pub async fn expire(&self) {
+        let mut registry = self.registry.lock().await;
+        registry.expire(Instant::now());
+        registry.publish_presence(&self.central);
+    }
+
+    /// 백그라운드 세션 만료 타이머 태스크 (HTTP 요청이 없어도 90초 경과 시 자동 OFFLINE 전파)
+    pub async fn run_expiration(self, cancel: CancellationToken) {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let mut registry = self.registry.lock().await;
+                    registry.closed = true;
+                    registry.sessions.clear();
+                    registry.instances.clear();
+                    registry.owners.clear();
+                    registry.publish_presence(&self.central);
+                    return;
+                }
+                _ = tick.tick() => self.expire().await,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::central::ConnectionStatus;
+    use tokio::sync::{Notify, RwLock};
+
+    fn id(value: &str) -> Identifier {
+        Identifier::parse(value).unwrap()
+    }
+    fn principal(agent: Option<&str>) -> Principal {
+        Principal {
+            user_id: id("user-a"),
+            team_id: id("team-a"),
+            agent_id: agent.map(id),
+            tool_type: agent.map(|_| ToolType::Codex),
+        }
+    }
+    fn central() -> CentralState {
+        CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)))
+    }
+    fn claim(
+        registry: &mut Registry,
+        instance: &str,
+        mode: ClaimMode,
+        agent: Option<&str>,
+        now: Instant,
+    ) -> Result<Session, SessionError> {
+        let requested = agent.map(id);
+        registry.claim(
+            id(instance),
+            mode,
+            requested.as_ref(),
+            principal(agent),
+            now,
+            LEASE_DURATION,
+        )
+    }
+
+    struct TestIdentity;
+    impl IdentityProvider for TestIdentity {
+        fn resolve<'a>(&'a self, agent: Option<&'a Identifier>) -> IdentityFuture<'a> {
+            Box::pin(async move { Ok(principal(agent.map(Identifier::as_str))) })
+        }
+    }
+
+    #[test]
+    fn shared_identity_fixtures_and_optional_fields_match_mcp() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../contracts/local-broker/v1/identity-fixtures.json"
+        ))
+        .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let result = match fixture["type"].as_str().unwrap() {
+                "principal" => {
+                    serde_json::from_value::<Principal>(fixture["value"].clone()).is_ok()
+                }
+                "session" => serde_json::from_value::<Session>(fixture["value"].clone()).is_ok(),
+                _ => continue,
+            };
+            assert_eq!(
+                result,
+                fixture["valid"].as_bool().unwrap(),
+                "{}",
+                fixture["name"]
+            );
+        }
+        for field in ["agentId", "toolType"] {
+            let mut value = serde_json::to_value(principal(None)).unwrap();
+            value[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<Principal>(value).is_err());
+        }
+        assert!(Identifier::parse("😀".repeat(128)).is_ok());
+        assert!(Identifier::parse("😀".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn same_instance_claim_is_idempotent_but_cannot_change_agent() {
+        let mut registry = Registry::default();
+        let now = Instant::now();
+        let first = claim(
+            &mut registry,
+            "instance-a",
+            ClaimMode::Fresh,
+            Some("11"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            first,
+            claim(
+                &mut registry,
+                "instance-a",
+                ClaimMode::Recover,
+                Some("11"),
+                now + Duration::from_secs(30)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            first,
+            claim(
+                &mut registry,
+                "instance-a",
+                ClaimMode::Fresh,
+                Some("11"),
+                now
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            claim(
+                &mut registry,
+                "instance-a",
+                ClaimMode::Fresh,
+                Some("12"),
+                now
+            ),
+            Err(SessionError::Conflict)
+        );
+        assert_eq!(registry.sessions.len(), 1);
+    }
+
+    #[test]
+    fn fresh_replacement_fences_old_claim_heartbeat_and_delete() {
+        let mut registry = Registry::default();
+        let now = Instant::now();
+        let old = claim(&mut registry, "old", ClaimMode::Fresh, Some("11"), now).unwrap();
+        let new = claim(&mut registry, "new", ClaimMode::Fresh, Some("11"), now).unwrap();
+        assert_ne!(old.session_id, new.session_id);
+        assert_eq!(
+            registry.renew(&old.session_id, &id("old"), now, LEASE_DURATION),
+            Err(SessionError::Replaced)
+        );
+        assert_eq!(
+            registry.release(&old.session_id, &id("old")),
+            Err(SessionError::Replaced)
+        );
+        assert_eq!(
+            claim(&mut registry, "old", ClaimMode::Fresh, Some("11"), now),
+            Err(SessionError::Replaced)
+        );
+        assert_eq!(
+            claim(&mut registry, "old", ClaimMode::Recover, Some("11"), now),
+            Err(SessionError::Replaced)
+        );
+        assert_eq!(registry.owners.get(&id("11")), Some(&new.session_id));
+    }
+
+    #[test]
+    fn restart_first_recover_wins_and_agents_have_separate_slots() {
+        let now = Instant::now();
+        let mut registry = Registry::default();
+        let previous = claim(&mut registry, "previous", ClaimMode::Fresh, Some("11"), now).unwrap();
+        let mut restarted = Registry::default();
+        let winner = claim(
+            &mut restarted,
+            "winner",
+            ClaimMode::Recover,
+            Some("11"),
+            now,
+        )
+        .unwrap();
+        assert_ne!(previous.session_id, winner.session_id);
+        assert_eq!(
+            claim(
+                &mut restarted,
+                "previous",
+                ClaimMode::Recover,
+                Some("11"),
+                now
+            ),
+            Err(SessionError::Conflict)
+        );
+        assert!(
+            claim(
+                &mut restarted,
+                "other-agent",
+                ClaimMode::Recover,
+                Some("12"),
+                now
+            )
+            .is_ok()
+        );
+        assert_eq!(restarted.owners.len(), 2);
+    }
+
+    #[test]
+    fn lease_expires_at_90_seconds_and_renewal_uses_broker_time() {
+        let now = Instant::now();
+        let mut registry = Registry::default();
+        let first = claim(&mut registry, "a", ClaimMode::Fresh, Some("11"), now).unwrap();
+        registry.expire(now + Duration::from_secs(89));
+        assert!(registry.current(&first.session_id, &id("a")).is_ok());
+        registry
+            .renew(
+                &first.session_id,
+                &id("a"),
+                now + Duration::from_secs(89),
+                LEASE_DURATION,
+            )
+            .unwrap();
+        registry.expire(now + Duration::from_secs(90));
+        assert!(registry.current(&first.session_id, &id("a")).is_ok());
+        registry.expire(now + Duration::from_secs(179));
+        assert_eq!(
+            registry.renew(
+                &first.session_id,
+                &id("a"),
+                now + Duration::from_secs(179),
+                LEASE_DURATION
+            ),
+            Err(SessionError::Expired)
+        );
+        assert!(
+            registry.sessions.is_empty()
+                && registry.instances.is_empty()
+                && registry.owners.is_empty()
+        );
+    }
+
+    #[test]
+    fn unbound_bind_cannot_steal_or_switch_agent_or_user() {
+        let now = Instant::now();
+        let mut registry = Registry::default();
+        let owner = claim(&mut registry, "owner", ClaimMode::Fresh, Some("11"), now).unwrap();
+        let unbound = claim(&mut registry, "unbound", ClaimMode::Fresh, None, now).unwrap();
+        assert_eq!(
+            registry.bind(
+                &unbound.session_id,
+                &id("unbound"),
+                principal(Some("11")),
+                now,
+                LEASE_DURATION
+            ),
+            Err(SessionError::Conflict)
+        );
+        assert_eq!(
+            registry.release(&owner.session_id, &id("unbound")),
+            Err(SessionError::Conflict)
+        );
+        registry.release(&owner.session_id, &id("owner")).unwrap();
+        let bound = registry
+            .bind(
+                &unbound.session_id,
+                &id("unbound"),
+                principal(Some("11")),
+                now,
+                LEASE_DURATION,
+            )
+            .unwrap();
+        assert_eq!(bound.session_id, unbound.session_id);
+        assert_eq!(
+            registry.bind(
+                &bound.session_id,
+                &id("unbound"),
+                principal(Some("12")),
+                now,
+                LEASE_DURATION
+            ),
+            Err(SessionError::Conflict)
+        );
+        let mut foreign = principal(Some("11"));
+        foreign.user_id = id("other-user");
+        assert_eq!(
+            registry.bind(
+                &bound.session_id,
+                &id("unbound"),
+                foreign.clone(),
+                now,
+                LEASE_DURATION
+            ),
+            Err(SessionError::Identity(IdentityError::Forbidden))
+        );
+        assert_eq!(
+            registry.claim(
+                id("foreign"),
+                ClaimMode::Fresh,
+                Some(&id("11")),
+                foreign,
+                now,
+                LEASE_DURATION
+            ),
+            Err(SessionError::Identity(IdentityError::Forbidden))
+        );
+    }
+
+    #[tokio::test]
+    async fn presence_tracks_bound_owners_and_diagnostics_remain_unknown() {
+        let central = central();
+        let manager = SessionManager::new(Arc::new(TestIdentity), central.clone());
+        manager.expire().await;
+        assert_eq!(central.presence().await, None);
+        let a = manager
+            .claim(id("a"), ClaimMode::Fresh, None)
+            .await
+            .unwrap();
+        assert_eq!(central.presence().await, Some(PresenceStatus::Offline));
+        manager
+            .bind(&a.session_id, &id("a"), id("11"))
+            .await
+            .unwrap();
+        let b = manager
+            .claim(id("b"), ClaimMode::Fresh, Some(id("12")))
+            .await
+            .unwrap();
+        assert_eq!(central.presence().await, Some(PresenceStatus::Online));
+        manager.release(&a.session_id, &id("a")).await.unwrap();
+        assert_eq!(central.presence().await, Some(PresenceStatus::Online));
+        manager.release(&b.session_id, &id("b")).await.unwrap();
+        assert_eq!(central.presence().await, Some(PresenceStatus::Offline));
+    }
+
+    #[tokio::test]
+    async fn concurrent_recover_claims_have_exactly_one_owner() {
+        let manager = SessionManager::new(Arc::new(TestIdentity), central());
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let manager = manager.clone();
+            tasks.spawn(async move {
+                manager
+                    .claim(
+                        id(&format!("instance-{i}")),
+                        ClaimMode::Recover,
+                        Some(id("11")),
+                    )
+                    .await
+            });
+        }
+        let mut successes = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(_) => successes += 1,
+                Err(error) => assert_eq!(error, SessionError::Conflict),
+            }
+        }
+        assert_eq!(successes, 1);
+        let mut repeated = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let manager = manager.clone();
+            repeated.spawn(async move {
+                manager
+                    .claim(id("same-instance"), ClaimMode::Fresh, None)
+                    .await
+                    .unwrap()
+                    .session_id
+            });
+        }
+        let mut ids = std::collections::HashSet::new();
+        while let Some(result) = repeated.join_next().await {
+            ids.insert(result.unwrap());
+        }
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn abandoned_session_expires_without_an_http_request() {
+        let central = central();
+        let mut manager = SessionManager::new(Arc::new(TestIdentity), central.clone());
+        manager.lease = Duration::from_millis(30); // Internal test timing only; public leases stay at 90s.
+        let session = manager
+            .claim(id("a"), ClaimMode::Fresh, Some(id("11")))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let runner = tokio::spawn(manager.clone().run_expiration(cancel.clone()));
+        timeout(Duration::from_secs(3), async {
+            while central.presence().await != Some(PresenceStatus::Offline) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            manager.heartbeat(&session.session_id, &id("a")).await,
+            Err(SessionError::Expired)
+        );
+        cancel.cancel();
+        runner.await.unwrap();
+    }
+
+    struct DelayedIdentity {
+        started: Notify,
+        release: Notify,
+    }
+    impl IdentityProvider for DelayedIdentity {
+        fn resolve<'a>(&'a self, agent: Option<&'a Identifier>) -> IdentityFuture<'a> {
+            Box::pin(async move {
+                if agent.is_some() {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(principal(agent.map(Identifier::as_str)))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn late_identity_reply_cannot_resurrect_released_or_shutdown_session() {
+        let provider = Arc::new(DelayedIdentity {
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let central = central();
+        let manager = SessionManager::new(provider.clone(), central.clone());
+        let session = manager
+            .claim(id("a"), ClaimMode::Fresh, None)
+            .await
+            .unwrap();
+        let copy = manager.clone();
+        let session_id = session.session_id.clone();
+        let binding = tokio::spawn(async move { copy.bind(&session_id, &id("a"), id("11")).await });
+        provider.started.notified().await;
+        manager
+            .release(&session.session_id, &id("a"))
+            .await
+            .unwrap();
+        provider.release.notify_one();
+        assert_eq!(binding.await.unwrap(), Err(SessionError::Expired));
+        assert_eq!(central.presence().await, Some(PresenceStatus::Offline));
+
+        let copy = manager.clone();
+        let claiming = tokio::spawn(async move {
+            copy.claim(id("after-shutdown"), ClaimMode::Fresh, Some(id("11")))
+                .await
+        });
+        provider.started.notified().await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        manager.clone().run_expiration(cancel).await;
+        provider.release.notify_one();
+        assert_eq!(claiming.await.unwrap(), Err(SessionError::Expired));
+    }
+}

@@ -77,7 +77,7 @@ Rust는 상태 보고에 `agent_id`, 사용자·팀 식별자, 클라이언트 �
 
 로컬 HTTP 핸들러와 중앙 연결 태스크는 같은 `CentralState`를 공유한다. 세션 관리가 확인한 상태는 `CentralState::set_presence(PresenceStatus::Online/Offline)`으로 게시한다. `SharedPresence`는 `watch::Sender<Option<PresenceStatus>>`이며 기존 `Arc<RwLock<...>>` 직접 쓰기 방식 대신 이 게시 메서드를 사용한다. 기본 상태는 미확인(`None`)이다.
 
-3단계 로컬 세션 구현에서는 활성 세션의 생성·bind·해제·만료에 따라 위 게시 메서드를 호출해야 한다. 초기 로컬 상태 확인과 실제 세션 이벤트 연결은 아직 구현되지 않았으므로 실제 Host 세션까지 포함한 완료로 판정하지 않는다. 로컬 세션 만료를 중앙 작업의 실패·취소로 변환하지 않는다.
+로컬 세션 관리자는 생성·bind·해제·만료와 같은 잠금 안에서 위 게시 메서드를 호출하도록 연결했다. 첫 성공 세션 전에는 미확인 상태를 유지하고, 이후 활성 bound 소유자가 있으면 ONLINE, 없으면 OFFLINE이다. 거부된 요청·health는 상태를 활성화하지 않는다. 중앙 신원 공급부는 미연결이며 성공 흐름은 테스트용 검증 신원으로 확인했으므로 실제 Host 세션·운영 중앙까지 포함한 완료로 판정하지 않는다. 로컬 세션 만료를 중앙 작업의 실패·취소로 변환하지 않는다. 상세 내용은 [로컬 세션 API](local-sessions.md)를 따른다.
 
 ## 5. 연결 교체·종료와 오래된 이벤트 보호
 
@@ -146,7 +146,7 @@ Rust는 상태 보고에 `agent_id`, 사용자·팀 식별자, 클라이언트 �
 
 ## 8. 다음 구현·검증 순서
 
-1. 기존 READY·PRESENCE 규칙에 맞춰 3단계 로컬 세션 상태와 중앙 presence를 연결한다. MCP 세션 principal에 필요한 검증된 신원 전달 경로는 별도로 연결한다.
+1. 구현한 로컬 세션·presence에 실제 중앙 IdentityProvider를 연결한다. 현재 기본 공급부는 신원을 만들지 않고 503 CENTRAL_UNAUTHENTICATED로 닫힌다.
 2. 실제 중앙의 AgentTokenVerifier·Agent 토큰으로 Upgrade → READY → PRESENCE → DB 상태 갱신을 검증한다.
 3. 세션 해제·만료, 중앙 재시작·재접속, 동일 Agent 연결 교체와 오래된 이벤트가 새 상태에 영향을 주지 않는지 확인한다.
 4. 구현한 JSON Heartbeat·4001 재접속을 실제 중앙 배포 설정·인증 환경에서도 확인한다.

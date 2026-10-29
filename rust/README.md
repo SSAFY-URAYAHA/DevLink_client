@@ -19,7 +19,7 @@ cargo build --release --locked --workspace
 .\target\release\devlink.exe --help
 ```
 
-`rust-toolchain.toml`은 stable, rustfmt, clippy를 선택합니다. 의존성 버전은 이 디렉터리의 `Cargo.lock`으로 고정하며 공통 의존성은 workspace의 `Cargo.toml`에서 관리합니다. 빌드 산출물은 `rust/target/`에 생성됩니다. 2026-10-28 실시간 45초 Heartbeat 자동 회귀 추가 후 Windows MSVC에서 컴파일·포맷·Clippy 검사, 단위 테스트 17개와 통합 테스트 29개를 통과했습니다. MCP 패키지의 100개 테스트와 일반·릴리스 빌드는 이전 검증 기록이며 이번 추가에서 재실행하지 않았습니다. 실행 시점별 결과는 [로컬 검증 기록](docs/verification.md)에 보관합니다. 현재 저장소에는 CI 워크플로가 없으며 Ubuntu 실행은 검증하지 않았습니다.
+`rust-toolchain.toml`은 stable, rustfmt, clippy를 선택합니다. 의존성 버전은 이 디렉터리의 `Cargo.lock`으로 고정하며 공통 의존성은 workspace의 `Cargo.toml`에서 관리합니다. 빌드 산출물은 `rust/target/`에 생성됩니다. 2026-10-28 로컬 세션 구현 후 Windows MSVC에서 컴파일·포맷·Clippy 검사와 단위 27개·통합 36개(세션 HTTP/WebSocket 6개·CLI 30개)가 통과했습니다. MCP 100개 테스트와 일반·릴리스 빌드는 이전 기록입니다. 실행 시점별 결과는 [로컬 검증 기록](docs/verification.md)에 보관합니다. CI 워크플로는 없으며 Ubuntu 실행은 이번에 검증하지 않았습니다.
 
 통합 테스트는 로컬 TCP 연결을 사용합니다. 네트워크가 제한된 샌드박스에서 Windows 오류 `10013` 또는 브로커 시작 시간 초과가 발생하면 로컬 통신이 허용된 일반 PowerShell이나 승인된 샌드박스 외부 실행으로 검증하세요.
 
@@ -47,7 +47,7 @@ cargo run -p devlink-cli -- stop
 
 Mock 서버를 Ctrl+C로 종료하면 `status`가 `Reconnecting`으로 바뀝니다. 같은 포트·토큰으로 서버를 다시 실행하면 `Connected`로 돌아옵니다. `Connected`는 `/ws/broker` WebSocket Upgrade 인증(`Authorization: Bearer <DEVLINK_TOKEN>`) 후 유효한 `BROKER_READY` 수신(확인된 로컬 Agent 상태가 있는 경우 초기 `AGENT_PRESENCE` 보고 포함; 로컬 상태 미확인 시 추측한 `AGENT_PRESENCE`는 전송하지 않음)까지 마친 상태입니다. Upgrade HTTP `401`/`403`은 `AuthFailed`, 동일 Agent의 새 연결 교체(`4002`)는 `Replaced`, 메시지/정책 위반(`1008` 또는 잘못된 `BROKER_READY`)은 `ProtocolViolation`이 되며 자동 재시도하지 않습니다. 이 경우 토큰이나 설정을 고친 뒤 `stop`/`start`로 다시 시작합니다. Close `4001`은 하트비트 만료이며 `autoReconnect` 설정에 따라 재접속합니다.
 
-중앙 연결과 로컬 HTTP 핸들러는 같은 `CentralState`를 공유합니다. 로컬 세션 관리에서 확인한 상태를 `set_presence(Online/Offline)`으로 게시하면 READY 이후 현재 연결로 보고하며, 같은 상태는 중복 전송하지 않습니다. 연결 전·재접속 중에는 최신 상태를 보존해 다음 READY 직후 보고합니다. 현재 `/v1/sessions` API는 없으므로 실제 세션 생성·bind·해제·만료가 이 게시 지점을 호출하는 작업은 3단계에 남아 있습니다. 기본 상태는 미확인(`None`)입니다.
+중앙 연결·로컬 HTTP·세션 관리자는 같은 `CentralState`를 공유합니다. 검증된 세션의 생성·bind·해제·만료에서 활성 bound 소유자 유무로 presence를 계산하고 `set_presence(Online/Offline)`에 게시합니다. READY 이후 변경 보고, 동일 상태 중복 생략, 재접속 시 최신 상태 재보고를 사용합니다. 기본 상태는 미확인(`None`)이며 health·거부된 요청만으로 상태를 확정하지 않습니다. 실제 중앙 신원 공급부 연결은 별도 후속 항목입니다.
 
 ## 설정
 
@@ -101,6 +101,12 @@ MCP는 처음 읽은 주소·토큰을 실행 중 고정합니다. 토큰 회전
 
 구버전에서 업그레이드할 때는 실행 중인 구버전 브로커를 구버전 CLI로 먼저 종료하세요. 새 버전은 `.devlink-runtime/`만 사용하며, 설정 파일 보호를 위해 기존 위치의 런타임·잠금 파일을 자동 이동하거나 삭제하지 않습니다. 구버전과 새 버전은 잠금 경로가 다르므로 동시에 실행하지 마세요.
 
+## 로컬 MCP 세션
+
+세션 생성·bind·heartbeat·해제 HTTP 경로와 90초 lease·fresh/recover 소유권·presence 연결을 구현했습니다. 중앙 신원 공급부는 `IdentityProvider` 인터페이스로 분리했고, 기본 CLI에는 미구성 공급부를 연결합니다. 따라서 현재 정상 MCP 토큰으로 `POST /v1/sessions`를 호출하면 **503 CENTRAL_UNAUTHENTICATED**이며, 사용자·팀을 임의로 만들어 성공시키지 않습니다. 성공 경로는 테스트 내부의 검증 신원 공급부로 검증합니다.
+
+세션 API는 MCP localToken만 허용하며 CLI controlToken은 거부합니다. 중앙 신원 전달·등록 계약이 정해지면 실제 공급부를 연결해야 합니다. [로컬 세션 API](docs/local-sessions.md)에 경로·JSON·오류·소유권·presence·검증 범위를 정리했습니다.
+
 ## 상태와 오류 처리
 
 ```text
@@ -125,12 +131,15 @@ Central Server: Connected
 | `crates/devlink-broker/src/lib.rs` | 브로커 라이브러리 진입점 |
 | `crates/devlink-broker/src/config.rs` | CLI와 브로커가 공유하는 설정 타입·검증·원자 저장·잠금 |
 | `crates/devlink-broker/src/credentials.rs` | MCP 자격 파일 경로·원자 발행·토큰 유지·회전·OS 권한 검사 |
+| `crates/devlink-broker/src/sessions.rs` | 신원 공급부 인터페이스·세션 소유권·90초 lease·만료·presence |
+| `crates/devlink-broker/src/session_api.rs` | MCP 토큰 인증·세션 HTTP 경로·요청 검증·오류 envelope |
 | `crates/devlink-broker/src/broker.rs` | HTTP 서버·종료 신호·태스크 정리 |
 | `crates/devlink-broker/src/local.rs` | 런타임 발견·인증된 제어 클라이언트·Health 계약 |
 | `crates/devlink-broker/src/central.rs` | 중앙 WebSocket 상태·인증·Heartbeat·재연결 |
 | `crates/devlink-broker/src/protocol.rs` | 중앙 서버 메시지 DTO |
 | `crates/devlink-broker/examples/mock_server.rs` | 개발용 중앙 서버 |
 | `crates/devlink-cli/tests/cli_broker.rs` | 실제 CLI·브로커·Mock 서버 통합 테스트 |
+| `crates/devlink-broker/tests/session_api.rs` | 테스트용 검증 신원·실제 HTTP/WebSocket 세션 통합 테스트 |
 
 테스트는 임시 디렉터리·동적 포트를 사용하며 사용자 설정을 변경하지 않습니다. 독립 실행, 동시 시작, 중복 방지, 정상/강제 종료, 포트 충돌, 토큰 비노출, 설정 오류, 로컬 API 인증, WebSocket 인증·서버 재시작·재연결·재시도 중 종료를 검증합니다. MCP 자격 파일의 실제 Node reader 호환성, 토큰 유지·회전·권한 분리, junction 거부, 느린 ACL 검사와 presence 보고도 포함합니다. JSON Heartbeat 테스트는 같은 연결 루프에 짧은 시간을 주입해 실제 로컬 소켓에서 연결 유지·잘못된/이전 PONG·무응답 만료·4001 재접속을 검증합니다. CLI 통합 테스트는 autoReconnect의 켜짐·꺼짐과 HTTP 인증 실패 시 재접속 중단을 별도로 확인합니다. Node.js 24 이상과 MCP 패키지 의존성이 필요하며, Rust 테스트의 격리 reader 의존성이 없으면 해당 테스트가 `npm ci`를 실행합니다.
 
@@ -142,4 +151,4 @@ cargo test --offline --locked -p devlink-cli --test cli_broker json_heartbeat_ke
 
 [중앙 WebSocket 연동 규칙](docs/central-websocket-contract.md)에 보안 전략·작업 기록과 현재 로컬 서버의 JSON Heartbeat·만료 처리 소스를 기준으로 인증, READY·PRESENCE, 연결 교체·종료 규칙과 Rust 적용 현황을 정리했습니다. MCP 신원 전달·업무 라우팅과 실제 배포 환경 검증은 후속 항목입니다.
 
-[진행 현황](PROJECT_STATUS.md), [TypeScript 분석](docs/typescript-analysis.md), [MCP 실행 구조 및 내부 API 초안](docs/mcp-interface.md), [작업별 현황](docs/task-status.md)을 참고하세요. 다음 개발 작업은 세션 API 4개와 소유권·만료 처리·presence 연결입니다. MCP 서버·업무 도구는 `packages/mcp-server`에 있으며 실제 Rust 세션·업무 API 및 중앙 서버와의 연동 검증은 후속 작업입니다.
+[진행 현황](PROJECT_STATUS.md), [TypeScript 분석](docs/typescript-analysis.md), [MCP 실행 구조 및 내부 API](docs/mcp-interface.md), [작업별 현황](docs/task-status.md)을 참고하세요. 로컬 세션 API 4개·소유권·만료·presence는 구현됐으며 중앙 신원 공급부·Agent 등록·업무 API·실제 Host 왕복 연결이 남아 있습니다.

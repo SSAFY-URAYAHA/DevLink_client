@@ -1,5 +1,34 @@
 # 로컬 검증 기록
 
+## 2026-10-28: 로컬 세션 API·소유권·만료·presence 구현
+
+기준은 feature/rust/session-api의 `b8bd142` 이후 작업 트리입니다. 사용자 요청에 따라 rust/ 안에서만 구현했고 커밋·Push는 진행하지 않았습니다. 중앙 신원 조회·등록/토큰 발급·업무 API는 이번 범위에서 제외합니다.
+
+세션 생성·bind·heartbeat·해제 HTTP API, MCP localToken 전용 인증, requestId+data/error envelope, 입력 상한·공유 식별자 검증을 추가했습니다. 세션 관리자는 instanceId 멱등성·fresh 교체·recover 충돌·브로커 시계 90초 만료·오래된 갱신/해제 차단을 구현합니다. 요청 전 정리와 1초 주기 만료 태스크를 사용하며, 확인된 bound 소유자 유무로 CentralState presence를 같은 잠금 안에서 갱신합니다.
+
+IdentityProvider는 교체 가능한 비동기 인터페이스입니다. 기본 CLI에는 UnconfiguredIdentityProvider를 연결하므로 생성은 503 CENTRAL_UNAUTHENTICATED로 닫히고 가짜 principal이나 ONLINE을 만들지 않습니다. 테스트 내부에서만 검증된 신원을 주입해 성공 흐름을 확인합니다. 실제 구현 계약과 후속 연결은 [로컬 세션 API](local-sessions.md)를 참고합니다.
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo check --offline --locked --workspace --all-targets` | 통과 |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 27개·세션 HTTP/WebSocket 통합 6개·CLI 통합 30개 통과, 실패·무시 0 |
+
+Windows MSVC에서 ACL·로컬 HTTP/WebSocket 전체 테스트를 승인된 샌드박스 외부에서 순차 실행했습니다. 세션 HTTP 묶음은 0.10초, CLI 묶음은 131.51초였으며 기존 45초 실제 주기 Heartbeat 회귀도 포함합니다. 컴파일·Clippy에는 증분 캐시 hard link 대신 파일 복사를 사용하는 환경 경고가 있었고 검사 종료 코드는 0입니다.
+
+새 검증은 다음을 포함합니다.
+
+- 공유 principal/session 신원 fixture, Unicode 128개 경계와 null/추가 필드 거부.
+- 동일 인스턴스 동시 claim 멱등성, 서로 다른 recover 경쟁의 단일 소유자, fresh 교체·이전 세션의 갱신/해제/재claim 차단.
+- 재시작 전 소유권 미보존, 브로커 시계 90초 경계·갱신, 요청 없는 백그라운드 만료. 경계 검사는 내부 monotonic 시각으로 수행하고 주기 정리는 테스트 내부 lease만 단축했습니다.
+- unbound bind 충돌·사용자/팀/Agent 변경 거부, 해제·종료 이후 지연된 신원 응답으로 세션 부활 방지.
+- 실제 HTTP의 생성→bind→heartbeat→DELETE, requestId·principal·오류 scope/outcome, 인증·Origin·크기·Content-Type·잘못된 JSON·중복 필드·행위자/시각 덮어쓰기 거부.
+- 같은 실제 로컬 WebSocket에서 unbound 생성 OFFLINE→bind ONLINE→해제 OFFLINE 보고.
+- 실제 CLI에서 MCP 토큰의 세션 생성은 신원 미구성 503, CLI controlToken은 세션 API 401이며 health·중앙 연결·정상 종료는 유지.
+
+MCP 전체 테스트·릴리스 빌드, 실제 중앙 인증·토큰·DB, 실제 MCP Host와의 업무 왕복은 이번에 실행하지 않았습니다. 기존 TypeScript·중앙 서버·공유 계약 파일은 수정하지 않았고, 새로운 의존성이나 운영용 신원 우회 설정은 추가하지 않았습니다.
+
 ## 2026-10-28: 실시간 45초 연결 유지 자동 회귀 추가
 
 `feature/rust/broekr_sessionapi`의 `6e6fd78` 이후 작업 트리에 `json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect`를 추가했습니다. 앞서 별도 실행으로 확인한 45초 유지 검증을 Rust CLI 통합 테스트로 저장했으며 `#[ignore]` 없이 기본 전체 테스트에 포함합니다.

@@ -789,6 +789,48 @@ async fn json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_routes_require_verified_identity_and_reject_cli_control_token() {
+    let server = Mock::start("127.0.0.1:0", Behavior::Ready { agent_id: 11 }).await;
+    let f = Fixture::new();
+    f.configure(|config| config.server_url = format!("ws://{}", server.address));
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Connected).await;
+    let runtime = Runtime::load(&f.path).unwrap();
+    let credentials = devlink_broker::credentials::load(&f.path).unwrap();
+    let client = runtime.client().unwrap();
+    let payload = serde_json::json!({"requestId":"production-claim","instanceId":"mcp-instance","mode":"fresh"});
+    let response = client
+        .post(runtime.url("/v1/sessions"))
+        .bearer_auth(&credentials.local_token)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"requestId":"production-claim","error":{"code":"CENTRAL_UNAUTHENTICATED","scope":"domain","outcome":"rejected"}})
+    );
+    assert!(!body.to_string().contains(&credentials.local_token));
+    let response = client
+        .post(runtime.url("/v1/sessions"))
+        .bearer_auth(&runtime.control_token)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+    assert_eq!(f.health().await.central_server, ConnectionStatus::Connected);
+    assert!(
+        server.received.lock().await.is_empty(),
+        "Rejected claims must not activate presence"
+    );
+    f.ok(&["stop"]);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeat_timeout_4001_reconnects_only_when_enabled() {
     for auto_reconnect in [true, false] {
         let server = Mock::start("127.0.0.1:0", Behavior::CloseHeartbeatTimeout4001).await;
