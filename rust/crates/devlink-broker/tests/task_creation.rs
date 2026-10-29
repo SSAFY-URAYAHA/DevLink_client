@@ -590,3 +590,70 @@ async fn bad_local_credentials_and_storage_failure_never_call_central() {
     assert!(remote.state.calls.lock().await.is_empty());
     broker.stop().await;
 }
+
+// Opt-in: compile packages/mcp-server into a directory under rust/target and set
+// DEVLINK_MCP_BUILD to that path. The harness uses its existing node_modules.
+// Reuse the HTTP fixtures above; READY identity is prepared, not received over WS.
+#[tokio::test]
+#[ignore = "requires Node >=24 and current MCP build at DEVLINK_MCP_BUILD"]
+async fn actual_mcp_tools_use_rust_sessions_and_mock_central() {
+    let build = std::env::var_os("DEVLINK_MCP_BUILD").expect("set DEVLINK_MCP_BUILD");
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir_in(workspace.join("target")).unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_millis(200)).await;
+    for (scenario, mode, expected_calls) in [
+        ("success", 0, 2),
+        ("delivery-unknown", 8, 1),
+        ("central-auth", 2, 1),
+        ("timeout", 1, 1),
+        ("local-auth", 0, 0),
+    ] {
+        remote.state.mode.store(mode, Ordering::SeqCst);
+        let before = remote.state.calls.lock().await.len();
+        let mut command = tokio::process::Command::new("node");
+        command
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/mcp_task_creation.mjs"
+            ))
+            .arg(&build)
+            .arg(&broker.url)
+            .arg(scenario)
+            .env("DEVLINK_TEST_LOCAL_TOKEN", LOCAL)
+            .env("DEVLINK_TEST_AGENT_TOKEN", AGENT)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let output = timeout(Duration::from_secs(20), command.output())
+            .await
+            .expect("MCP harness timed out")
+            .expect("cannot start Node");
+        assert!(
+            output.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["scenario"], scenario);
+        assert_eq!(report["passed"], true);
+        // The real MCP transport must not retry a central mutation implicitly.
+        let calls = remote.state.calls.lock().await;
+        assert_eq!(calls.len() - before, expected_calls, "{scenario}");
+        for sent in &calls[before..] {
+            assert_eq!(sent["requesterAgentId"], 12);
+            assert_eq!(sent["receiverAgentId"], 13);
+            let prompt: Value = serde_json::from_str(sent["prompt"].as_str().unwrap()).unwrap();
+            assert_eq!(prompt["title"], "MCP integration");
+            assert_eq!(prompt["description"], "실제 MCP 입력");
+            assert_eq!(prompt["taskContext"], "mock only");
+        }
+        if scenario == "success" {
+            assert_ne!(calls[before]["requestKey"], calls[before + 1]["requestKey"]);
+            assert_eq!(remote.state.saved.lock().await.len(), 2);
+        }
+        println!("actual MCP: {scenario} passed ({expected_calls} central calls)");
+    }
+    broker.stop().await;
+}
