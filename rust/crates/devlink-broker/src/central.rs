@@ -10,6 +10,7 @@ use crate::{
         ClientMessage, HeartbeatPong, MAX_CENTRAL_MESSAGE_BYTES, PresenceStatus, ServerMessage,
         TaskAckPayload, TaskCreatedMessage,
     },
+    sessions::IdentityError,
 };
 use anyhow::{Result, bail, ensure};
 use futures_util::{Sink, SinkExt, StreamExt, stream::FuturesUnordered};
@@ -107,6 +108,7 @@ pub struct CentralState {
     presence: SharedPresence,
     inbox: Option<Inbox>,
     subject_changes: watch::Sender<u64>,
+    auth_failures: watch::Sender<u64>,
 }
 
 impl CentralState {
@@ -137,6 +139,7 @@ impl CentralState {
             inbox: None,
             context_client: None,
             subject_changes: watch::channel(0).0,
+            auth_failures: watch::channel(0).0,
         }
     }
 
@@ -162,17 +165,51 @@ impl CentralState {
         generation: u64,
         expected: &CentralIdentity,
         context: Option<&crate::agent_context::AgentContext>,
-    ) -> bool {
+    ) -> Result<(), IdentityError> {
         let mut guard = self.inner.write().await;
-        if guard.generation != generation
-            || guard.status != ConnectionStatus::Connected
-            || guard.identity.as_ref() != Some(expected)
-        {
-            return false;
+        if guard.generation != generation || guard.status != ConnectionStatus::Connected {
+            return Err(IdentityError::Unavailable);
         }
-        let mut identity = expected.clone();
-        identity.user_id = context.map(|c| c.owner_user_id);
-        identity.team_id = context.map(|c| c.team_id);
+        let Some(current) = guard.identity.as_ref() else {
+            return Err(IdentityError::Unavailable);
+        };
+        if current.connection_id != expected.connection_id || current.agent_id != expected.agent_id
+        {
+            return Err(IdentityError::Unavailable);
+        }
+        // Hydration by another request is not a connection change. However,
+        // already verified fields must agree with every concurrent success.
+        let rejection = match context {
+            None => Some(IdentityError::Unauthenticated),
+            Some(context)
+                if context.agent_id != current.agent_id
+                    || current
+                        .user_id
+                        .is_some_and(|id| id != context.owner_user_id)
+                    || current.team_id.is_some_and(|id| id != context.team_id) =>
+            {
+                Some(IdentityError::Forbidden)
+            }
+            Some(_) => None,
+        };
+        if let Some(error) = rejection {
+            guard.subject = None;
+            guard.subject_epoch = guard.subject_epoch.saturating_add(1);
+            guard.identity = None;
+            *self.identity.write().await = None;
+            guard.status = ConnectionStatus::AuthFailed;
+            *self.status.write().await = ConnectionStatus::AuthFailed;
+            if self.presence.borrow().is_some() {
+                self.set_presence(PresenceStatus::Offline);
+            }
+            self.subject_changes.send_replace(guard.subject_epoch);
+            self.auth_failures.send_replace(generation);
+            return Err(error);
+        }
+        let context = context.expect("accepted context");
+        let mut identity = current.clone();
+        identity.user_id = Some(context.owner_user_id);
+        identity.team_id = Some(context.team_id);
         let subject = identity
             .user_id
             .zip(identity.team_id)
@@ -187,13 +224,7 @@ impl CentralState {
         }
         guard.identity = Some(identity.clone());
         *self.identity.write().await = Some(identity);
-        if context.is_none() {
-            // A revoked or contradictory context cannot be reinterpreted as a
-            // legacy READY on the same WS principal. A new connection is required.
-            guard.status = ConnectionStatus::AuthFailed;
-            *self.status.write().await = ConnectionStatus::AuthFailed;
-        }
-        true
+        Ok(())
     }
 
     /// 새 연결 세션을 시작하며 세대(generation)를 증가시키고 이전 연결의 식별 정보를 즉시 무효화합니다.
@@ -258,6 +289,22 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    async fn finish_connection(&self, outcome: Outcome) -> Outcome {
+        let mut guard = self.state.inner.write().await;
+        if guard.generation != self.generation {
+            return Outcome::Stopped;
+        }
+        // Classify and clear under one lock. Otherwise a context denial between
+        // the status check and clear could be overwritten by Reconnecting.
+        let outcome = if guard.status == ConnectionStatus::AuthFailed {
+            Outcome::AuthFailed
+        } else {
+            outcome
+        };
+        guard.identity = None;
+        *self.state.identity.write().await = None;
+        outcome
+    }
     /// 세대 번호를 반환합니다.
     pub fn generation(&self) -> u64 {
         self.generation
@@ -443,8 +490,8 @@ async fn run_with_heartbeat(
     loop {
         let session_handle = state.begin_session().await;
         let outcome = session(&config, &token, &session_handle, &cancel, heartbeat_timing).await;
-        // 연결 세션이 종료되면 해당 세션의 connection_id / agent_id를 즉시 무효화
-        session_handle.clear_identity().await;
+        // An I/O failure racing with revocation must not enable reconnect.
+        let outcome = session_handle.finish_connection(outcome).await;
 
         match outcome {
             Outcome::Stopped => {
@@ -551,6 +598,7 @@ async fn session(
 ) -> Outcome {
     // 연결 전부터 구독해 READY 수신과 구독 사이의 상태 변경을 놓치지 않습니다.
     let mut presence = handle.state.presence.subscribe();
+    let mut auth_failures = handle.state.auth_failures.subscribe();
     let mut last_presence = None;
     if !handle.mark_connecting().await {
         return Outcome::Stopped;
@@ -614,8 +662,24 @@ async fn session(
 
     loop {
         tokio::select! {
+            biased;
+            changed = auth_failures.changed() => {
+                if changed.is_err() { return Outcome::Stopped; }
+                if *auth_failures.borrow_and_update() == handle.generation {
+                    let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                    return Outcome::AuthFailed;
+                }
+            }
             // 수신함 디스크 저장이 완료되면 중앙 WebSocket으로 ACK 회신
             saved = receipts.next(), if !receipts.is_empty() => {
+                // Serialize the final ACK write with authentication revocation.
+                // Never hold this guard while awaiting the disk write itself.
+                let auth = handle.state.inner.read().await;
+                if auth.generation != handle.generation { return Outcome::Stopped; }
+                if auth.status != ConnectionStatus::Connected || auth.identity.is_none() {
+                    let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                    return Outcome::AuthFailed;
+                }
                 let Some(Ok(ack)) = saved else {
                     let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
                     return Outcome::InboxFailed;
@@ -757,7 +821,13 @@ async fn session(
                                 }
                                 Ok(ServerMessage::TaskCreated { event_id, payload }) => {
                                     let message = TaskCreatedMessage { event_id, payload };
-                                    let identity = handle.state.identity().await;
+                                    let auth = handle.state.inner.read().await;
+                                    if auth.generation != handle.generation { return Outcome::Stopped; }
+                                    if auth.status != ConnectionStatus::Connected {
+                                        let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                                        return Outcome::AuthFailed;
+                                    }
+                                    let identity = auth.identity.as_ref();
                                     // 1. BROKER_READY 완료 여부 및 수신 Agent 일치 검증
                                     let Some(identity) = identity else { return Outcome::ProtocolViolation; };
                                     if !message.is_valid() || message.payload.receiver_agent_id != identity.agent_id
@@ -776,8 +846,9 @@ async fn session(
                                     }
                                     // 3. 비동기 디스크 기록 작업 큐에 등록 (소켓 이벤트 루프 블로킹 방지)
                                     let origin = config.server_url.clone();
+                                    let agent_id = identity.agent_id;
                                     receipts.push(Box::pin(async move {
-                                        inbox.record(origin, identity.agent_id, message).await
+                                        inbox.record(origin, agent_id, message).await
                                     }));
                                 }
                                 // 원문은 출력하지 않으며 알 수 없는 메시지로 PONG 대기를 연장하지 않습니다.
@@ -824,6 +895,85 @@ mod tests {
         task::{JoinHandle, JoinSet},
     };
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_waiting_for_central_lock_cannot_renew_an_expired_lease() {
+        use crate::sessions::{
+            ClaimMode, Identifier, IdentityFuture, IdentityProvider, Principal, SessionError,
+            SessionManager,
+        };
+
+        struct GatedIdentity {
+            calls: AtomicUsize,
+            arrived: tokio::sync::Notify,
+            resume: tokio::sync::Notify,
+        }
+
+        impl IdentityProvider for GatedIdentity {
+            fn requires_current_ready(&self) -> bool {
+                true
+            }
+            fn requires_live_check(&self) -> bool {
+                true
+            }
+            fn resolve<'a>(&'a self, _agent: Option<&'a Identifier>) -> IdentityFuture<'a> {
+                Box::pin(async move {
+                    if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                        self.arrived.notify_one();
+                        self.resume.notified().await;
+                    }
+                    Ok(Principal {
+                        user_id: Identifier::parse("3").unwrap(),
+                        team_id: Identifier::parse("1").unwrap(),
+                        agent_id: Some(Identifier::parse("12").unwrap()),
+                        tool_type: None,
+                    })
+                })
+            }
+        }
+
+        let state = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)));
+        let handle = state.begin_session().await;
+        handle
+            .set_identity(CentralIdentity {
+                connection_id: "lease-lock-regression".into(),
+                agent_id: 12,
+                user_id: Some(3),
+                team_id: Some(1),
+            })
+            .await;
+        handle.set_status(ConnectionStatus::Connected).await;
+        let provider = Arc::new(GatedIdentity {
+            calls: AtomicUsize::new(0),
+            arrived: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let manager = SessionManager::new(provider.clone(), state.clone());
+        let owner = Identifier::parse("owner").unwrap();
+        let session = manager
+            .claim(
+                owner.clone(),
+                ClaimMode::Fresh,
+                Some(Identifier::parse("12").unwrap()),
+            )
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(85)).await;
+        let heartbeat = manager.heartbeat(&session.session_id, &owner);
+        tokio::pin!(heartbeat);
+        // Manually poll to make both wait boundaries deterministic: the local
+        // precheck has finished before identity resolution waits on Notify.
+        assert!(futures_util::poll!(&mut heartbeat).is_pending());
+        provider.arrived.notified().await;
+        let central_write = state.inner.write().await;
+        provider.resume.notify_one();
+        // Identity has resolved, but final validation is queued on inner.read.
+        assert!(futures_util::poll!(&mut heartbeat).is_pending());
+        tokio::time::advance(Duration::from_secs(6)).await;
+        drop(central_write);
+        assert_eq!(heartbeat.await, Err(SessionError::Expired));
+        assert_eq!(state.presence().await, Some(PresenceStatus::Offline));
+    }
 
     #[tokio::test]
     async fn stalled_receipt_storage_keeps_heartbeat_alive_without_early_ack() {

@@ -54,6 +54,10 @@ struct Store {
 pub struct Inbox(Arc<Mutex<Store>>, Arc<tokio::sync::Semaphore>);
 
 impl Inbox {
+    #[cfg(test)]
+    pub(crate) fn has_pending_write(&self) -> bool {
+        self.1.available_permits() == 0
+    }
     /// 수신함 파일 경로 반환 (`.devlink/inbox.json`)
     pub fn path(config_path: &Path) -> PathBuf {
         config::state_directory(config_path).join("inbox.json")

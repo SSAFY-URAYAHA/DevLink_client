@@ -204,7 +204,8 @@ impl IdentityProvider for ReadyIdentityProvider {
                     Ok(context) => context,
                     Err(error) => {
                         if error == IdentityError::Unauthenticated {
-                            self.central
+                            let _ = self
+                                .central
                                 .confirm_context(generation, &identity, None)
                                 .await;
                         }
@@ -217,18 +218,15 @@ impl IdentityProvider for ReadyIdentityProvider {
                         .is_some_and(|id| id != context.owner_user_id)
                     || identity.team_id.is_some_and(|id| id != context.team_id)
                 {
-                    self.central
+                    let _ = self
+                        .central
                         .confirm_context(generation, &identity, None)
                         .await;
                     return Err(IdentityError::Forbidden);
                 }
-                if !self
-                    .central
+                self.central
                     .confirm_context(generation, &identity, Some(&context))
-                    .await
-                {
-                    return Err(IdentityError::Unavailable);
-                }
+                    .await?;
             }
             self.central
                 .with_ready_context(|status, identity, _| {
@@ -492,6 +490,23 @@ impl Registry {
         }
         Ok(())
     }
+
+    fn authorize(&self, id: &Identifier, expected: &Principal) -> Result<Principal, SessionError> {
+        if self.closed {
+            return Err(SessionError::Expired);
+        }
+        let entry = self.sessions.get(id).ok_or(SessionError::Expired)?;
+        if entry.replaced {
+            return Err(SessionError::Replaced);
+        }
+        if entry.view.principal.agent_id.is_none() {
+            return Err(SessionError::AgentUnregistered);
+        }
+        if &entry.view.principal != expected {
+            return Err(SessionError::Identity(IdentityError::Forbidden));
+        }
+        Ok(entry.view.principal.clone())
+    }
 }
 
 /// 외부에서 접근하는 세션 관리자 (Thread-safe)
@@ -567,8 +582,8 @@ impl SessionManager {
     ) -> Result<Session, SessionError> {
         let principal = self.resolve(agent.as_ref()).await?;
         let mut registry = self.registry.lock().await;
-        let now = Instant::now();
         self.with_context(&mut registry, |registry, current| {
+            let now = Instant::now();
             registry.expire(now);
             check_current_principal(&principal, current)?;
             registry.claim(instance, mode, agent.as_ref(), principal, now, self.lease)
@@ -594,8 +609,8 @@ impl SessionManager {
         }
         let principal = self.resolve(Some(&agent)).await?;
         let mut registry = self.registry.lock().await;
-        let now = Instant::now();
         self.with_context(&mut registry, |registry, current| {
+            let now = Instant::now();
             registry.expire(now);
             registry.current(id, instance)?;
             check_current_principal(&principal, current)?;
@@ -610,12 +625,22 @@ impl SessionManager {
         id: &Identifier,
         instance: &Identifier,
     ) -> Result<(), SessionError> {
+        // Reject stale or foreign local sessions before any central request.
+        // Do not keep the registry lock across the identity provider await.
+        {
+            let mut registry = self.registry.lock().await;
+            self.with_context(&mut registry, |registry, _| {
+                registry.expire(Instant::now());
+                registry.current(id, instance).map(|_| ())
+            })
+            .await?;
+        }
         if self.identity.requires_live_check() {
             self.resolve(None).await?;
         }
         let mut registry = self.registry.lock().await;
-        let now = Instant::now();
         self.with_context(&mut registry, |registry, current| {
+            let now = Instant::now();
             registry.expire(now);
             check_current_principal(&registry.current(id, instance)?.view.principal, current)?;
             registry.renew(id, instance, now, self.lease)
@@ -632,30 +657,38 @@ impl SessionManager {
         id: &Identifier,
         expected: &Principal,
     ) -> Result<Principal, SessionError> {
+        // Validate local ownership and caller context before resolving a legacy
+        // reconnect. Unrelated/stale requests must not trigger central IO.
+        {
+            let mut registry = self.registry.lock().await;
+            self.with_context(&mut registry, |registry, _| {
+                registry.expire(Instant::now());
+                registry.authorize(id, expected).map(|_| ())
+            })
+            .await?;
+        }
+        if self.identity.requires_live_check() {
+            let needs_context = self
+                .central
+                .with_ready_context(|status, identity, _| {
+                    status == ConnectionStatus::Connected
+                        && identity.is_some_and(|identity| {
+                            identity.user_id.is_none() || identity.team_id.is_none()
+                        })
+                })
+                .await;
+            if needs_context {
+                self.resolve(None).await?;
+            }
+        }
         let mut registry = self.registry.lock().await;
         self.with_context(&mut registry, |registry, current| {
-            // 만료된 세션 정리
+            // Recheck after the await: release, replacement, expiry or a central
+            // subject change may have happened while resolving identity.
             registry.expire(Instant::now());
-            if registry.closed {
-                return Err(SessionError::Expired);
-            }
-            // 세션 존재 여부 확인
-            let entry = registry.sessions.get(id).ok_or(SessionError::Expired)?;
-            // 새 세션으로 대체(replaced)되었는지 확인
-            if entry.replaced {
-                return Err(SessionError::Replaced);
-            }
-            // 에이전트가 정상 바인딩/등록되어 있는지 확인
-            if entry.view.principal.agent_id.is_none() {
-                return Err(SessionError::AgentUnregistered);
-            }
-            // 세션에 등록된 Principal(사용자, 팀, 에이전트)과 요청된 Principal이 정확히 일치하는지 검증
-            if &entry.view.principal != expected {
-                return Err(SessionError::Identity(IdentityError::Forbidden));
-            }
-            // 중앙 서버(WebSocket)와의 신원 연결 상태와 일치하는지 검증
-            check_current_principal(&entry.view.principal, current)?;
-            Ok(entry.view.principal.clone())
+            let principal = registry.authorize(id, expected)?;
+            check_current_principal(&principal, current)?;
+            Ok(principal)
         })
         .await
     }

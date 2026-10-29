@@ -138,7 +138,7 @@ async fn revoked_token_cannot_renew_and_invalidates_previous_ownership() {
     *mock.response.lock().await = (StatusCode::OK, body());
     assert_eq!(
         manager.heartbeat(&old.session_id, &id("host")).await,
-        Err(SessionError::Identity(IdentityError::Unauthenticated))
+        Err(SessionError::Expired)
     );
     let next = state.begin_session().await;
     next.set_identity(identity("after-revocation")).await;

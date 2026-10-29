@@ -1,5 +1,9 @@
 # 로컬 검증 기록
 
+## 2026-10-29: Gemini 지적 4건 후속 보완
+
+기준 e69f363의 Gemini 리뷰를 재현해 동시 context 보완/거부 처리, legacy 재접속 즉시 업무 인가, heartbeat 로컬 오류 우선, AuthFailed 후 WS 수신·ACK 차단을 수정했다. 추가로 잠금 대기 중 90초 만료 경계를 넘는 heartbeat의 부활을 막았다. 최종 Rust 전체 129개, SDK 명시 2개, MCP 100개, 별도 DELETE wire 1개와 포맷·Clippy·diff 검사가 통과했다. 실제 중앙·DB 재실행과 수정본에 대한 Gemini/Opus 재승인은 하지 않았다. 변경은 rust/에만 있으며 커밋하지 않았다. [후속 수정 상세](session-story-verification.md)의 마지막 절을 따른다.
+
 ## 2026-10-29: 추가 검토·A→B→A legacy 소유권 차단
 
 legacy READY의 Agent 전환 A→B→A에서 이전 세션이 유지되는 결함을 테스트로 재현하고 같은 Agent 재접속에서만 소유권을 보존하도록 수정했다. 최신 Rust 기본 회귀 112개는 기대값 1건 수정 후 분할 재실행을 포함해 최종 통과했고 SDK 2개(96.25초), MCP 101개, 포맷·Clippy·diff 검사도 통과했다. 최초 workspace 실행의 실패와 개별 재실행을 [세션 검증 기록](session-story-verification.md)의 마지막 절에 구분했다. 이번에는 실제 중앙/DB를 다시 기동하지 않았다. Opus 검토·커밋은 미실행이다.

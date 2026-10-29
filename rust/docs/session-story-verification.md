@@ -151,3 +151,60 @@ node --test rust/crates/devlink-broker/tests/support/session-delete-wire.test.mj
 ```
 
 이후 MCP의 기본 npm test 대상은 기존 100개이고 옮긴 wire 회귀 1개는 별도다. 위의 101개 통과 기록은 이동 전 실제 실행 기록이다. Rust 밖에 남긴 변경은 `packages/mcp-server/src/broker/http.ts`의 Content-Length 수정뿐이다. 이를 제거하면 Node DELETE의 requestId/instanceId 본문이 Rust에 전달되지 않아 세션 해제와 즉시 OFFLINE 검증이 실패하므로 기능 보존을 위해 유지했다.
+
+## Gemini 리뷰 후속 수정 (기준 커밋 e69f363)
+
+사용자가 제공한 Gemini 아르곤 리뷰의 4건을 재현한 뒤 수정했다. 이번 후속 변경은 전부 rust/ 안에 있으며 기존 커밋을 다시 쓰거나 새 커밋을 만들지 않았다.
+
+| 리뷰 지적 | 보완 내용 | 회귀 |
+| --- | --- | --- |
+| 1. legacy 동시 resolve의 보완/401 누락 | 연결 fence는 generation·connection_id·agent_id로 확인하고, 이미 보완된 user/team과 새 응답의 일관성을 별도 검사한다. 동일 연결의 인증 거부는 보완 여부와 무관하게 적용하며 이전 generation의 거부는 새 연결에 적용하지 않는다. | context_concurrency.rs 5개: 200/200, 200→401, 401→200, user/team 모순, 동일 wire ID를 재사용한 새 generation 보존 |
+| 2. 재접속 후 첫 heartbeat 전 authorize 실패 | 먼저 로컬 세션/principal을 검사하고, legacy 신원 미확정일 때만 잠금 밖 context 조회 후 최종 검사한다. 이미 보완된 신원은 추가 REST를 호출하지 않는다. | session_validation.rs의 즉시 인가·REST 횟수·조회 중 해제/교체 검증 |
+| 3. stale heartbeat가 중앙 장애로 가려짐 | 만료·교체·instance를 REST 전에 검사하고 응답 후에도 최종 재검증한다. 무효화 후 정리된 세션은 중앙 인증 오류보다 SESSION_EXPIRED가 먼저 나올 수 있으며 기존 기대값도 이에 맞췄다. | session_validation.rs의 stale/foreign/released/missing·Reconnecting·조회 중 해제 검증 |
+| 4. AuthFailed 후 저장/ACK 가능 | 식별자 제거 및 generation별 인증 무효화 알림으로 WS를 종료한다. TASK_CREATED와 ACK 직전에도 현재 generation·Connected·identity를 검사한다. ACK 네트워크 전송은 제한된 read lock 안에서 수행해 무효화 쓰기와 순서를 보장한다. | auth_invalidation.rs 4개 및 central_auth_tests.rs 1개 |
+
+인증 유효 시 이미 접수해 시작한 디스크 쓰기는 무효화 뒤 완료·보존될 수 있다. 이를 삭제하거나 중앙 업무 실패로 바꾸지 않는다. 다만 무효화 이후 해당 기록의 ACK는 송신하지 않고, 무효화 후 새로 도착한 작업은 저장하지 않는다. 무효화와 I/O 실패가 경합하는 WS 종료도 한 번의 잠금 안에서 AuthFailed 우선 판정과 identity 제거를 수행해 자동 재접속으로 잘못 넘어가지 않게 했다.
+
+독립 코드 검토 중 추가 lease 경계도 발견해 재현·보완했다. 기존 claim/bind/heartbeat는 중앙 신원 잠금을 기다리기 전 시각을 캡처했다. 85초에 heartbeat가 신원을 확인하고 잠금을 기다린 뒤 91초에 처리될 때 기존 코드는 만료 세션을 갱신했다. 최종 상태 변경 closure 안에서 시각을 읽도록 바꿨다. 새 unit 회귀는 생산 lease 90초를 유지하고 테스트 시계만 85→91초로 이동한다. Tokio test-util은 dev-dependency 기능에만 추가했고 Cargo.lock이나 운영 의존성 버전은 바꾸지 않았다.
+
+신규 회귀는 총 17개(동시성 5, 수신 차단 4, 대기 ACK 1, 세션 검증 6, 시계 경계 1)다. 별도 에이전트로 구현과 검토를 분담했으며 이는 지정 Opus나 Gemini가 수정본을 다시 승인한 기록이 아니다.
+
+검증 구간은 실제 Rust 상태·loopback HTTP/WS와 합성 중앙 응답·임시 수신함이다. 이전 실제 중앙 30b7d70/PostgreSQL 실행 기록과 구분하며, 이번 수정에서 실제 중앙/DB를 다시 기동하지 않았다. 실제 Host·-91·-52·-66 및 커밋의 미완료 경계는 유지한다.
+
+최종 실행 결과:
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo test --locked --workspace --all-targets` | 최종 종료 0. 기본 회귀 129개 통과, 실패 0, SDK 2개는 기본 실행에서 ignored. 로그는 ignored `rust/target/gemini-followup-tests.log` |
+| SDK 2개 명시 실행 | 2 통과, 96.28초. 실제 MCP 소스 빌드와 Rust HTTP, 중앙 응답은 fixture. 마지막 WS 종료 원자화 이후에는 아래 수신/인증 회귀를 포함한 기본 129개를 재실행했다. |
+| `npm test` (packages/mcp-server) | 기존 100개 통과, 타입·공유 계약 검사 포함 |
+| 옮긴 DELETE wire 테스트 | 1 통과, UTF-8 본문 및 종료 중 DELETE 검사 |
+| `cargo fmt --all --check`, 전체 targets Clippy `-D warnings`, diff 검사 | 종료 0. Clippy 초기 새 테스트의 collapsible_if 지적은 수정 후 재통과. 캐시 hard-link 대신 복사하는 환경 경고가 나올 수 있음 |
+
+기본 129개의 구성은 lib 42, agent_context 7, auth_invalidation 4, context_concurrency 5, session_api 7, session_validation 6, task_creation 9, task_receipts 3, CLI auth 8, CLI broker 33, CLI teams 5다. 검토 중 발견한 새 결함을 재현하는 실패와 수정 뒤 최종 통과를 분리했으며, 이전 커밋의 테스트 통과만으로 이 후속 수정의 성공을 판단하지 않았다.
+
+## 2026-10-29 Gemini 수정본 최종 연동 재검증
+
+대상은 `e69f363`에 현재 미커밋 Rust 수정분을 더한 상태다. 사용자가 제공한 Gemini 재검토는 기존 지적 4건의 해결을 확인했고 새 수정 요구는 없었다. 보고서의 Rust 전체 테스트 101개 표기는 앞선 직접 재실행 결과와 다르다. 실제 `cargo test --locked --workspace --all-targets` 결과는 129개 통과, 실패 0, SDK 2개 ignored이며 로그는 ignored `rust/target/gemini-rereview-workspace-tests.log`다. 지정 Opus 검토가 수행됐다는 뜻은 아니다.
+
+이번에는 최신 Rust CLI를 `cargo build --locked -p devlink-cli`로 빌드하고 MCP 소스도 다시 타입 빌드했다. 중앙은 이전에 고정한 `30b7d7073150771b2e83877d7edee71baee7c56f`의 서버이며 최신 develop으로 표현하지 않는다. archive의 commit comment를 확인하고 중앙 소스 168개 파일을 archive와 SHA-256 대조해 불일치 0을 확인했다. 사용한 jar SHA-256은 `DA0888A576251E49933500FFB6BA780FEE31D9048AE99DA47897836F66A7A3E0`이다.
+
+실제 중앙은 별도 loopback 임시 포트, DB는 새 임시 PostgreSQL 17.11 클러스터와 전용 `devlink_session_test` 역할/DB를 사용했다. 합성 사용자를 실제 세션·CSRF로 가입/로그인시켜 팀·Agent·연결 토큰을 발급했다. 이 테스트 중앙 프로세스에만 `ddl-auto=update`, Flyway 비활성화를 적용했으므로 운영 마이그레이션 검증으로 해석하지 않는다. 기존 서버·DB·중앙 소스는 변경하지 않았다.
+
+| 검증 | 이번 실행 결과와 증거 범위 |
+| --- | --- |
+| SDK MCP → 실제 Rust, 명시 SDK 2개 실행 | 2개 통과, 실패 0, 92.40초. 실제 90초 lease 만료, 소유권 교체, 신원 위조 거부 및 업무 호출/오류 동작을 검사한다. 중앙 업무 응답과 READY 신원은 fixture이므로 실제 중앙·DB 증거와 구분한다. 로그: ignored `rust/target/final-sdk-integration.log` |
+| 실제 중앙·PostgreSQL·최신 CLI·실제 SDK | `node rust/scripts/verify-sessions.mjs` 종료 0. `passed`, `actualCentral`, `actualPostgres`, `actualSdkSession` 모두 true. 로그: ignored `rust/target/session-central/final-actual-integration.log` |
+| 검증된 principal·bind | 실제 중앙 user/team 일치, 다른 Agent bind 거부, 정상 bind 성공 |
+| 소유권 | fresh 교체, 동일 instance recover 멱등, 늦은 recover 충돌, 이전 owner heartbeat/DELETE 거부, 새 owner heartbeat 성공 |
+| presence 생산 호출 → 중앙 수신 → 실제 SQL | DB ONLINE 및 last_seen_at 기록, DELETE/SDK 종료 시 OFFLINE 확인 |
+| 실제 로컬 브로커 재시작 | 이전 세션 heartbeat 만료, 첫 recover 소유권 획득, 뒤늦은 이전 owner recover 충돌 |
+| lease | 실제 91초 대기 후 DB OFFLINE 및 old heartbeat SESSION_EXPIRED, 명시 recover 후 ONLINE |
+| 실제 중앙 토큰 교체 | DB OFFLINE 및 기존 자격의 heartbeat 거부 확인 |
+| DELETE UTF-8 본문 wire 회귀 | 1개 통과. 초기 샌드박스 loopback 연결 거부 후 같은 테스트를 승인된 외부 실행으로 재검증했다. 기능 코드는 바꾸지 않았다. |
+
+실제 중앙을 사용한 SDK 검증은 선행 세션 수립과 종료, DB ONLINE/OFFLINE을 검사한다. 기존 `list_agents` 로컬 provider는 여전히 404이며 도구 결과는 BROKER_PROTOCOL_ERROR다. `adapter.state=bound`로 세션만 판정했고 목록 도구의 성공으로 처리하지 않았다. 실제 Codex/Claude Host, 중앙 프로세스 재시작, 두 실제 브로커 경쟁 연결 전체 시나리오, -91 bootstrap 자동화, -52 전체 통합 및 -66 A→B/B→A는 이 실행의 완료 범위에 포함하지 않는다.
+
+종료 직전 SQL에서 `status=OFFLINE`, `last_seen_at IS NOT NULL=true`를 다시 읽었다. 이번에 시작한 중앙 PID와 jar 경로를 대조해 종료하고 전용 data 경로의 pg_ctl로 DB를 정상 종료했다. 검증한 임시 경로 안의 DB·자격·PostgreSQL 바이너리/zip을 제거했으며 기존 프로세스는 건드리지 않았다. 정리 결과는 ignored `rust/target/session-central/final-cleanup-result.json`에 저장했다. 최초 환경 시작은 자동 승인 검토의 사용량 제한으로 실행되지 않았고 사용자 재시도 요청 뒤 정상 실행했다. 이를 기능 테스트 실패로 합산하지 않는다.
+
+이번 최종 연동 확인에서 기능 소스 수정이나 커밋은 하지 않았고 이 문서에 검증 결과만 추가했다.
