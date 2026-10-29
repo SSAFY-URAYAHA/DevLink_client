@@ -57,6 +57,75 @@ pub enum ClientMessage {
     /// 로컬 Agent 접속 상태 보고 메시지
     AgentPresence(AgentPresencePayload),
     Heartbeat(HeartbeatPing),
+    /// 수신함 내구 기록 후에만 전송합니다. 읽기·수락·업무 완료가 아닙니다.
+    Ack(TaskAckPayload),
+}
+
+/// 중앙 TASK_CREATED의 top-level event_id와 payload 형식을 유지합니다.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCreatedEvent {
+    #[serde(rename = "type")]
+    pub kind: TaskCreatedKind,
+    pub event_id: String,
+    pub payload: TaskCreatedPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskCreatedKind {
+    #[serde(rename = "TASK_CREATED")]
+    TaskCreated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCreatedPayload {
+    pub task_id: u64,
+    pub team_id: u64,
+    pub requester_agent_id: u64,
+    pub receiver_agent_id: u64,
+    pub prompt: String,
+    /// 중앙 LocalDateTime 문자열이며 클라이언트 시각/시간대 권한으로 쓰지 않습니다.
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskAckPayload {
+    pub event_id: String,
+    pub task_id: u64,
+}
+
+impl TaskCreatedEvent {
+    /// 신원은 현재 인증 연결의 READY Agent와 대조합니다. payload로 actor를 만들지 않습니다.
+    pub fn is_valid_for(&self, authenticated_agent: u64) -> bool {
+        let p = &self.payload;
+        !self.event_id.trim().is_empty()
+            && self.event_id.encode_utf16().count() <= 128
+            && !self.event_id.chars().any(char::is_control)
+            && [
+                p.task_id,
+                p.team_id,
+                p.requester_agent_id,
+                p.receiver_agent_id,
+                authenticated_agent,
+            ]
+            .into_iter()
+            .all(|id| id > 0 && id <= i64::MAX as u64)
+            && p.receiver_agent_id == authenticated_agent
+            && !p.prompt.trim().is_empty()
+            && p.prompt.len() <= 65_536
+            && !p.created_at.trim().is_empty()
+            && p.created_at.len() <= 64
+            && !p.created_at.chars().any(char::is_control)
+    }
+
+    pub fn acknowledgement(&self) -> TaskAckPayload {
+        TaskAckPayload {
+            event_id: self.event_id.clone(),
+            task_id: self.payload.task_id,
+        }
+    }
 }
 
 impl ClientMessage {

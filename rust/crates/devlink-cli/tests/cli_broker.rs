@@ -19,7 +19,7 @@ use tokio::{
     net::TcpListener,
     sync::{Mutex, RwLock},
     task::{JoinHandle, JoinSet},
-    time::{Instant, sleep},
+    time::{Instant, sleep, timeout},
 };
 use tokio_tungstenite::{
     accept_hdr_async,
@@ -110,6 +110,199 @@ fn text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_dedup_survives_real_cli_broker_process_restart() {
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    f.configure(|config| {
+        config.server_url = format!("ws://{address}/ws/broker");
+        config.auto_reconnect = false;
+    });
+    let event: devlink_broker::protocol::TaskCreatedEvent =
+        serde_json::from_value(serde_json::json!({
+            "type": "TASK_CREATED", "event_id": "event-real-process-restart-100",
+            "payload": {
+                "task_id": 100, "team_id": 3, "requester_agent_id": 11,
+                "receiver_agent_id": 22, "prompt": "프로세스 재시작 수신함 검증용 요청",
+                "created_at": "2026-10-29T12:00:00"
+            }
+        }))
+        .unwrap();
+    let server_event = event.clone();
+    let observer_path = f.path.clone();
+    let (acknowledged, mut acknowledgements) = tokio::sync::mpsc::channel(2);
+    let server = tokio::spawn(async move {
+        for connection in 1..=2 {
+            let (stream, _) = timeout(Duration::from_secs(30), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = accept_hdr_async(
+                stream,
+                |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
+                    assert_eq!(request.uri().path(), "/ws/broker");
+                    assert_eq!(
+                        request.headers().get(AUTHORIZATION).unwrap(),
+                        &format!("Bearer {TOKEN}")
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let ready = ServerMessage::BrokerReady(devlink_broker::protocol::BrokerReadyPayload {
+                connection_id: format!("process-restart-{connection}"),
+                agent_id: 22,
+            });
+            socket
+                .send(Message::Text(serde_json::to_string(&ready).unwrap().into()))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&server_event).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            let mut got_ack = false;
+            loop {
+                let frame = timeout(Duration::from_secs(15), socket.next())
+                    .await
+                    .unwrap();
+                match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<ClientMessage>(&text).unwrap() {
+                            ClientMessage::Ack(payload) => {
+                                assert!(
+                                    !got_ack,
+                                    "No duplicate positive ACK without another event"
+                                );
+                                assert_eq!(payload, server_event.acknowledgement());
+                                let observer =
+                                    devlink_broker::inbox::Inbox::for_config(&observer_path);
+                                assert_eq!(
+                                    observer.list(20).await.unwrap(),
+                                    vec![server_event.clone()],
+                                    "A new process's ACK must follow the same durable single record"
+                                );
+                                got_ack = true;
+                                acknowledged.send(connection).await.unwrap();
+                            }
+                            ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }) => {
+                                socket
+                                    .send(Message::Text(
+                                        serde_json::to_string(&ServerMessage::heartbeat_pong(
+                                            ping_id,
+                                        ))
+                                        .unwrap()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                            }
+                            ClientMessage::AgentPresence(_) => panic!(
+                                "Inbox reception alone must not assert local session presence"
+                            ),
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        socket.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        assert!(got_ack);
+                        let _ = socket.close(None).await;
+                        break;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    other => panic!("Unexpected process-restart socket frame: {other:?}"),
+                }
+            }
+        }
+    });
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Connected).await;
+    assert_eq!(
+        timeout(Duration::from_secs(15), acknowledgements.recv())
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    let first_instance = f.health().await.instance_id;
+    let snapshot = config::state_directory(&f.path).join("inbox/tasks.json");
+    let original = std::fs::read(&snapshot).unwrap();
+    f.ok(&["stop"]);
+    assert!(!local::running(&f.path).unwrap());
+    assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Connected).await;
+    assert_ne!(
+        f.health().await.instance_id,
+        first_instance,
+        "The second receipt must use a new broker process instance"
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(15), acknowledgements.recv())
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        std::fs::read(&snapshot).unwrap(),
+        original,
+        "Duplicate receipt after process restart must not change journal bytes"
+    );
+    let shown: Vec<devlink_broker::protocol::TaskCreatedEvent> =
+        serde_json::from_str(&f.ok(&["inbox", "list"])).unwrap();
+    assert_eq!(shown, vec![event]);
+    f.ok(&["stop"]);
+    timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbox_commands_read_without_accepting_and_only_clear_while_stopped() {
+    let f = Fixture::new();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&f.ok(&["inbox"])).unwrap(),
+        serde_json::json!([])
+    );
+    assert!(!f.run(&["inbox", "list", "--limit", "0"]).status.success());
+    assert!(
+        !f.run(&["inbox", "list", "--limit", "1001"])
+            .status
+            .success()
+    );
+    let event:devlink_broker::protocol::TaskCreatedEvent=serde_json::from_value(serde_json::json!({"type":"TASK_CREATED","event_id":"event-cli-100","payload":{"task_id":100,"team_id":3,"requester_agent_id":11,"receiver_agent_id":22,"prompt":"\u{1b}[31m\u{9b}31m\u{7f}\u{202e}\u{2066}수락 전 실행 금지","created_at":"2026-10-29T12:00:00"}})).unwrap();
+    let inbox = devlink_broker::inbox::Inbox::for_config(&f.path);
+    inbox.record(event.clone(), 22).await.unwrap();
+    let output = f.ok(&["inbox", "list", "--limit", "1"]);
+    assert!(
+        !output.contains('\u{1b}'),
+        "Remote terminal controls must be escaped in JSON output"
+    );
+    for ch in ['\u{9b}', '\u{7f}', '\u{202e}', '\u{2066}'] {
+        assert!(!output.contains(ch));
+    }
+    let shown: Vec<devlink_broker::protocol::TaskCreatedEvent> =
+        serde_json::from_str(&output).unwrap();
+    assert_eq!(shown, vec![event.clone()]);
+    let snapshot = config::state_directory(&f.path).join("inbox/tasks.json");
+    let original = std::fs::read(&snapshot).unwrap();
+    f.ok(&["start"]);
+    assert!(f.health().await.inbox.is_some());
+    assert!(f.ok(&["status"]).contains("Inbox rejects"));
+    assert!(!f.run(&["inbox", "clear"]).status.success());
+    assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+    f.ok(&["stop"]);
+    f.ok(&["inbox", "clear"]);
+    assert!(!snapshot.exists());
+    assert!(inbox.list(20).await.unwrap().is_empty());
 }
 
 struct OwnedProcess(Child);

@@ -2,6 +2,10 @@
 
 Rust CLI와 독립 로컬 브로커입니다. CLI는 설정과 프로세스 수명 주기를 관리하고, 브로커는 로컬 제어 API와 중앙 서버 WebSocket 연결을 관리합니다.
 
+`TASK_CREATED`의 private 수신함·저장 후 ACK, `devlink inbox` 조회와 보관 정리는 [수신함 문서](docs/inbox.md)를 참고합니다. 사용자 수락·업무 상태 변경·실제 중앙 DB 검증은 별도 단계입니다.
+
+2026-10-29 수신함 추가분은 Windows MSVC에서 Rust 전체57건(단위23·소켓3·CLI31), Clippy·포맷 검사를 통과했습니다. 실제 CLI broker 프로세스의 정상 정지·재시작 후 동일 이벤트 ACK와 journal 바이트·단일 작업 표시 보존도 검증했습니다(중앙은 loopback fixture). 인증된 health/status에서 수신 거부 진단을 확인할 수 있습니다. 소표본 ACK 지연과 재현 가능한 측정 example은 [검증 기록](docs/verification.md)에 정리했습니다.
+
 이 디렉터리는 `devlink-cli`(실행 파일)와 `devlink-broker`(라이브러리)로 구성한 Cargo workspace입니다. CLI가 브로커 라이브러리를 참조하며 브로커는 CLI에 의존하지 않습니다. 아래 명령은 저장소 루트에서 `cd rust`로 이동한 뒤 실행합니다.
 
 ## Windows 개발 환경

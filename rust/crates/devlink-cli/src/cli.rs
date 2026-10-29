@@ -40,6 +40,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<McpCommand>,
     },
+    /// Read received task requests. Listing does not accept or execute them.
+    Inbox {
+        #[command(subcommand)]
+        command: Option<InboxCommand>,
+    },
     /// Internal command: run the broker loop in foreground (spawned by start)
     #[command(hide = true)]
     Broker,
@@ -64,6 +69,17 @@ pub enum McpCommand {
     Path,
     /// Rotate the MCP local token (only allowed when broker is stopped)
     Rotate,
+}
+
+#[derive(Subcommand)]
+pub enum InboxCommand {
+    /// Read newest local requests as JSON; no central task state is changed
+    List {
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+    },
+    /// Delete retained request data and dedup history (broker must be stopped)
+    Clear,
 }
 
 /// CLI 진입점: 파싱된 CLI 명령어에 따라 적절한 로직을 라우팅하여 실행합니다.
@@ -105,6 +121,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     "Local Broker  : Running (PID: {})\nCentral Server: {:?}",
                     health.pid, health.central_server
                 );
+                if let Some(inbox) = health.inbox {
+                    println!(
+                        "Inbox rejects : {} (last: {:?})",
+                        inbox.rejected_events, inbox.last_error
+                    );
+                }
             }
         }
         // 실행 중인 브로커 정상 종료 (Graceful shutdown)
@@ -143,10 +165,54 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("MCP local token rotated; restart any running MCP server to apply");
             }
         },
+        Commands::Inbox { command } => {
+            let inbox = devlink_broker::inbox::Inbox::for_config(&path);
+            match command.unwrap_or(InboxCommand::List { limit: 20 }) {
+                InboxCommand::List { limit } => {
+                    let json = serde_json::to_string_pretty(&inbox.list(limit as usize).await?)?;
+                    println!("{}", escape_json_display(&json));
+                }
+                InboxCommand::Clear => {
+                    match std::fs::symlink_metadata(state_directory(&path)) {
+                        Ok(_) => devlink_broker::credentials::verify_parent_safety(
+                            &state_directory(&path),
+                        )?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            println!("Inbox already empty");
+                            return Ok(());
+                        }
+                        Err(_) => bail!("Cannot inspect inbox state directory"),
+                    }
+                    let _guard = config::lock(&state_directory(&path).join("control.lock"))?;
+                    anyhow::ensure!(
+                        !local::running(&path)?,
+                        "Stop the broker before clearing inbox retention and dedup history"
+                    );
+                    let _broker_guard = config::lock(&state_directory(&path).join("broker.lock"))?;
+                    inbox.clear().await?;
+                    println!("Inbox data and dedup history cleared; no central task was changed");
+                }
+            }
+        }
         // 포그라운드에서 직접 브로커 통신 루프 실행 (start 명령어로 생성된 자식 프로세스가 실행)
         Commands::Broker => broker::run(&path).await?,
     }
     Ok(())
+}
+
+/// Keep JSON round-trippable while escaping non-ASCII terminal and bidi formatting controls.
+fn escape_json_display(json: &str) -> String {
+    let mut output = String::with_capacity(json.len());
+    for ch in json.chars() {
+        if matches!(ch,'\u{007f}'..='\u{009f}'|'\u{061c}'|'\u{200b}'..='\u{200f}'|'\u{2028}'..='\u{202e}'|'\u{2060}'..='\u{206f}'|'\u{feff}')
+        {
+            use std::fmt::Write;
+            write!(&mut output, "\\u{:04x}", ch as u32).expect("writing into String");
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }
 
 /// 브로커를 터미널과 분리된 백그라운드 독립 프로세스로 구동하고 정상 기동을 검증합니다.

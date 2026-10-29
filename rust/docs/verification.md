@@ -1,5 +1,23 @@
 # 로컬 검증 기록
 
+## 2026-10-29: S15P31D108-95 수신함·ACK
+
+`feature/ai/task-inbox-95`, client base b8bd142와 중앙 source5891ef2 기준이다. 초기 Windows MSVC 전체54건(단위21·실제 loopback소켓3·CLI30)이 통과했다. Opus 검토 후 health/CLI 실패 진단, C1/DEL/bidi 출력 escape, 전역 writer 상한·정지 fencing과 원자 batch 저장을 추가했다. 최종 검사 결과는 아래 표에 기록한다. 실제 중앙 인증/DB·두 사용자 수용은 미검증이다.
+
+동일 환경에서 단건5회/16건 burst의 실제 파일·ACL·소켓 ACK 지연을 측정했다. 초기 burst p95는12282.58ms이며10/16건이5초를 넘었다. 최대5ms 수집 후 한 snapshot으로 원자 발행하도록 바꿔, 단건 p50/p95 797.44/826.82ms, burst p50/p95 881.71/881.84ms,5초 초과0/16을 확인했다. 소표본·debug/loopback 측정이며 운영 SLA를 뜻하지 않는다. [재현 도구·정책](inbox.md)을 참조한다.
+
+| 최종 검사 | 결과 |
+| --- | --- |
+| Windows MSVC 전체 Rust / all-targets | 57건 통과: 단위23·inbox소켓3·CLI31, 실패/무시0. examples도 컴파일·test target 확인 |
+| Clippy / fmt | --workspace --all-targets -- -D warnings 및 fmt --all -- --check 통과 |
+| MCP health 필드 호환 | MCP build와 readiness 회귀9건 통과. 선택적 inbox를 받아들이고 안전한 centralServer만 보고서에 복사함 |
+| 실제 중앙 DB·MCP 세션·두 사용자 | 미검증: -49/-84/-91/-92 및 후속 업무 provider 필요 |
+
+커밋 전 Claude Code CLI `claude-opus-5-5`, effort `high`로 2회 검토했다. 첫 검토의 실패 진단·Windows 지연·출력 escape를 보완했고, 포맷 실패 추정은 실제 검사로 확인했다. 최종은 확정 P1/P2 없음·커밋 가능 판정이었다. 추가 확인 C-1(health shape)은 `integration-readiness.mjs`의 추가 필드 허용/안전한 필드 복사를 읽고, 실제 `inbox` 필드를 readiness fixture에 포함해9건 통과로 확인했다. 실제 중앙 통합/Jira Done 판정을 대신하지 않는다.
+
+같은 날 실제 CLI 프로세스 재시작 회귀를 추가했다. `devlink start`로 수신·ACK 후 정지하고 다시 시작한 별도 broker instanceId에서 동일 이벤트를 재수신했다. 두 ACK의 event/task를 대조하고 ACK 수신 직후 테스트 프로세스의 별도 Inbox 인스턴스에서 단일 작업 표시, 정지 전후·재수신 후 journal 바이트 동일성을 확인했다. 새 테스트 단독1건과 전체57건, Clippy·fmt가 통과했다. 중앙 소켓은 fixture이며 production 인증/DB 검증은 추가하지 않았다. 추가분도 `claude-opus-5-5`, effort high로 검토해 확정 P1/P2 없음·amend 가능 판정을 받았다. 테스트 실패 문구와 README의 fixture 범위는 P3 의견에 맞게 정밀화했다.
+
+
 ## 2026-10-28: 실시간 45초 연결 유지 자동 회귀 추가
 
 `feature/rust/broekr_sessionapi`의 `6e6fd78` 이후 작업 트리에 `json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect`를 추가했습니다. 앞서 별도 실행으로 확인한 45초 유지 검증을 Rust CLI 통합 테스트로 저장했으며 `#[ignore]` 없이 기본 전체 테스트에 포함합니다.

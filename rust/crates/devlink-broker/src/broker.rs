@@ -32,6 +32,7 @@ struct ApiState {
     cancel: CancellationToken,
     /// MCP 클라이언트용 로컬 인증 토큰
     mcp_token: Arc<String>,
+    inbox: crate::inbox::Inbox,
 }
 
 /// 브로커 종료 시 런타임 파일(runtime.json)을 자동으로 정리(삭제)하는 RAII 가드
@@ -82,11 +83,13 @@ pub async fn run(path: &Path) -> Result<()> {
     let central_state = CentralState::new(status);
 
     // 중앙 서버와 통신하는 비동기 태스크 시작
-    let central = tokio::spawn(central::run_with_state(
+    let inbox = crate::inbox::Inbox::for_config(path);
+    let central = tokio::spawn(central::run_with_inbox(
         config,
         token,
         central_state.clone(),
         cancel.clone(),
+        inbox.clone(),
     ));
 
     // 로컬 제어 API 라우터 설정 (/health, /shutdown)
@@ -99,6 +102,7 @@ pub async fn run(path: &Path) -> Result<()> {
             central: central_state,
             cancel: cancel.clone(),
             mcp_token,
+            inbox: inbox.clone(),
         });
 
     // Graceful Shutdown 처리 (취소 토큰 수신 또는 OS 종료 시그널 감지 시)
@@ -124,6 +128,7 @@ pub async fn run(path: &Path) -> Result<()> {
     };
 
     // 중앙 서버 태스크 종료 요청 및 대기 (최대 2초 후 강제 취소)
+    inbox.stop_accepting();
     cancel.cancel();
     let abort = central.abort_handle();
     if timeout(Duration::from_secs(2), central).await.is_err() {
@@ -197,6 +202,7 @@ async fn health(State(state): State<ApiState>, headers: HeaderMap) -> Response {
         pid: state.runtime.pid,
         instance_id: state.runtime.instance_id.clone(),
         central_server: state.central.status().await,
+        inbox: Some(state.inbox.diagnostics()),
     })
     .into_response()
 }

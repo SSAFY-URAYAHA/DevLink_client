@@ -5,10 +5,11 @@
 
 use crate::{
     config::Config,
-    protocol::{ClientMessage, HeartbeatPong, PresenceStatus, ServerMessage},
+    inbox::{Inbox, InboxFailure},
+    protocol::{ClientMessage, HeartbeatPong, PresenceStatus, ServerMessage, TaskCreatedEvent},
 };
 use anyhow::{Result, bail, ensure};
-use futures_util::{Sink, SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -171,6 +172,10 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    async fn is_current(&self) -> bool {
+        self.state.inner.read().await.generation == self.generation
+    }
+
     /// 세대 번호를 반환합니다.
     pub fn generation(&self) -> u64 {
         self.generation
@@ -313,7 +318,18 @@ pub async fn run_with_state(
     state: CentralState,
     cancel: CancellationToken,
 ) {
-    run_with_heartbeat(config, token, state, cancel, HEARTBEAT_TIMING).await;
+    run_with_heartbeat(config, token, state, cancel, HEARTBEAT_TIMING, None).await;
+}
+
+/// Production broker supplies its private inbox; existing transport-only callers do not ACK tasks.
+pub async fn run_with_inbox(
+    config: Config,
+    token: String,
+    state: CentralState,
+    cancel: CancellationToken,
+    inbox: Inbox,
+) {
+    run_with_heartbeat(config, token, state, cancel, HEARTBEAT_TIMING, Some(inbox)).await;
 }
 
 async fn run_with_heartbeat(
@@ -322,11 +338,20 @@ async fn run_with_heartbeat(
     state: CentralState,
     cancel: CancellationToken,
     heartbeat_timing: HeartbeatTiming,
+    inbox: Option<Inbox>,
 ) {
     let mut delay = config.reconnect_initial_ms;
     loop {
         let session_handle = state.begin_session().await;
-        let outcome = session(&config, &token, &session_handle, &cancel, heartbeat_timing).await;
+        let outcome = session(
+            &config,
+            &token,
+            &session_handle,
+            &cancel,
+            heartbeat_timing,
+            inbox.as_ref(),
+        )
+        .await;
         // 연결 세션이 종료되면 해당 세션의 connection_id / agent_id를 즉시 무효화
         session_handle.clear_identity().await;
 
@@ -426,6 +451,7 @@ async fn session(
     handle: &SessionHandle,
     cancel: &CancellationToken,
     heartbeat_timing: HeartbeatTiming,
+    inbox: Option<&Inbox>,
 ) -> Outcome {
     // 연결 전부터 구독해 READY 수신과 구독 사이의 상태 변경을 놓치지 않습니다.
     let mut presence = handle.state.presence.subscribe();
@@ -485,9 +511,39 @@ async fn session(
     tokio::pin!(pong_deadline);
     let mut pending_ping: Option<String> = None;
     let mut ready = false;
+    let mut authenticated_agent = 0;
+    // Disk/ACL work runs on the blocking pool. Socket heartbeats/close continue independently.
+    // Completions belong to this connection only; dropping this set cannot ACK on a new socket.
+    let mut pending_inbox = FuturesUnordered::new();
+    let mut queued_inbox = Vec::new();
+    let flush_inbox = sleep(Duration::from_millis(5));
+    tokio::pin!(flush_inbox);
 
     loop {
         tokio::select! {
+            _ = &mut flush_inbox, if !queued_inbox.is_empty() && pending_inbox.is_empty() => {
+                if let Some(inbox)=inbox {
+                    let inbox=inbox.clone();
+                    let events=std::mem::take(&mut queued_inbox);
+                    pending_inbox.push(async move { inbox.record_batch(events,authenticated_agent).await });
+                }
+            }
+            acknowledgement = pending_inbox.next(), if !pending_inbox.is_empty() => {
+                match acknowledgement {
+                    Some(Ok(payloads)) => {
+                        for payload in payloads {
+                            if !handle.is_current().await { return Outcome::Stopped; }
+                            let text = serde_json::to_string(&ClientMessage::Ack(payload))
+                                .expect("serializable inbox ACK");
+                            if !matches!(timeout(Duration::from_secs(1), socket.send(Message::Text(text.into()))).await, Ok(Ok(()))) {
+                                return Outcome::Retry { was_connected: true };
+                            }
+                        }
+                    }
+                    Some(Err(_)) => eprintln!("Inbox persistence failed; TASK_CREATED was not acknowledged"),
+                    None => {}
+                }
+            }
             // 브로커 종료 요청 시 정상적으로 웹소켓 Close 프레임 전송 후 종료
             _ = cancel.cancelled() => {
                 let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
@@ -569,6 +625,7 @@ async fn session(
                         if !ready {
                             match serde_json::from_str::<ServerMessage>(&text) {
                                 Ok(ServerMessage::BrokerReady(payload)) if payload.is_valid() => {
+                                    authenticated_agent = payload.agent_id;
                                     let identity = CentralIdentity {
                                         connection_id: payload.connection_id,
                                         agent_id: payload.agent_id,
@@ -603,6 +660,22 @@ async fn session(
                                 }
                             }
                         } else {
+                            if let Ok(event) = serde_json::from_str::<TaskCreatedEvent>(&text) {
+                                if event.is_valid_for(authenticated_agent)
+                                    && let Some(inbox) = inbox
+                                {
+                                    if queued_inbox.len() < 16 {
+                                        if queued_inbox.is_empty() { flush_inbox.as_mut().reset(Instant::now()+Duration::from_millis(5)); }
+                                        queued_inbox.push(event);
+                                    } else {
+                                        inbox.rejected(InboxFailure::QueueFull);
+                                        eprintln!("Inbox queue is full; TASK_CREATED was not acknowledged");
+                                    }
+                                } else if let Some(inbox)=inbox {
+                                    inbox.rejected(InboxFailure::InvalidEvent);
+                                }
+                                continue;
+                            }
                             match serde_json::from_str::<ServerMessage>(&text) {
                                 Ok(ServerMessage::Heartbeat(HeartbeatPong::Pong { ping_id })) => {
                                     if pending_ping.as_deref() == Some(ping_id.as_str())
@@ -616,7 +689,12 @@ async fn session(
                                     return Outcome::ProtocolViolation;
                                 }
                                 // 원문은 출력하지 않으며 알 수 없는 메시지로 PONG 대기를 연장하지 않습니다.
-                                Err(_) => {}
+                                Err(_) => {
+                                    if let Some(inbox)=inbox
+                                        && serde_json::from_str::<serde_json::Value>(&text)
+                                            .is_ok_and(|value|value.get("type").and_then(|kind|kind.as_str())==Some("TASK_CREATED"))
+                                    { inbox.rejected(InboxFailure::InvalidEvent); }
+                                }
                             }
                         }
                     }
@@ -792,6 +870,7 @@ mod tests {
                 state.clone(),
                 cancel.clone(),
                 timing,
+                None,
             ));
             Self {
                 state,

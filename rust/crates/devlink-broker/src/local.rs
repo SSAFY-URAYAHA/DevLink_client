@@ -101,6 +101,8 @@ pub struct Health {
     pub pid: u32,
     pub instance_id: String,
     pub central_server: ConnectionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<crate::inbox::InboxDiagnostics>,
 }
 
 /// A held OS lock is authoritative. PID files alone are unsafe because PIDs can be reused.
