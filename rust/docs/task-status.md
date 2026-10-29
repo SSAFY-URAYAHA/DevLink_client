@@ -1,5 +1,7 @@
 # Epic 작업별 현황
 
+2026-10-29: [작업 수신함·ACK](task-inbox.md)를 구현했습니다. TASK_CREATED를 디스크에 저장한 뒤 현재 event_id/task_id로 ACK하며, 재접속·재시작 후 같은 작업은 항목을 추가하지 않습니다. 중앙 신원 공급부·업무 API·실제 Agent 실행은 별도 후속 작업입니다. 저장 후 ACK·누락 복구 정책의 중앙 합의는 아직 필요합니다.
+
 2026-10-28 로컬 세션 구현: 세션 API 4개·fresh/recover·90초 lease·presence 연결을 구현했습니다. 중앙 신원 공급부는 인터페이스로 분리했으며 기본 CLI의 생성 요청은 503 CENTRAL_UNAUTHENTICATED입니다. [로컬 세션 API](local-sessions.md)와 [중앙 WebSocket 규칙](central-websocket-contract.md)에 로컬 검증과 실제 중앙 신원·업무 연동의 남은 범위를 구분합니다.
 
 | Task | 이번 변경 | 남은 완료 조건 |

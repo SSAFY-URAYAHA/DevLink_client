@@ -4,6 +4,8 @@ Rust CLI와 독립 로컬 브로커입니다. CLI는 설정과 프로세스 수�
 
 이 디렉터리는 `devlink-cli`(실행 파일)와 `devlink-broker`(라이브러리)로 구성한 Cargo workspace입니다. CLI가 브로커 라이브러리를 참조하며 브로커는 CLI에 의존하지 않습니다. 아래 명령은 저장소 루트에서 `cd rust`로 이동한 뒤 실행합니다.
 
+2026-10-29: 중앙 `TASK_CREATED` 수신 → 디스크 수신함 저장 → `ACK` 전송을 추가했습니다. 재접속·재시작 후 중복 수신을 구분하고, 저장 실패는 ACK 없이 `InboxFailed`로 중단합니다. 작업 수락·실행·완료와 MCP 업무 조회 API는 후속 연결입니다. [수신함·ACK와 Mock 데모](docs/task-inbox.md)에 보관 위치·제한·실패 정책과 공동 계약이 필요한 항목을 정리했습니다.
+
 ## Windows 개발 환경
 
 1. Visual Studio 2022 Build Tools의 **Desktop development with C++** 워크로드와 Windows SDK를 설치합니다.

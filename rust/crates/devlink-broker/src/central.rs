@@ -5,12 +5,16 @@
 
 use crate::{
     config::Config,
-    protocol::{ClientMessage, HeartbeatPong, PresenceStatus, ServerMessage},
+    inbox::Inbox,
+    protocol::{
+        ClientMessage, HeartbeatPong, PresenceStatus, ServerMessage, TaskAckPayload,
+        TaskCreatedMessage,
+    },
 };
 use anyhow::{Result, bail, ensure};
-use futures_util::{Sink, SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     sync::{RwLock, watch},
     time::{Instant, sleep, timeout},
@@ -54,6 +58,8 @@ pub enum ConnectionStatus {
     Replaced,
     /// Close 1008 또는 잘못된 `BROKER_READY` 등 메시지/정책 위반 (자동 재시도 중단)
     ProtocolViolation,
+    /// 로컬 수신함 영속화 실패 (디스크 오류 등; 재시작 필요)
+    InboxFailed,
     /// 정상/강제 종료 또는 `auto_reconnect=false` 상태에서 연결 해제
     Disconnected,
 }
@@ -94,6 +100,7 @@ pub struct CentralState {
     status: SharedStatus,
     identity: SharedIdentity,
     presence: SharedPresence,
+    inbox: Option<Inbox>,
 }
 
 impl CentralState {
@@ -119,7 +126,13 @@ impl CentralState {
             status,
             identity,
             presence,
+            inbox: None,
         }
+    }
+
+    pub fn with_inbox(mut self, inbox: Inbox) -> Self {
+        self.inbox = Some(inbox);
+        self
     }
 
     /// 새 연결 세션을 시작하며 세대(generation)를 증가시키고 이전 연결의 식별 정보를 즉시 무효화합니다.
@@ -242,6 +255,8 @@ enum Outcome {
     Replaced,
     /// 메시지/정책 위반 또는 잘못된 `BROKER_READY` 수신으로 인한 영구 중단 (Close 1008 등)
     ProtocolViolation,
+    /// 수신함(Inbox) 디스크 저장 실패로 인한 중단
+    InboxFailed,
     /// 브로커 종료 시그널(cancel)에 의한 정상 종료
     Stopped,
 }
@@ -350,6 +365,12 @@ async fn run_with_heartbeat(
             Outcome::ProtocolViolation => {
                 session_handle
                     .set_status(ConnectionStatus::ProtocolViolation)
+                    .await;
+                return;
+            }
+            Outcome::InboxFailed => {
+                session_handle
+                    .set_status(ConnectionStatus::InboxFailed)
                     .await;
                 return;
             }
@@ -485,9 +506,25 @@ async fn session(
     tokio::pin!(pong_deadline);
     let mut pending_ping: Option<String> = None;
     let mut ready = false;
+    // 디스크 저장은 백그라운드 태스크에서 진행되어 PING/PONG 등 소켓 루프를 차단하지 않습니다.
+    // 세션이 끊기면 미완료된 ACK future는 폐기되며, 완료된 디스크 기록은 안전하게 보존되어 새 연결에서 처리됩니다.
+    type Receipt = Pin<Box<dyn Future<Output = Result<TaskAckPayload>> + Send>>;
+    let mut receipts: FuturesUnordered<Receipt> = FuturesUnordered::new();
 
     loop {
         tokio::select! {
+            // 수신함 디스크 저장이 완료되면 중앙 WebSocket으로 ACK 회신
+            saved = receipts.next(), if !receipts.is_empty() => {
+                let Some(Ok(ack)) = saved else {
+                    let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                    return Outcome::InboxFailed;
+                };
+                let text = serde_json::to_string(&ClientMessage::Ack(ack))
+                    .expect("serializable task ACK");
+                if !matches!(timeout(Duration::from_secs(1), socket.send(Message::Text(text.into()))).await, Ok(Ok(()))) {
+                    return Outcome::Retry { was_connected: ready };
+                }
+            }
             // 브로커 종료 요청 시 정상적으로 웹소켓 Close 프레임 전송 후 종료
             _ = cancel.cancelled() => {
                 let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
@@ -615,6 +652,30 @@ async fn session(
                                     let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
                                     return Outcome::ProtocolViolation;
                                 }
+                                Ok(ServerMessage::TaskCreated { event_id, payload }) => {
+                                    let message = TaskCreatedMessage { event_id, payload };
+                                    let identity = handle.state.identity().await;
+                                    // 1. BROKER_READY 완료 여부 및 수신 Agent 일치 검증
+                                    let Some(identity) = identity else { return Outcome::ProtocolViolation; };
+                                    if !message.is_valid() || message.payload.receiver_agent_id != identity.agent_id {
+                                        let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                                        return Outcome::ProtocolViolation;
+                                    }
+                                    let Some(inbox) = handle.state.inbox.clone() else {
+                                        let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                                        return Outcome::InboxFailed;
+                                    };
+                                    // 2. 동시 쓰기 대기열 상한 (16건 초과 시 재연결 유도)
+                                    if receipts.len() >= 16 {
+                                        let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                                        return Outcome::Retry { was_connected: true };
+                                    }
+                                    // 3. 비동기 디스크 기록 작업 큐에 등록 (소켓 이벤트 루프 블로킹 방지)
+                                    let origin = config.server_url.clone();
+                                    receipts.push(Box::pin(async move {
+                                        inbox.record(origin, identity.agent_id, message).await
+                                    }));
+                                }
                                 // 원문은 출력하지 않으며 알 수 없는 메시지로 PONG 대기를 연장하지 않습니다.
                                 Err(_) => {}
                             }
@@ -659,6 +720,123 @@ mod tests {
         task::{JoinHandle, JoinSet},
     };
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+    #[tokio::test]
+    async fn stalled_receipt_storage_keeps_heartbeat_alive_without_early_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let inbox = Inbox::open(&path).unwrap();
+        let (release, paused) = inbox.pause_writes();
+        paused.await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("ws://{}", listener.local_addr().unwrap());
+        let config = Config {
+            server_url: origin.clone(),
+            auto_reconnect: false,
+            ..Config::default()
+        };
+        let state = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)))
+            .with_inbox(inbox.clone());
+        let cancel = CancellationToken::new();
+        let runner = tokio::spawn(run_with_heartbeat(
+            config,
+            "synthetic-token".into(),
+            state.clone(),
+            cancel.clone(),
+            HeartbeatTiming {
+                interval: Duration::from_millis(40),
+                pong_timeout: Duration::from_millis(500),
+            },
+        ));
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        for message in [
+            ServerMessage::BrokerReady(BrokerReadyPayload {
+                connection_id: "stalled-write".into(),
+                agent_id: 12,
+            }),
+            ServerMessage::TaskCreated {
+                event_id: "task-event".into(),
+                payload: crate::protocol::TaskCreatedPayload {
+                    task_id: 101,
+                    team_id: 1,
+                    requester_agent_id: 10,
+                    receiver_agent_id: 12,
+                    prompt: "synthetic slow storage".into(),
+                    created_at: "2026-10-29T09:00:00".into(),
+                },
+            },
+        ] {
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&message).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(3), async {
+            let mut pings = 0;
+            while pings < 3 {
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    panic!("connection closed")
+                };
+                match serde_json::from_str::<ClientMessage>(&text).unwrap() {
+                    ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }) => {
+                        pings += 1;
+                        let pong =
+                            serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id)).unwrap();
+                        socket.send(Message::Text(pong.into())).await.unwrap();
+                    }
+                    ClientMessage::Ack(_) => panic!("ACK before durable persistence"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!Inbox::path(&path).exists());
+        assert_eq!(state.status().await, ConnectionStatus::Connected);
+        release.send(()).unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    panic!("connection closed")
+                };
+                match serde_json::from_str::<ClientMessage>(&text).unwrap() {
+                    ClientMessage::Ack(ack) => {
+                        assert_eq!(ack.event_id, "task-event");
+                        break;
+                    }
+                    ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }) => {
+                        socket
+                            .send(Message::Text(
+                                serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id))
+                                    .unwrap()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            Inbox::open(&path)
+                .unwrap()
+                .list_for(&origin, 12)
+                .unwrap()
+                .len(),
+            1
+        );
+        cancel.cancel();
+        timeout(Duration::from_secs(3), runner)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[derive(Clone, Copy)]
     enum HeartbeatReply {

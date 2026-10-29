@@ -1,5 +1,32 @@
 # 로컬 검증 기록
 
+## 2026-10-29: 작업 수신함·저장 후 ACK
+
+사용자 요청으로 동일 작업 트리를 재검증했습니다. 포맷·Clippy(-D warnings)·전체 73개 테스트·git diff --check가 다시 통과했습니다. 실패·무시 0이며 단위 10.00초, 세션 통합 0.04초, 작업 수신 통합 1.60초, CLI 통합 121.88초입니다. 기존에 확인한 Windows ACL·로컬 소켓 제약에 따라 테스트는 승인된 샌드박스 외부에서 실행했습니다. 실제 중앙·MCP Host 연동은 이번 재검증에도 포함하지 않았고, 기능 코드는 추가 수정하지 않았습니다.
+
+rust/ 작업 트리에 중앙 TASK_CREATED/ACK DTO, `.devlink-runtime/inbox.json` 원자 저장, 중앙 URL·수신 Agent·task_id 중복 판별, 저장 후 ACK와 InboxFailed 상태를 추가했습니다. 생성·수락·완료·실행·MCP 업무 API·운영 신원 공급부는 이번 변경 범위가 아닙니다. [동작·Mock 실행·후속 계약](task-inbox.md)을 참고하세요.
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo check --offline --locked --workspace --all-targets` | 초기 구현 컴파일 통과. 최종 변경은 아래 Clippy와 전체 테스트로 컴파일 검증 |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 33개·세션 통합 6개·작업 수신 통합 3개·CLI 통합 31개, 총 73개 통과. 실패·무시 0 |
+
+Windows MSVC에서 실행했습니다. 처음 샌드박스 내부 테스트는 기존 테스트까지 파일 접근·ACL·로컬 통신 제한으로 실패했고, 자동 승인된 샌드박스 외부에서 전체 검사를 다시 실행해 통과했습니다. 단위 묶음 9.69초, 작업 수신 묶음 1.59초, CLI 묶음 116.41초이며 기본 45초 Heartbeat 회귀를 포함합니다. 증분 캐시 hard link 대신 파일 복사를 사용하는 환경 경고는 검사 실패가 아닙니다.
+
+추가한 검증은 다음과 같습니다.
+
+- 중앙 wire와 동일한 최상위 event_id의 TASK_CREATED 및 payload 내부 event_id/task_id의 ACK.
+- ACK 수신 시 디스크에 이미 존재하는 기록을 별도 Inbox 인스턴스로 확인.
+- 재접속·재시작·새 event_id의 재전달에도 수신함 항목 1개와 현재 event_id ACK 유지.
+- 중앙 URL·수신 Agent 격리, payload 충돌 시 원본 보존·ACK 차단.
+- 손상·누락 snapshot, 잘못된 수신자·저장 대상·용량 초과에서 ACK하지 않음.
+- 디스크 writer를 막아도 반복 JSON PING/PONG이 유지되고 저장 완료 전에는 ACK하지 않음.
+- 실제 CLI start → 작업 저장·ACK → stop/start → 재수신·ACK와 snapshot 불변 확인.
+
+새 의존성은 추가하지 않았습니다. TypeScript MCP·중앙 서버·공유 계약은 변경하지 않았고 커밋·Push도 하지 않았습니다. 실제 중앙 토큰·DB·MCP Host의 왕복, Unix 실행, 중앙 5초 ACK 제한 아래의 운영 성능은 미검증입니다.
+
 ## 2026-10-28: 로컬 세션 API·소유권·만료·presence 구현
 
 기준은 feature/rust/session-api의 `b8bd142` 이후 작업 트리입니다. 사용자 요청에 따라 rust/ 안에서만 구현했고 커밋·Push는 진행하지 않았습니다. 중앙 신원 조회·등록/토큰 발급·업무 API는 이번 범위에서 제외합니다.

@@ -1,5 +1,7 @@
 # 중앙 WebSocket 연동 규칙과 Rust 적용 기준
 
+2026-10-29 추가: Rust에 TASK_CREATED 수신·디스크 수신함·저장 후 ACK를 구현했습니다. [상세 동작·Mock 데모](task-inbox.md)를 참고하세요. 아래 2026-10-28 기록의 업무 라우팅 미제공 설명은 당시 중앙 보안 문서 기준이며, 새 중앙 커밋 `5891ef2`에는 전달·ACK 기록이 구현돼 있습니다. 현재 Rust는 기존 메시지 형식만 추가했고 READY 신원 확장·업무 REST 계약은 바꾸지 않았습니다.
+
 확인일: 2026-10-28 (Asia/Seoul). 중앙 서버 문서와 로컬 서버 소스에 명시된 규칙을 Rust 브로커의 구현 기준으로 기록한다. JSON Heartbeat·4001의 의미는 아래 서버 구현을 확인해 갱신했다. 이 기록은 실제 중앙 배포 환경과 Rust의 연동 완료를 의미하지 않는다.
 
 ## 1. 근거 문서와 적용 범위
@@ -150,6 +152,6 @@ Rust는 상태 보고에 `agent_id`, 사용자·팀 식별자, 클라이언트 �
 2. 실제 중앙의 AgentTokenVerifier·Agent 토큰으로 Upgrade → READY → PRESENCE → DB 상태 갱신을 검증한다.
 3. 세션 해제·만료, 중앙 재시작·재접속, 동일 Agent 연결 교체와 오래된 이벤트가 새 상태에 영향을 주지 않는지 확인한다.
 4. 구현한 JSON Heartbeat·4001 재접속을 실제 중앙 배포 설정·인증 환경에서도 확인한다.
-5. 중앙 업무 라우팅 계약에 맞춰 4단계 업무 API와 5단계 수신함·ACK를 구현한다.
+5. 구현한 수신함·ACK를 실제 중앙에서 확인하고, 중앙·MCP와 계약을 확정한 뒤 업무 API·누락 복구·결과 전달을 연결한다.
 
 현재 구현 근거: [프로토콜 DTO](../crates/devlink-broker/src/protocol.rs), [중앙 연결 루프](../crates/devlink-broker/src/central.rs), [로컬 HTTP 라우터](../crates/devlink-broker/src/broker.rs), [MCP principal 스키마](../../packages/mcp-server/src/broker/schemas.ts).

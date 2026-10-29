@@ -33,6 +33,97 @@ use tokio_tungstenite::{
 
 const TOKEN: &str = "test-only-secret-never-print";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_persists_tasks_before_ack_and_deduplicates_after_restart() {
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("ws://{}", listener.local_addr().unwrap());
+    f.configure(|config| config.server_url = origin.clone());
+    let path = f.path.clone();
+    let origin_copy = origin.clone();
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        for attempt in 1..=2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let event_id = format!("cli-task-{attempt}");
+            for message in [
+                serde_json::json!({"type":"BROKER_READY","payload":{"connection_id":format!("cli-{attempt}"),"agent_id":12}}),
+                serde_json::json!({"type":"TASK_CREATED","event_id":event_id,"payload":{
+                    "task_id":101,"team_id":1,"requester_agent_id":10,"receiver_agent_id":12,
+                    "prompt":"Synthetic CLI receipt test", "created_at":"2026-10-29T09:00:00"
+                }}),
+            ] {
+                socket
+                    .send(Message::Text(message.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            while let Some(Ok(frame)) = socket.next().await {
+                match frame {
+                    Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text)
+                        .unwrap()
+                    {
+                        ClientMessage::Ack(ack) => {
+                            assert_eq!(ack.event_id, event_id);
+                            assert_eq!(
+                                devlink_broker::inbox::Inbox::open(&path)
+                                    .unwrap()
+                                    .list_for(&origin_copy, 12)
+                                    .unwrap()
+                                    .len(),
+                                1
+                            );
+                            events.send(ack.event_id).unwrap();
+                        }
+                        ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }) => {
+                            socket
+                                .send(Message::Text(
+                                    serde_json::to_string(&ServerMessage::heartbeat_pong(ping_id))
+                                        .unwrap()
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                        }
+                        _ => {}
+                    },
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        }
+    });
+    f.ok(&["start"]);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "cli-task-1"
+    );
+    let snapshot = std::fs::read(devlink_broker::inbox::Inbox::path(&f.path)).unwrap();
+    assert!(!String::from_utf8_lossy(&snapshot).contains(TOKEN));
+    f.ok(&["stop"]);
+    f.ok(&["start"]);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "cli-task-2"
+    );
+    assert_eq!(
+        std::fs::read(devlink_broker::inbox::Inbox::path(&f.path)).unwrap(),
+        snapshot
+    );
+    f.ok(&["stop"]);
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     path: PathBuf,

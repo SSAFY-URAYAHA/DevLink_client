@@ -65,6 +65,7 @@ pub async fn run(path: &Path) -> Result<()> {
     // MCP 자격 스냅샷 발행 또는 기존 토큰 재사용
     let mcp_creds = crate::credentials::publish(path, &broker_url)?;
     let mcp_token = Arc::new(mcp_creds.local_token);
+    let inbox = crate::inbox::Inbox::open(path)?;
 
     // 현재 실행 인스턴스 정보 생성 및 파일로 게시(publish)
     let runtime = Arc::new(Runtime {
@@ -80,7 +81,7 @@ pub async fn run(path: &Path) -> Result<()> {
     // 취소 토큰 및 중앙 서버 연결 상태 초기화
     let cancel = CancellationToken::new();
     let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
-    let central_state = CentralState::new(status);
+    let central_state = CentralState::new(status).with_inbox(inbox);
     let sessions = SessionManager::new(
         Arc::new(UnconfiguredIdentityProvider),
         central_state.clone(),

@@ -1,7 +1,10 @@
 //! Stage 2 central server mock (`/ws/broker`). Never prints authentication payloads.
 #![allow(clippy::result_large_err)]
 use anyhow::{Context, Result};
-use devlink_broker::protocol::{BrokerReadyPayload, ClientMessage, HeartbeatPing, ServerMessage};
+use devlink_broker::protocol::{
+    BrokerReadyPayload, ClientMessage, HeartbeatPing, ServerMessage, TaskCreatedMessage,
+    TaskCreatedPayload,
+};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::{
@@ -23,6 +26,8 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 #[tokio::main]
 async fn main() -> Result<()> {
     let token = std::env::var("DEVLINK_TOKEN").context("Set DEVLINK_TOKEN for the mock server")?;
+    // Synthetic demo only: repeated deliveries use new event IDs for the same task.
+    let demo_task = std::env::var("DEVLINK_MOCK_TASK_DEMO").is_ok_and(|value| value == "1");
     let addr = std::env::var("DEVLINK_MOCK_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let listener = TcpListener::bind(&addr).await?;
     println!(
@@ -76,6 +81,36 @@ async fn main() -> Result<()> {
                 return;
             }
 
+            let mut pending = std::collections::HashMap::new();
+            if demo_task {
+                for attempt in 1..=2 {
+                    let event_id = format!("mock-{seq}-{attempt}");
+                    let payload = TaskCreatedPayload {
+                        task_id: 101,
+                        team_id: 1,
+                        requester_agent_id: 2,
+                        receiver_agent_id: 1,
+                        prompt: "Synthetic inbox demo; do not execute this task.".into(),
+                        created_at: "2026-10-29T09:00:00".into(),
+                    };
+                    let task = TaskCreatedMessage {
+                        event_id: event_id.clone(),
+                        payload: payload.clone(),
+                    };
+                    pending.insert(event_id.clone(), task.payload.task_id);
+                    let message = ServerMessage::TaskCreated { event_id, payload };
+                    if socket
+                        .send(Message::Text(
+                            serde_json::to_string(&message).unwrap().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+
             // 운영 서버처럼 JSON PING만 만료 감시 시간을 갱신합니다.
             let deadline = sleep(Duration::from_secs(40));
             tokio::pin!(deadline);
@@ -94,6 +129,15 @@ async fn main() -> Result<()> {
                 match message {
                     Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(ClientMessage::AgentPresence(_)) => {}
+                        Ok(ClientMessage::Ack(ack)) => {
+                            if pending.get(&ack.event_id) == Some(&ack.task_id) {
+                                pending.remove(&ack.event_id);
+                                println!(
+                                    "Synthetic task receipt acknowledged ({}/2)",
+                                    2 - pending.len()
+                                );
+                            }
+                        }
                         Ok(ClientMessage::Heartbeat(HeartbeatPing::Ping { ping_id }))
                             if !ping_id.trim().is_empty()
                                 && ping_id.encode_utf16().count() <= 128 =>

@@ -56,7 +56,74 @@ pub enum HeartbeatPong {
 pub enum ClientMessage {
     /// 로컬 Agent 접속 상태 보고 메시지
     AgentPresence(AgentPresencePayload),
+    /// 중앙 서버 하트비트 PING 메시지
     Heartbeat(HeartbeatPing),
+    /// 중앙 수신 업무(TASK_CREATED) 로컬 영속화 완료 후 전송하는 확인 응답 (ACK)
+    Ack(TaskAckPayload),
+}
+
+/// 중앙 서버로 전송하는 수신 확인(ACK) 페이로드 (로컬 inbox.json 저장 완료 후 전송)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskAckPayload {
+    /// 수신한 업무의 이벤트 고유 식별자
+    pub event_id: String,
+    /// 수신한 업무의 식별자
+    pub task_id: u64,
+}
+
+/// 중앙 서버가 브로커로 전달하는 신규 업무(TASK_CREATED) 페이로드
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCreatedPayload {
+    /// 업무 식별자
+    pub task_id: u64,
+    /// 팀 식별자
+    pub team_id: u64,
+    /// 업무를 요청한 발신 Agent 식별자
+    pub requester_agent_id: u64,
+    /// 업무를 수신할 대상 Agent 식별자
+    pub receiver_agent_id: u64,
+    /// 실행할 프롬프트/작업 내용
+    pub prompt: String,
+    /// 중앙 서버 측 생성 시각 문자열 (LocalDateTime)
+    pub created_at: String,
+}
+
+/// 중앙 서버가 전달하는 TASK_CREATED 전체 메시지 구조
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCreatedMessage {
+    /// 중앙 서버가 발급한 이벤트 식별자 (envelope 레벨)
+    pub event_id: String,
+    /// 업무 상세 정보 페이로드
+    pub payload: TaskCreatedPayload,
+}
+
+impl TaskCreatedMessage {
+    /// 메시지 필수 필드 및 식별자 범위 유효성 검증
+    pub fn is_valid(&self) -> bool {
+        !self.event_id.trim().is_empty()
+            && self.event_id.encode_utf16().count() <= 128
+            && [
+                self.payload.task_id,
+                self.payload.team_id,
+                self.payload.requester_agent_id,
+                self.payload.receiver_agent_id,
+            ]
+            .into_iter()
+            .all(|id| id > 0 && id <= i64::MAX as u64)
+            && !self.payload.prompt.trim().is_empty()
+            && !self.payload.created_at.trim().is_empty()
+    }
+
+    /// 수신 확인(ACK)용 페이로드 생성
+    pub fn ack(&self) -> TaskAckPayload {
+        TaskAckPayload {
+            event_id: self.event_id.clone(),
+            task_id: self.payload.task_id,
+        }
+    }
 }
 
 impl ClientMessage {
@@ -88,23 +155,58 @@ impl BrokerReadyPayload {
 }
 
 /// 중앙 서버에서 브로커로 수신되는 메시지 규격
-///
-/// # 역직렬화(JSON) 예시
-/// ```json
-/// {
-///   "type": "BROKER_READY",
-///   "payload": {
-///     "connection_id": "current-websocket-session-id",
-///     "agent_id": 11
-///   }
-/// }
-/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(from = "ServerWire", into = "ServerWire")]
 pub enum ServerMessage {
     /// 서버 측 인증 및 ConnectionRegistry 등록 완료 응답
     BrokerReady(BrokerReadyPayload),
+    /// 하트비트 PONG 응답
     Heartbeat(HeartbeatPong),
+    /// 중앙 서버가 전달하는 신규 업무 수신 메시지
+    TaskCreated {
+        event_id: String,
+        payload: TaskCreatedPayload,
+    },
+}
+
+/// 중앙 서버 WebSocket 메시지 와이어 포맷 (TASK_CREATED의 event_id는 payload 바깥 envelope에 위치)
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+enum ServerWire {
+    BrokerReady {
+        payload: BrokerReadyPayload,
+    },
+    Heartbeat {
+        payload: HeartbeatPong,
+    },
+    TaskCreated {
+        event_id: String,
+        payload: TaskCreatedPayload,
+    },
+}
+
+impl From<ServerWire> for ServerMessage {
+    fn from(value: ServerWire) -> Self {
+        match value {
+            ServerWire::BrokerReady { payload } => Self::BrokerReady(payload),
+            ServerWire::Heartbeat { payload } => Self::Heartbeat(payload),
+            ServerWire::TaskCreated { event_id, payload } => {
+                Self::TaskCreated { event_id, payload }
+            }
+        }
+    }
+}
+
+impl From<ServerMessage> for ServerWire {
+    fn from(value: ServerMessage) -> Self {
+        match value {
+            ServerMessage::BrokerReady(payload) => Self::BrokerReady { payload },
+            ServerMessage::Heartbeat(payload) => Self::Heartbeat { payload },
+            ServerMessage::TaskCreated { event_id, payload } => {
+                Self::TaskCreated { event_id, payload }
+            }
+        }
+    }
 }
 
 impl ServerMessage {

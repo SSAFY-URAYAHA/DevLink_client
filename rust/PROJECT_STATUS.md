@@ -1,5 +1,7 @@
 # CLI·브로커 진행 현황
 
+2026-10-29 추가: 작업 수신함·저장 후 ACK와 재시작 후 중복 수신 방지를 구현했습니다. [상세 문서](docs/task-inbox.md), [검증 기록](docs/verification.md)을 참고하세요. 아래 2026-10-28 현황에서 수신함·ACK 미구현으로 기재된 부분은 이번 추가로 대체하며, 중앙 신원·업무 API·실제 Host 왕복은 계속 미완료입니다.
+
 - 갱신일: 2026-10-28 (Asia/Seoul)
 - 확인 기준: 로컬 소스 코드·작업 트리와 같은 날 실행한 검사 결과
 - 현재 브랜치: `feature/rust/session-api`
@@ -20,6 +22,7 @@ HTTP 라우터에는 health/shutdown과 세션 생성·bind·heartbeat·해제�
 | 중앙 연결 | 로컬 검증 | `/ws/broker` Bearer 인증·READY·presence 변경 보고·재연결·종료 분류. 실제 중앙 인증·DB 연동은 미검증 |
 | MCP 서버·업무 도구 | 구현·가짜 브로커 검증 | stdio MCP 서버·업무 도구 7개·세션 복구 클라이언트. 실제 Rust 세션·업무 연동 필요 |
 | Rust 로컬 세션 | 구현·로컬 검증 | HTTP 4개 경로·fresh/recover·소유권·90초 만료·presence. 중앙 신원 공급부는 미연결 |
+| 작업 수신함·ACK | 구현·로컬 검증 | 기존 TASK_CREATED/ACK 형식, 디스크 원자 저장·재시작 중복 방지·실패 시 ACK 차단. 저장 후 ACK는 중앙 합의 및 실제 운영 검증 필요 |
 | Rust 업무 API | 미구현 | 업무 7개 경로·중앙 인증/DTO·라우팅·수신함 연결 필요 |
 | 실제 MVP 통합 | 미검증 | 서로 다른 두 사용자·프로젝트에서 요청·수락·편집·결과 조회까지 검증 필요 |
 | CI·Unix | 미검증 | `.github/workflows/` 없음. Ubuntu 빌드·테스트와 Unix 권한 분기 실행 필요 |
