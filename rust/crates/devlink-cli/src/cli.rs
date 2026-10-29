@@ -50,6 +50,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: TeamCommand,
     },
+    /// Bind an owned Agent and keep its central token separate from MCP settings
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Internal command: run the broker loop in foreground (spawned by start)
     #[command(hide = true)]
     Broker,
@@ -115,6 +120,41 @@ pub enum TeamCommand {
     },
 }
 
+#[derive(Subcommand)]
+pub enum AgentCommand {
+    /// Explicitly create once; an uncertain creation is never retried automatically
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long,value_parser=["codex","claude-code"])]
+        tool: String,
+        #[arg(long)]
+        project_name: String,
+        #[arg(long)]
+        project: PathBuf,
+        #[arg(long)]
+        role_description: Option<String>,
+    },
+    /// List the selected team's Agents; only your own ID can be bound
+    List,
+    /// Bind a server-verified existing ID; missing credentials require explicit token
+    Use {
+        #[arg(long)]
+        id: u64,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// Explicitly issue/rotate the current Agent token while its broker is stopped
+    Token,
+    /// Show public profile metadata and verify a stored central token
+    Status,
+    /// Clear only an unknown creation after manual server inspection; never retries
+    ResetPending {
+        #[arg(long)]
+        accept_duplicate_risk: bool,
+    },
+}
+
 fn print_json(value: &serde_json::Value) -> Result<()> {
     let json = serde_json::to_string(value)?;
     let safe: String = json
@@ -172,6 +212,40 @@ fn secret_input(label: &str, limit: usize, from_stdin: bool) -> Result<String> {
 pub async fn run(cli: Cli) -> Result<()> {
     let path = config::config_path(cli.config)?;
     match cli.command {
+        Commands::Agent { command } => {
+            use devlink_broker::agent_profile::{self, CreateOptions, Tool};
+            let result = match command {
+                AgentCommand::Create {
+                    name,
+                    tool,
+                    project_name,
+                    project,
+                    role_description,
+                } => {
+                    agent_profile::create(
+                        &path,
+                        CreateOptions {
+                            name,
+                            tool: Tool::parse(&tool)?,
+                            project_name,
+                            project,
+                            role_description,
+                        },
+                    )
+                    .await?
+                }
+                AgentCommand::List => serde_json::to_value(agent_profile::list(&path).await?)?,
+                AgentCommand::Use { id, project } => {
+                    agent_profile::use_agent(&path, id, project.as_deref()).await?
+                }
+                AgentCommand::Token => agent_profile::token(&path).await?,
+                AgentCommand::Status => agent_profile::status(&path).await?,
+                AgentCommand::ResetPending {
+                    accept_duplicate_risk,
+                } => agent_profile::reset_pending(&path, accept_duplicate_risk).await?,
+            };
+            print_json(&result)?;
+        }
         Commands::Team { command } => {
             use devlink_broker::teams;
             let value = match command {
@@ -306,7 +380,7 @@ async fn start(path: &Path) -> Result<()> {
         println!("Broker already running");
         return Ok(());
     }
-    broker::central_token()?;
+    broker::central_token_for(path)?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--config")
@@ -331,8 +405,9 @@ async fn start(path: &Path) -> Result<()> {
     let mut child = command.spawn().context("Cannot spawn broker process")?;
     // Credential publication precedes runtime discovery. On Windows its three ACL
     // checks can each succeed within 5 s and still exceed the former 8 s wait.
-    let startup_timeout =
-        Duration::from_secs(8) + devlink_broker::credentials::startup_validation_allowance();
+    let startup_timeout = Duration::from_secs(8)
+        + devlink_broker::credentials::startup_validation_allowance()
+        + devlink_broker::agent_profile::startup_allowance(path);
     let deadline = Instant::now() + startup_timeout;
     // Poll process exit and authenticated readiness within the combined budget.
     loop {
