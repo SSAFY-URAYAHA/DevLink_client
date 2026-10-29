@@ -45,6 +45,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Create/join teams and choose a verified team for Agent setup
+    Team {
+        #[command(subcommand)]
+        command: TeamCommand,
+    },
     /// Internal command: run the broker loop in foreground (spawned by start)
     #[command(hide = true)]
     Broker,
@@ -87,6 +92,29 @@ pub enum AuthCommand {
     Logout,
 }
 
+#[derive(Subcommand)]
+pub enum TeamCommand {
+    Create {
+        #[arg(long)]
+        name: String,
+    },
+    List,
+    /// Read the invite code in a hidden prompt or from one stdin line
+    Join {
+        #[arg(long)]
+        code_stdin: bool,
+    },
+    Select {
+        #[arg(long)]
+        id: u64,
+    },
+    Current,
+    Members {
+        #[arg(long)]
+        id: u64,
+    },
+}
+
 fn print_json(value: &serde_json::Value) -> Result<()> {
     let json = serde_json::to_string(value)?;
     let safe: String = json
@@ -105,6 +133,10 @@ fn print_json(value: &serde_json::Value) -> Result<()> {
 }
 
 fn password_input(from_stdin: bool) -> Result<String> {
+    secret_input("Password", 72, from_stdin)
+}
+
+fn secret_input(label: &str, limit: usize, from_stdin: bool) -> Result<String> {
     use std::io::{BufRead, Read};
     let password = if from_stdin {
         let mut bytes = Vec::new();
@@ -121,12 +153,17 @@ fn password_input(from_stdin: bool) -> Result<String> {
         }
         String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("Password must be UTF-8"))?
     } else {
-        rpassword::prompt_password("Password: ").map_err(|_| {
-            anyhow::anyhow!("Cannot read hidden password; use --password-stdin for pipes")
+        rpassword::prompt_password(format!("{label}: ")).map_err(|_| {
+            let flag = if label == "Password" {
+                "--password-stdin"
+            } else {
+                "--code-stdin"
+            };
+            anyhow::anyhow!("Cannot read hidden {label}; use {flag} for pipes")
         })?
     };
-    if password.is_empty() || password.len() > 72 {
-        bail!("Password must contain 1 to 72 UTF-8 bytes");
+    if password.is_empty() || password.len() > limit {
+        bail!("{label} must contain 1 to {limit} UTF-8 bytes");
     }
     Ok(password)
 }
@@ -135,6 +172,31 @@ fn password_input(from_stdin: bool) -> Result<String> {
 pub async fn run(cli: Cli) -> Result<()> {
     let path = config::config_path(cli.config)?;
     match cli.command {
+        Commands::Team { command } => {
+            use devlink_broker::teams;
+            let value = match command {
+                TeamCommand::Create { name } => {
+                    serde_json::to_value(teams::create(&path, &name).await?)?
+                }
+                TeamCommand::List => serde_json::to_value(teams::list(&path).await?)?,
+                TeamCommand::Join { code_stdin } => {
+                    devlink_broker::user_auth::validate_config(&path)?;
+                    let code = secret_input("Invite code", 256, code_stdin)?;
+                    serde_json::to_value(teams::join(&path, &code).await?)?
+                }
+                TeamCommand::Select { id } => {
+                    serde_json::json!({"selected":true,"team":teams::select(&path,id).await?,"agentBindingChanged":false})
+                }
+                TeamCommand::Current => match teams::current(&path).await? {
+                    Some(team) => serde_json::json!({"selected":true,"team":team}),
+                    None => serde_json::json!({"selected":false}),
+                },
+                TeamCommand::Members { id } => {
+                    serde_json::to_value(teams::members(&path, id).await?)?
+                }
+            };
+            print_json(&value)?;
+        }
         Commands::Auth { command } => match command {
             AuthCommand::Login {
                 email,
