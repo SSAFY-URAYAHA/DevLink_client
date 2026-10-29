@@ -6,6 +6,8 @@ S15P31D108-59 실행 기반, -60 브로커 호출·세션 복구, -61 공통 도
 
 사용자는 [Agent 요청·수락·결과 등록 지침](packages/mcp-server/docs/agent-workflow.md)에서 수신자 지정부터 사용자 수락, Host의 로컬 수정·검증, 완료·실패 조회까지 확인할 수 있습니다.
 
+실제 중앙 연동의 인증·Agent bootstrap·DTO 차이와 후속 구현 조건은 [중앙 연동 결정표](contracts/central/README.md)에 정리했습니다. 확인한 develop SHA와 미제공 API를 구분하며, 기존 로컬 계약의 실제 연동 완료를 뜻하지 않습니다.
+
 ## Git Flow
 
 [Notion Git Flow 전략](https://www.notion.so/fdd35a4f3ca6837fb6ef8101afa7fb68)을 기준으로 브랜치를 관리합니다.
