@@ -40,6 +40,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<McpCommand>,
     },
+    /// Sign in to the central user API (separate from Agent/MCP credentials)
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Internal command: run the broker loop in foreground (spawned by start)
     #[command(hide = true)]
     Broker,
@@ -66,10 +71,91 @@ pub enum McpCommand {
     Rotate,
 }
 
+#[derive(Subcommand)]
+pub enum AuthCommand {
+    /// Sign in; password is never accepted as a command-line argument
+    Login {
+        #[arg(long)]
+        email: String,
+        /// Read one password line from stdin instead of a hidden terminal prompt
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Check the session against the central server
+    Status,
+    /// End the user session without revoking the separate Agent token
+    Logout,
+}
+
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string(value)?;
+    let safe: String = json
+        .chars()
+        .map(|c| {
+            if matches!(c, '\u{7f}'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                format!("\\u{:04x}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect();
+    println!("{safe}");
+    Ok(())
+}
+
+fn password_input(from_stdin: bool) -> Result<String> {
+    use std::io::{BufRead, Read};
+    let password = if from_stdin {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take(1025)
+            .read_until(b'\n', &mut bytes)
+            .map_err(|_| anyhow::anyhow!("Cannot read password from stdin"))?;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("Password must be UTF-8"))?
+    } else {
+        rpassword::prompt_password("Password: ").map_err(|_| {
+            anyhow::anyhow!("Cannot read hidden password; use --password-stdin for pipes")
+        })?
+    };
+    if password.is_empty() || password.len() > 72 {
+        bail!("Password must contain 1 to 72 UTF-8 bytes");
+    }
+    Ok(password)
+}
+
 /// CLI 진입점: 파싱된 CLI 명령어에 따라 적절한 로직을 라우팅하여 실행합니다.
 pub async fn run(cli: Cli) -> Result<()> {
     let path = config::config_path(cli.config)?;
     match cli.command {
+        Commands::Auth { command } => match command {
+            AuthCommand::Login {
+                email,
+                password_stdin,
+            } => {
+                devlink_broker::user_auth::validate_config(&path)?;
+                let password = password_input(password_stdin)?;
+                let user = devlink_broker::user_auth::login(&path, &email, &password).await?;
+                print_json(&serde_json::json!({"state":"authenticated","user":user}))?;
+            }
+            AuthCommand::Status => print_json(&devlink_broker::user_auth::status(&path).await?)?,
+            AuthCommand::Logout => {
+                let confirmed = devlink_broker::user_auth::logout(&path).await?;
+                print_json(&serde_json::json!({"state":"logged_out","authenticated":false}))?;
+                if !confirmed {
+                    eprintln!(
+                        "Local session cleared; no remote session was available to invalidate"
+                    );
+                }
+            }
+        },
         // 설정 파일 초기화 (기존 파일이 없을 때만 기본 생성)
         Commands::Init => {
             println!(
