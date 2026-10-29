@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -21,6 +21,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 pub const PASSWORD: &str = "test-password-do-not-print";
 pub const COOKIE: &str = "post-login-cookie-do-not-print";
 pub const CSRF: &str = "post-login-csrf-do-not-print";
+pub const INVITE: &str = "synthetic-invite-code-read-from-stdin-only";
 
 #[derive(Clone, Default)]
 pub struct MockState {
@@ -30,6 +31,9 @@ pub struct MockState {
     pub changed_user: Arc<AtomicBool>,
     pub me_failure: Arc<AtomicBool>,
     pub calls: Arc<Mutex<Vec<String>>>,
+    pub joined: Arc<AtomicBool>,
+    pub membership_missing: Arc<AtomicBool>,
+    pub teams: Arc<Mutex<std::collections::BTreeMap<u64, Value>>>,
 }
 
 pub fn success(value: Value) -> Response {
@@ -122,6 +126,113 @@ async fn logout(State(state): State<MockState>, headers: HeaderMap) -> Response 
     success(Value::Null)
 }
 
+fn team_value(id: u64, name: &str, role: &str) -> Value {
+    json!({"teamId":id,"name":name,"myRole":role,"createdAt":"2026-10-29T00:00:00"})
+}
+fn team_for(state: &MockState, id: u64) -> Option<Value> {
+    match id {
+        71 => Some(team_value(71, "Owned team", "OWNER")),
+        72 if state.joined.load(Ordering::SeqCst) => Some(team_value(72, "Joined team", "MEMBER")),
+        _ => state.teams.lock().unwrap().get(&id).cloned(),
+    }
+}
+fn authorized(state: &MockState, headers: &HeaderMap, mutation: bool) -> bool {
+    assert!(!headers.contains_key("authorization"));
+    cookie(headers, COOKIE)
+        && !state.expired.load(Ordering::SeqCst)
+        && (!mutation || headers.get("x-csrf-token").is_some_and(|v| v == CSRF))
+}
+async fn team_list(State(state): State<MockState>, headers: HeaderMap) -> Response {
+    state.calls.lock().unwrap().push("team_list".into());
+    if !authorized(&state, &headers, false) {
+        return failure(StatusCode::UNAUTHORIZED, "AUTHENTICATION_REQUIRED");
+    }
+    let mut teams = vec![team_for(&state, 71).unwrap()];
+    if let Some(team) = team_for(&state, 72) {
+        teams.push(team);
+    }
+    teams.extend(state.teams.lock().unwrap().values().cloned());
+    success(json!(teams))
+}
+async fn team_create(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state.calls.lock().unwrap().push("team_create".into());
+    assert!(authorized(&state, &headers, true));
+    assert_eq!(
+        body.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["name"]
+    );
+    let mut teams = state.teams.lock().unwrap();
+    let id = 101 + teams.len() as u64;
+    let team = team_value(id, body["name"].as_str().unwrap(), "OWNER");
+    teams.insert(id, team.clone());
+    let mut created = team;
+    created["inviteCode"] = json!(INVITE);
+    success(created)
+}
+async fn team_detail(
+    Path(id): Path<u64>,
+    State(state): State<MockState>,
+    headers: HeaderMap,
+) -> Response {
+    state.calls.lock().unwrap().push("team_detail".into());
+    if !authorized(&state, &headers, false) {
+        return failure(StatusCode::UNAUTHORIZED, "AUTHENTICATION_REQUIRED");
+    }
+    if id == 99 {
+        return failure(StatusCode::FORBIDDEN, "ACCESS_DENIED");
+    }
+    team_for(&state, id)
+        .map(success)
+        .unwrap_or_else(|| failure(StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND"))
+}
+async fn team_members(
+    Path(id): Path<u64>,
+    State(state): State<MockState>,
+    headers: HeaderMap,
+) -> Response {
+    state.calls.lock().unwrap().push("team_members".into());
+    if !authorized(&state, &headers, false) {
+        return failure(StatusCode::UNAUTHORIZED, "AUTHENTICATION_REQUIRED");
+    }
+    if id == 99 {
+        return failure(StatusCode::FORBIDDEN, "ACCESS_DENIED");
+    }
+    let Some(team) = team_for(&state, id) else {
+        return failure(StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND");
+    };
+    let user = if state.membership_missing.load(Ordering::SeqCst) {
+        777
+    } else {
+        51
+    };
+    success(
+        json!([{"userId":user,"name":"Verified","nickname":null,"role":team["myRole"],"joinedAt":"2026-10-29T00:00:00"}]),
+    )
+}
+async fn team_join(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state.calls.lock().unwrap().push("team_join".into());
+    assert!(authorized(&state, &headers, true));
+    if body["inviteCode"] != INVITE {
+        return failure(StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND");
+    }
+    let replayed = state.joined.swap(true, Ordering::SeqCst);
+    success(
+        json!({"teamId":72,"name":"Joined team","myRole":"MEMBER","joinedAt":"2026-10-29T00:00:00","replayed":replayed}),
+    )
+}
+
 pub struct Fixture {
     pub _root: tempfile::TempDir,
     pub path: PathBuf,
@@ -137,6 +248,10 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let state = MockState::default();
         let app = Router::new()
+            .route("/api/v1/teams", get(team_list).post(team_create))
+            .route("/api/v1/teams/join", post(team_join))
+            .route("/api/v1/teams/{id}", get(team_detail))
+            .route("/api/v1/teams/{id}/members", get(team_members))
             .route("/api/v1/auth/csrf", get(csrf))
             .route("/api/v1/auth/login", post(login))
             .route("/api/v1/auth/users/me", get(me))
