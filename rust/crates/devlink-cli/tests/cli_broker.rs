@@ -493,6 +493,7 @@ async fn unhealthy_live_broker_is_not_reported_as_stopped() {
 #[derive(Clone, Copy)]
 enum Behavior {
     Ready { agent_id: u64 },
+    VerifiedReady,
     Deny401,
     Deny403,
     Silent,
@@ -592,6 +593,9 @@ impl Mock {
                     };
 
                     let ready_text = match behavior {
+                        Behavior::VerifiedReady => format!(
+                            r#"{{"type":"BROKER_READY","payload":{{"connection_id":"conn-{seq}","agent_id":11,"user_id":3,"team_id":1}}}}"#
+                        ),
                         Behavior::Ready { agent_id } => {
                             format!(
                                 r#"{{"type":"BROKER_READY","payload":{{"connection_id":"conn-{seq}","agent_id":{agent_id}}}}}"#
@@ -922,6 +926,63 @@ async fn session_routes_require_verified_identity_and_reject_cli_control_token()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_uses_ready_identity_for_real_local_sessions() {
+    let server = Mock::start("127.0.0.1:0", Behavior::VerifiedReady).await;
+    let f = Fixture::new();
+    f.configure(|config| config.server_url = format!("ws://{}", server.address));
+    f.ok(&["start"]);
+    f.wait_status(ConnectionStatus::Connected).await;
+    let runtime = Runtime::load(&f.path).unwrap();
+    let credentials = devlink_broker::credentials::load(&f.path).unwrap();
+    let client = runtime.client().unwrap();
+    let response = client.post(runtime.url("/v1/sessions"))
+        .bearer_auth(&credentials.local_token)
+        .json(&serde_json::json!({"requestId":"verified-claim","instanceId":"verified-host","mode":"fresh","agentId":"11"}))
+        .send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["data"]["principal"],
+        serde_json::json!({"userId":"3","teamId":"1","agentId":"11"})
+    );
+    let session = body["data"]["sessionId"].as_str().unwrap();
+    assert!(!body.to_string().contains(&credentials.local_token));
+    let messages = server.wait_messages(1).await;
+    assert_eq!(
+        messages[0],
+        serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"ONLINE"}})
+    );
+    let response = client.post(runtime.url("/v1/sessions"))
+        .bearer_auth(&credentials.local_token)
+        .json(&serde_json::json!({"requestId":"wrong-agent","instanceId":"other-host","mode":"fresh","agentId":"12"}))
+        .send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 403);
+    let response = client
+        .post(runtime.url(&format!("/v1/sessions/{session}/heartbeat")))
+        .bearer_auth(&credentials.local_token)
+        .json(&serde_json::json!({"requestId":"verified-renew","instanceId":"verified-host"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let response = client
+        .delete(runtime.url(&format!("/v1/sessions/{session}")))
+        .bearer_auth(&credentials.local_token)
+        .json(&serde_json::json!({"requestId":"verified-release","instanceId":"verified-host"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let messages = server.wait_messages(2).await;
+    assert_eq!(
+        messages[1],
+        serde_json::json!({"type":"AGENT_PRESENCE","payload":{"status":"OFFLINE"}})
+    );
+    f.ok(&["stop"]);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeat_timeout_4001_reconnects_only_when_enabled() {
     for auto_reconnect in [true, false] {
         let server = Mock::start("127.0.0.1:0", Behavior::CloseHeartbeatTimeout4001).await;
@@ -1146,6 +1207,8 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         Some(CentralIdentity {
             connection_id: "conn-1".into(),
             agent_id: 42,
+            user_id: None,
+            team_id: None,
         })
     );
     sleep(Duration::from_millis(80)).await;
@@ -1190,6 +1253,8 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         Some(CentralIdentity {
             connection_id: "conn-1".into(),
             agent_id: 42,
+            user_id: None,
+            team_id: None,
         })
     );
     {
@@ -1235,6 +1300,8 @@ async fn central_state_distinguishes_unknown_confirmed_offline_and_confirmed_onl
         Some(CentralIdentity {
             connection_id: "conn-1".into(),
             agent_id: 99,
+            user_id: None,
+            team_id: None,
         })
     );
     {

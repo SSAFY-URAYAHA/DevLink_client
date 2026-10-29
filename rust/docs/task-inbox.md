@@ -1,10 +1,10 @@
 # 작업 수신함·ACK
 
-2026-10-29. 중앙의 기존 `TASK_CREATED`와 `ACK` 형식으로 Rust 로컬 수신 경로를 구현했다. 실제 운영 중앙·MCP Host의 업무 왕복 완료를 의미하지 않는다. 저장 후 ACK 정책은 로컬 구현안이며 중앙 담당자와 최종 합의해야 한다.
+2026-10-29. 중앙의 기존 `TASK_CREATED`와 `ACK` 형식으로 Rust 로컬 수신 경로를 구현했다. 이후 중앙 담당자와 저장 후 ACK·기본 5초 유지 방향을 확인했다. 실제 운영 중앙·MCP Host의 업무 왕복 완료를 의미하지 않는다. [READY 신원과 후속 계약](ready-identity.md)을 참고한다.
 
 ## 수신 순서
 
-1. 유효한 `BROKER_READY` 이후 `TASK_CREATED`를 받는다. READY에 사용자·팀 필드를 임의로 추가하지 않았다.
+1. 유효한 `BROKER_READY` 이후 `TASK_CREATED`를 받는다. 합의된 user_id/team_id가 있는 READY를 지원하며, team_id가 있으면 수신 작업의 팀도 대조한다.
 2. 양의 숫자 ID·비어 있지 않은 event_id/prompt/created_at, 현재 인증된 Agent와 receiver_agent_id의 일치를 검증한다. created_at은 시간대를 추정하지 않고 서버 문자열 그대로 보존한다.
 3. `.devlink-runtime/inbox.json`에 기록한다. 임시 파일 비공개 권한 → 쓰기 → sync_all → 권한 검사 → 원자 교체 순서이며 Unix는 부모 디렉터리도 sync한다.
 4. 저장 성공 뒤 현재 WebSocket으로 `{"type":"ACK","payload":{"event_id":"현재 전송 ID","task_id":101}}`를 보낸다. 작업 수락·실행·완료는 하지 않는다.
@@ -45,7 +45,7 @@ Mock에 ACK 2건이 표시되지만 `.demo/.devlink-runtime/inbox.json`에는 1�
 
 ## 계약이 필요한 후속 작업
 
-- 중앙 REST 인증, Agent 등록/토큰 발급, 검증된 userId/teamId 전달과 실제 IdentityProvider.
+- 중앙 업무 REST의 Agent 인증 적용, Agent 등록/토큰 발급·갱신. READY 기반 IdentityProvider는 연결했으며 실제 운영 중앙에서 검증해야 한다.
 - MCP 업무 경로와 get_tasks 수신함 노출·상태 병합. 지금은 내부 `Inbox::list_for`만 제공하며 공개 HTTP API를 추가하지 않았다.
 - 중앙 누락 조회·늦은 ACK·전달 결과 조회와 재전달 식별자 정책.
 - 작업 수락·실패·완료, version 충돌·결과 제출, 실제 Agent 실행·완료 알림.

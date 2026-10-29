@@ -8,7 +8,7 @@ use crate::{
     central::{self, CentralState, ConnectionStatus},
     config::{self, Config, state_directory},
     local::{self, API_VERSION, Health, Runtime, SERVICE},
-    sessions::{SessionManager, UnconfiguredIdentityProvider},
+    sessions::{ReadyIdentityProvider, SessionManager},
 };
 use anyhow::{Context, Result};
 use axum::{
@@ -83,7 +83,7 @@ pub async fn run(path: &Path) -> Result<()> {
     let status = Arc::new(RwLock::new(ConnectionStatus::Connecting));
     let central_state = CentralState::new(status).with_inbox(inbox);
     let sessions = SessionManager::new(
-        Arc::new(UnconfiguredIdentityProvider),
+        Arc::new(ReadyIdentityProvider::new(central_state.clone())),
         central_state.clone(),
     );
     let expiration = tokio::spawn(sessions.clone().run_expiration(cancel.clone()));

@@ -52,6 +52,8 @@ async fn ready(listener: &TcpListener) -> Socket {
         ServerMessage::BrokerReady(BrokerReadyPayload {
             connection_id: uuid::Uuid::new_v4().to_string(),
             agent_id: 12,
+            user_id: None,
+            team_id: None,
         }),
     )
     .await;

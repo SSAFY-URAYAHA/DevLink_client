@@ -5,7 +5,10 @@
 //! - fresh 모드 시 기존 세션을 안전하게 펜싱(대체)하고, recover 모드 시 선착순 복구를 보장합니다.
 //! - 활성 세션 바인딩 여부에 따라 중앙 WebSocket에 실시간 presence(ONLINE/OFFLINE)를 전파합니다.
 
-use crate::{central::CentralState, protocol::PresenceStatus};
+use crate::{
+    central::{CentralIdentity, CentralState, ConnectionStatus},
+    protocol::PresenceStatus,
+};
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::{
@@ -129,6 +132,74 @@ pub type IdentityFuture<'a> =
 /// 중앙 신원 및 Agent 소유권 확인 인터페이스
 pub trait IdentityProvider: Send + Sync {
     fn resolve<'a>(&'a self, agent_id: Option<&'a Identifier>) -> IdentityFuture<'a>;
+    fn requires_current_ready(&self) -> bool {
+        false
+    }
+}
+
+/// Trust only identity supplied by the authenticated current central connection.
+pub struct ReadyIdentityProvider {
+    central: CentralState,
+}
+
+impl ReadyIdentityProvider {
+    pub fn new(central: CentralState) -> Self {
+        Self { central }
+    }
+}
+
+fn ready_principal(
+    status: ConnectionStatus,
+    identity: Option<&CentralIdentity>,
+) -> Result<Principal, IdentityError> {
+    if status != ConnectionStatus::Connected {
+        return Err(if status == ConnectionStatus::AuthFailed {
+            IdentityError::Unauthenticated
+        } else {
+            IdentityError::Unavailable
+        });
+    }
+    let identity = identity.ok_or(IdentityError::Unauthenticated)?;
+    let (Some(user), Some(team)) = (identity.user_id, identity.team_id) else {
+        return Err(IdentityError::Unauthenticated);
+    };
+    let id = |number: u64| {
+        if number == 0 || number > i64::MAX as u64 {
+            return Err(IdentityError::Unauthenticated);
+        }
+        Identifier::parse(number.to_string()).map_err(|_| IdentityError::Unauthenticated)
+    };
+    Ok(Principal {
+        user_id: id(user)?,
+        team_id: id(team)?,
+        agent_id: Some(id(identity.agent_id)?),
+        tool_type: None,
+    })
+}
+
+impl IdentityProvider for ReadyIdentityProvider {
+    fn requires_current_ready(&self) -> bool {
+        true
+    }
+
+    fn resolve<'a>(&'a self, agent: Option<&'a Identifier>) -> IdentityFuture<'a> {
+        Box::pin(async move {
+            self.central
+                .with_ready_context(|status, identity, _| {
+                    let mut principal = ready_principal(status, identity)?;
+                    if let Some(agent) = agent {
+                        if principal.agent_id.as_ref() != Some(agent) {
+                            return Err(IdentityError::Forbidden);
+                        }
+                    } else {
+                        // Agent registration/binding is explicit in the existing MCP contract.
+                        principal.agent_id = None;
+                    }
+                    Ok(principal)
+                })
+                .await
+        })
+    }
 }
 
 /// 중앙 신원 연동 전 기본 프로바이더 (Unauthenticated 처리)
@@ -138,6 +209,21 @@ impl IdentityProvider for UnconfiguredIdentityProvider {
     fn resolve<'a>(&'a self, _agent_id: Option<&'a Identifier>) -> IdentityFuture<'a> {
         Box::pin(async { Err(IdentityError::Unauthenticated) })
     }
+}
+
+fn check_current_principal(
+    expected: &Principal,
+    current: Option<Result<Principal, IdentityError>>,
+) -> Result<(), SessionError> {
+    if let Some(current) = current {
+        let current = current.map_err(SessionError::Identity)?;
+        if !expected.same_user_team(&current)
+            || (expected.agent_id.is_some() && expected.agent_id != current.agent_id)
+        {
+            return Err(SessionError::Identity(IdentityError::Forbidden));
+        }
+    }
+    Ok(())
 }
 
 /// 세션 처리 중 발생하는 도메인 오류
@@ -176,9 +262,18 @@ struct Registry {
     observed: bool,
     /// 브로커 종료로 레지스트리 폐쇄 여부
     closed: bool,
+    subject_epoch: u64,
 }
 
 impl Registry {
+    fn sync_subject(&mut self, epoch: u64) {
+        if self.subject_epoch != epoch {
+            self.sessions.clear();
+            self.instances.clear();
+            self.owners.clear();
+            self.subject_epoch = epoch;
+        }
+    }
     /// 만료된 세션 정리
     fn expire(&mut self, now: Instant) {
         self.sessions.retain(|_, entry| entry.expires_at > now);
@@ -372,6 +467,29 @@ impl SessionManager {
         }
     }
 
+    async fn with_context<T>(
+        &self,
+        registry: &mut Registry,
+        operation: impl FnOnce(
+            &mut Registry,
+            Option<Result<Principal, IdentityError>>,
+        ) -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        if !self.identity.requires_current_ready() {
+            let result = operation(registry, None);
+            registry.publish_presence(&self.central);
+            return result;
+        }
+        self.central
+            .with_ready_context(|status, identity, epoch| {
+                registry.sync_subject(epoch);
+                let result = operation(registry, Some(ready_principal(status, identity)));
+                registry.publish_presence(&self.central);
+                result
+            })
+            .await
+    }
+
     /// 중앙 신원 해석 및 요청 Agent 일치 여부 검증
     async fn resolve(&self, agent: Option<&Identifier>) -> Result<Principal, SessionError> {
         let principal = timeout(Duration::from_secs(5), self.identity.resolve(agent))
@@ -394,10 +512,12 @@ impl SessionManager {
         let principal = self.resolve(agent.as_ref()).await?;
         let mut registry = self.registry.lock().await;
         let now = Instant::now();
-        registry.expire(now);
-        let result = registry.claim(instance, mode, agent.as_ref(), principal, now, self.lease);
-        registry.publish_presence(&self.central);
-        result
+        self.with_context(&mut registry, |registry, current| {
+            registry.expire(now);
+            check_current_principal(&principal, current)?;
+            registry.claim(instance, mode, agent.as_ref(), principal, now, self.lease)
+        })
+        .await
     }
 
     /// 세션에 Agent 바인딩 (활성화 및 ONLINE presence 전파)
@@ -410,17 +530,22 @@ impl SessionManager {
         // 비동기 작업 전 세션 유효성을 먼저 확인하여 만료된 요청 차단
         {
             let mut registry = self.registry.lock().await;
-            registry.expire(Instant::now());
-            registry.publish_presence(&self.central);
-            registry.current(id, instance)?;
+            self.with_context(&mut registry, |registry, _| {
+                registry.expire(Instant::now());
+                registry.current(id, instance).map(|_| ())
+            })
+            .await?;
         }
         let principal = self.resolve(Some(&agent)).await?;
         let mut registry = self.registry.lock().await;
         let now = Instant::now();
-        registry.expire(now);
-        let result = registry.bind(id, instance, principal, now, self.lease);
-        registry.publish_presence(&self.central);
-        result
+        self.with_context(&mut registry, |registry, current| {
+            registry.expire(now);
+            registry.current(id, instance)?;
+            check_current_principal(&principal, current)?;
+            registry.bind(id, instance, principal, now, self.lease)
+        })
+        .await
     }
 
     /// 세션 임대 기간 연장 (heartbeat)
@@ -431,9 +556,12 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         let mut registry = self.registry.lock().await;
         let now = Instant::now();
-        registry.expire(now);
-        registry.publish_presence(&self.central);
-        registry.renew(id, instance, now, self.lease)
+        self.with_context(&mut registry, |registry, current| {
+            registry.expire(now);
+            check_current_principal(&registry.current(id, instance)?.view.principal, current)?;
+            registry.renew(id, instance, now, self.lease)
+        })
+        .await
     }
 
     /// 세션 명시적 해제 및 OFFLINE presence 전파
@@ -443,22 +571,28 @@ impl SessionManager {
         instance: &Identifier,
     ) -> Result<(), SessionError> {
         let mut registry = self.registry.lock().await;
-        registry.expire(Instant::now());
-        registry.publish_presence(&self.central);
-        registry.release(id, instance)?;
-        registry.publish_presence(&self.central);
+        self.with_context(&mut registry, |registry, _| {
+            registry.expire(Instant::now());
+            registry.release(id, instance)
+        })
+        .await?;
         Ok(())
     }
 
     /// 만료 주기 실행
     pub async fn expire(&self) {
         let mut registry = self.registry.lock().await;
-        registry.expire(Instant::now());
-        registry.publish_presence(&self.central);
+        let _ = self
+            .with_context(&mut registry, |registry, _| {
+                registry.expire(Instant::now());
+                Ok(())
+            })
+            .await;
     }
 
     /// 백그라운드 세션 만료 타이머 태스크 (HTTP 요청이 없어도 90초 경과 시 자동 OFFLINE 전파)
     pub async fn run_expiration(self, cancel: CancellationToken) {
+        let mut subjects = self.central.subject_changes();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -473,6 +607,10 @@ impl SessionManager {
                     return;
                 }
                 _ = tick.tick() => self.expire().await,
+                changed = subjects.changed(), if self.identity.requires_current_ready() => {
+                    if changed.is_err() { return; }
+                    self.expire().await;
+                }
             }
         }
     }
@@ -483,6 +621,155 @@ mod tests {
     use super::*;
     use crate::central::ConnectionStatus;
     use tokio::sync::{Notify, RwLock};
+
+    async fn ready_as(
+        central: &CentralState,
+        user: u64,
+        team: u64,
+        agent: u64,
+    ) -> crate::central::SessionHandle {
+        let handle = central.begin_session().await;
+        handle
+            .set_identity(CentralIdentity {
+                connection_id: uuid::Uuid::new_v4().to_string(),
+                agent_id: agent,
+                user_id: Some(user),
+                team_id: Some(team),
+            })
+            .await;
+        handle.set_status(ConnectionStatus::Connected).await;
+        handle
+    }
+
+    #[tokio::test]
+    async fn ready_provider_requires_current_complete_identity_and_checks_agent() {
+        let central = central();
+        let provider = ReadyIdentityProvider::new(central.clone());
+        assert_eq!(
+            provider.resolve(None).await,
+            Err(IdentityError::Unavailable)
+        );
+        let legacy = central.begin_session().await;
+        legacy
+            .set_identity(CentralIdentity {
+                connection_id: "legacy".into(),
+                agent_id: 12,
+                user_id: None,
+                team_id: None,
+            })
+            .await;
+        legacy.set_status(ConnectionStatus::Connected).await;
+        assert_eq!(
+            provider.resolve(None).await,
+            Err(IdentityError::Unauthenticated)
+        );
+        let handle = ready_as(&central, 3, 1, 12).await;
+        assert_eq!(
+            provider.resolve(None).await.unwrap(),
+            Principal {
+                user_id: id("3"),
+                team_id: id("1"),
+                agent_id: None,
+                tool_type: None
+            }
+        );
+        assert_eq!(
+            provider.resolve(Some(&id("12"))).await.unwrap().agent_id,
+            Some(id("12"))
+        );
+        assert_eq!(
+            provider.resolve(Some(&id("13"))).await,
+            Err(IdentityError::Forbidden)
+        );
+        handle.clear_identity().await;
+        handle.set_status(ConnectionStatus::Reconnecting).await;
+        assert_eq!(
+            provider.resolve(None).await,
+            Err(IdentityError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn same_ready_subject_preserves_sessions_and_changed_subject_expires_them() {
+        let central = central();
+        let manager = SessionManager::new(
+            Arc::new(ReadyIdentityProvider::new(central.clone())),
+            central.clone(),
+        );
+        let old = ready_as(&central, 3, 1, 12).await;
+        let session = manager
+            .claim(id("host"), ClaimMode::Fresh, Some(id("12")))
+            .await
+            .unwrap();
+        assert_eq!(central.presence().await, Some(PresenceStatus::Online));
+        old.clear_identity().await;
+        old.set_status(ConnectionStatus::Reconnecting).await;
+        assert_eq!(
+            manager.heartbeat(&session.session_id, &id("host")).await,
+            Err(SessionError::Identity(IdentityError::Unavailable))
+        );
+        ready_as(&central, 3, 1, 12).await;
+        manager
+            .heartbeat(&session.session_id, &id("host"))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .claim(id("host"), ClaimMode::Recover, Some(id("12")))
+                .await
+                .unwrap()
+                .session_id,
+            session.session_id
+        );
+        // A -> B -> A also invalidates old sessions even when the watcher skips B.
+        ready_as(&central, 3, 2, 12).await;
+        ready_as(&central, 3, 1, 12).await;
+        assert_eq!(central.presence().await, Some(PresenceStatus::Offline));
+        assert_eq!(
+            manager.heartbeat(&session.session_id, &id("host")).await,
+            Err(SessionError::Expired)
+        );
+        let new = manager
+            .claim(id("host"), ClaimMode::Recover, Some(id("12")))
+            .await
+            .unwrap();
+        assert_ne!(new.session_id, session.session_id);
+        assert_eq!(
+            manager.release(&session.session_id, &id("host")).await,
+            Err(SessionError::Expired)
+        );
+        assert_eq!(central.presence().await, Some(PresenceStatus::Online));
+    }
+
+    #[tokio::test]
+    async fn changed_ready_subject_clears_ownership_without_http_requests() {
+        let central = central();
+        let manager = SessionManager::new(
+            Arc::new(ReadyIdentityProvider::new(central.clone())),
+            central.clone(),
+        );
+        ready_as(&central, 3, 1, 12).await;
+        manager
+            .claim(id("host"), ClaimMode::Fresh, Some(id("12")))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let expiration = tokio::spawn(manager.clone().run_expiration(cancel.clone()));
+        ready_as(&central, 4, 1, 13).await;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.registry.lock().await.sessions.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(central.presence().await, Some(PresenceStatus::Offline));
+        cancel.cancel();
+        expiration.await.unwrap();
+    }
 
     fn id(value: &str) -> Identifier {
         Identifier::parse(value).unwrap()

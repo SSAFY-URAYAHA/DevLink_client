@@ -1,5 +1,7 @@
 # 로컬 MCP 세션 API
 
+2026-10-29 갱신: 기본 CLI에 [READY 기반 신원 공급부](ready-identity.md)를 연결했다. 아래 2026-10-28 미구성 공급부 설명은 당시 기록이다. 현재 중앙의 user_id/team_id/agent_id가 있는 READY와 Connected 상태에서는 로컬 세션 생성·bind가 가능하며, legacy READY는 계속 CENTRAL_UNAUTHENTICATED다. 신원이 바뀌면 기존 세션을 만료시키고, 같은 신원 재접속은 lease 안의 소유권을 유지한다. 이 공급부와 실제 로컬 HTTP/WebSocket·CLI는 Mock으로 검증하며 운영 중앙 연동 완료를 뜻하지 않는다.
+
 2026-10-28 (Asia/Seoul). 기존 [MCP 계약](../../packages/mcp-server/docs/broker-contract-v0.1.md)의 로컬 세션 관리 부분을 구현했습니다. 중앙 신원 조회·Agent 등록·토큰 발급과 업무 API는 별도 후속 항목입니다.
 
 ## 구현 범위와 현재 실행 상태

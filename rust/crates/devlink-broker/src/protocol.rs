@@ -145,12 +145,32 @@ pub struct BrokerReadyPayload {
     pub connection_id: String,
     /// 인증된 Agent의 숫자 식별자 (양의 정수)
     pub agent_id: u64,
+    /// Verified central identity. Both omitted is legacy transport-only READY.
+    #[serde(
+        default,
+        deserialize_with = "crate::sessions::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_id: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "crate::sessions::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub team_id: Option<u64>,
 }
 
 impl BrokerReadyPayload {
     /// `connection_id`가 비어 있지 않고 `agent_id`가 양수인지 검증합니다.
     pub fn is_valid(&self) -> bool {
-        !self.connection_id.trim().is_empty() && self.agent_id > 0
+        let positive = |id| id > 0 && id <= i64::MAX as u64;
+        !self.connection_id.trim().is_empty()
+            && positive(self.agent_id)
+            && match (self.user_id, self.team_id) {
+                (None, None) => true,
+                (Some(user), Some(team)) => positive(user) && positive(team),
+                _ => false,
+            }
     }
 }
 
@@ -218,6 +238,41 @@ impl ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_identity_fields_are_positive_numeric_pairs() {
+        let base = serde_json::json!({"type":"BROKER_READY","payload":{
+            "connection_id":"verified","agent_id":12,"user_id":3,"team_id":1
+        }});
+        let message: ServerMessage = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&message).unwrap(), base);
+        let ServerMessage::BrokerReady(ready) = message else {
+            panic!("READY required")
+        };
+        assert!(ready.is_valid());
+        assert_eq!((ready.user_id, ready.team_id), (Some(3), Some(1)));
+        for (field, value) in [
+            ("user_id", serde_json::json!(null)),
+            ("team_id", serde_json::json!("1")),
+            ("user_id", serde_json::json!(-1)),
+            ("team_id", serde_json::json!(0)),
+            ("user_id", serde_json::json!(u64::MAX)),
+        ] {
+            let mut invalid = base.clone();
+            invalid["payload"][field] = value;
+            let result = serde_json::from_value::<ServerMessage>(invalid);
+            assert!(!matches!(result, Ok(ServerMessage::BrokerReady(ready)) if ready.is_valid()));
+        }
+        let mut partial = base;
+        partial["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("team_id");
+        let ServerMessage::BrokerReady(ready) = serde_json::from_value(partial).unwrap() else {
+            panic!("READY required")
+        };
+        assert!(!ready.is_valid());
+    }
 
     #[test]
     fn broker_ready_parses_valid_payload_and_rejects_invalid_shapes() {

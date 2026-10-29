@@ -71,6 +71,8 @@ pub struct CentralIdentity {
     pub connection_id: String,
     /// 인증된 Agent의 숫자 식별자
     pub agent_id: u64,
+    pub user_id: Option<u64>,
+    pub team_id: Option<u64>,
 }
 
 /// 스레드/비동기 태스크 간 안전하게 공유되는 연결 상태 타입
@@ -90,6 +92,8 @@ struct StateInner {
     generation: u64,
     status: ConnectionStatus,
     identity: Option<CentralIdentity>,
+    subject: Option<(u64, u64, u64)>,
+    subject_epoch: u64,
 }
 
 /// 세대(generation) 번호를 통해 이전 연결의 지연 정리나 타이머가
@@ -101,6 +105,7 @@ pub struct CentralState {
     identity: SharedIdentity,
     presence: SharedPresence,
     inbox: Option<Inbox>,
+    subject_changes: watch::Sender<u64>,
 }
 
 impl CentralState {
@@ -122,11 +127,14 @@ impl CentralState {
                 generation: 0,
                 status: ConnectionStatus::Connecting,
                 identity: None,
+                subject: None,
+                subject_epoch: 0,
             })),
             status,
             identity,
             presence,
             inbox: None,
+            subject_changes: watch::channel(0).0,
         }
     }
 
@@ -155,6 +163,19 @@ impl CentralState {
     /// 현재 활성 연결의 식별 정보를 조회합니다.
     pub async fn identity(&self) -> Option<CentralIdentity> {
         self.identity.read().await.clone()
+    }
+
+    /// Apply a local identity-dependent mutation while central identity cannot change.
+    pub(crate) async fn with_ready_context<T>(
+        &self,
+        operation: impl FnOnce(ConnectionStatus, Option<&CentralIdentity>, u64) -> T,
+    ) -> T {
+        let guard = self.inner.read().await;
+        operation(guard.status, guard.identity.as_ref(), guard.subject_epoch)
+    }
+
+    pub(crate) fn subject_changes(&self) -> watch::Receiver<u64> {
+        self.subject_changes.subscribe()
     }
 
     /// 현재 확인된 로컬 Agent 접속 상태를 조회합니다 (`None`이면 미확인).
@@ -205,6 +226,19 @@ impl SessionHandle {
         let mut guard = self.state.inner.write().await;
         if guard.generation != self.generation {
             return false;
+        }
+        let subject = identity
+            .user_id
+            .zip(identity.team_id)
+            .map(|(user, team)| (user, team, identity.agent_id));
+        if guard.subject != subject {
+            guard.subject = subject;
+            guard.subject_epoch = guard.subject_epoch.saturating_add(1);
+            // Never advertise old local ownership for a different authenticated subject.
+            if self.state.presence.borrow().is_some() {
+                self.state.set_presence(PresenceStatus::Offline);
+            }
+            self.state.subject_changes.send_replace(guard.subject_epoch);
         }
         guard.identity = Some(identity.clone());
         *self.state.identity.write().await = Some(identity);
@@ -609,6 +643,8 @@ async fn session(
                                     let identity = CentralIdentity {
                                         connection_id: payload.connection_id,
                                         agent_id: payload.agent_id,
+                                        user_id: payload.user_id,
+                                        team_id: payload.team_id,
                                     };
                                     if !handle.set_identity(identity).await {
                                         let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
@@ -657,7 +693,8 @@ async fn session(
                                     let identity = handle.state.identity().await;
                                     // 1. BROKER_READY 완료 여부 및 수신 Agent 일치 검증
                                     let Some(identity) = identity else { return Outcome::ProtocolViolation; };
-                                    if !message.is_valid() || message.payload.receiver_agent_id != identity.agent_id {
+                                    if !message.is_valid() || message.payload.receiver_agent_id != identity.agent_id
+                                        || identity.team_id.is_some_and(|team| team != message.payload.team_id) {
                                         let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
                                         return Outcome::ProtocolViolation;
                                     }
@@ -754,6 +791,8 @@ mod tests {
             ServerMessage::BrokerReady(BrokerReadyPayload {
                 connection_id: "stalled-write".into(),
                 agent_id: 12,
+                user_id: None,
+                team_id: None,
             }),
             ServerMessage::TaskCreated {
                 event_id: "task-event".into(),
@@ -878,6 +917,7 @@ mod tests {
                         let ready = ServerMessage::BrokerReady(BrokerReadyPayload {
                             connection_id: format!("heartbeat-{connection}"),
                             agent_id: 11,
+                            user_id: None, team_id: None,
                         });
                         socket.send(Message::Text(serde_json::to_string(&ready).unwrap().into())).await.unwrap();
                         let expiration = sleep(Duration::from_millis(250));
@@ -1178,6 +1218,8 @@ mod tests {
                 .set_identity(CentralIdentity {
                     connection_id: "conn-old".into(),
                     agent_id: 11,
+                    user_id: None,
+                    team_id: None,
                 })
                 .await
         );
@@ -1191,6 +1233,8 @@ mod tests {
                 .set_identity(CentralIdentity {
                     connection_id: "conn-new".into(),
                     agent_id: 11,
+                    user_id: None,
+                    team_id: None,
                 })
                 .await
         );
@@ -1205,6 +1249,8 @@ mod tests {
                 .set_identity(CentralIdentity {
                     connection_id: "conn-stale".into(),
                     agent_id: 99,
+                    user_id: None,
+                    team_id: None,
                 })
                 .await
         );
@@ -1215,6 +1261,8 @@ mod tests {
             Some(CentralIdentity {
                 connection_id: "conn-new".into(),
                 agent_id: 11,
+                user_id: None,
+                team_id: None,
             })
         );
     }

@@ -49,7 +49,7 @@ cargo run -p devlink-cli -- stop
 
 Mock 서버를 Ctrl+C로 종료하면 `status`가 `Reconnecting`으로 바뀝니다. 같은 포트·토큰으로 서버를 다시 실행하면 `Connected`로 돌아옵니다. `Connected`는 `/ws/broker` WebSocket Upgrade 인증(`Authorization: Bearer <DEVLINK_TOKEN>`) 후 유효한 `BROKER_READY` 수신(확인된 로컬 Agent 상태가 있는 경우 초기 `AGENT_PRESENCE` 보고 포함; 로컬 상태 미확인 시 추측한 `AGENT_PRESENCE`는 전송하지 않음)까지 마친 상태입니다. Upgrade HTTP `401`/`403`은 `AuthFailed`, 동일 Agent의 새 연결 교체(`4002`)는 `Replaced`, 메시지/정책 위반(`1008` 또는 잘못된 `BROKER_READY`)은 `ProtocolViolation`이 되며 자동 재시도하지 않습니다. 이 경우 토큰이나 설정을 고친 뒤 `stop`/`start`로 다시 시작합니다. Close `4001`은 하트비트 만료이며 `autoReconnect` 설정에 따라 재접속합니다.
 
-중앙 연결·로컬 HTTP·세션 관리자는 같은 `CentralState`를 공유합니다. 검증된 세션의 생성·bind·해제·만료에서 활성 bound 소유자 유무로 presence를 계산하고 `set_presence(Online/Offline)`에 게시합니다. READY 이후 변경 보고, 동일 상태 중복 생략, 재접속 시 최신 상태 재보고를 사용합니다. 기본 상태는 미확인(`None`)이며 health·거부된 요청만으로 상태를 확정하지 않습니다. 실제 중앙 신원 공급부 연결은 별도 후속 항목입니다.
+중앙 연결·로컬 HTTP·세션 관리자는 같은 `CentralState`를 공유합니다. 검증된 세션의 생성·bind·해제·만료에서 활성 bound 소유자 유무로 presence를 계산하고 `set_presence(Online/Offline)`에 게시합니다. READY 이후 변경 보고, 동일 상태 중복 생략, 재접속 시 최신 상태 재보고를 사용합니다. 기본 상태는 미확인(`None`)이며 health·거부된 요청만으로 상태를 확정하지 않습니다. READY 신원 공급부는 연결했고 실제 운영 중앙에서의 검증은 후속 항목입니다.
 
 ## 설정
 
@@ -105,9 +105,9 @@ MCP는 처음 읽은 주소·토큰을 실행 중 고정합니다. 토큰 회전
 
 ## 로컬 MCP 세션
 
-세션 생성·bind·heartbeat·해제 HTTP 경로와 90초 lease·fresh/recover 소유권·presence 연결을 구현했습니다. 중앙 신원 공급부는 `IdentityProvider` 인터페이스로 분리했고, 기본 CLI에는 미구성 공급부를 연결합니다. 따라서 현재 정상 MCP 토큰으로 `POST /v1/sessions`를 호출하면 **503 CENTRAL_UNAUTHENTICATED**이며, 사용자·팀을 임의로 만들어 성공시키지 않습니다. 성공 경로는 테스트 내부의 검증 신원 공급부로 검증합니다.
+세션 생성·bind·heartbeat·해제 HTTP 경로와 90초 lease·fresh/recover 소유권·presence 연결을 구현했습니다. 2026-10-29부터 기본 CLI는 ReadyIdentityProvider로 현재 중앙 READY의 user_id/team_id/agent_id를 검증해 세션 Principal을 구성합니다. 전체 신원이 없는 구버전 READY는 연결만 유지하고 세션은 503 CENTRAL_UNAUTHENTICATED로 거부합니다. 단절 중에는 신원을 재사용해 새 세션을 만들거나 lease를 연장하지 않습니다.
 
-세션 API는 MCP localToken만 허용하며 CLI controlToken은 거부합니다. 중앙 신원 전달·등록 계약이 정해지면 실제 공급부를 연결해야 합니다. [로컬 세션 API](docs/local-sessions.md)에 경로·JSON·오류·소유권·presence·검증 범위를 정리했습니다.
+세션 API는 MCP localToken만 허용하며 CLI controlToken은 거부합니다. 동일 신원 재접속은 세션을 유지하고 다른 신원은 이전 소유권을 무효화합니다. [READY 신원 계약](docs/ready-identity.md)과 [로컬 세션 API](docs/local-sessions.md)에 경로·JSON·오류·소유권·presence·검증 범위를 정리했습니다. 실제 운영 토큰 발급·업무 REST·MCP Host 왕복은 후속 연결입니다.
 
 ## 상태와 오류 처리
 
@@ -151,6 +151,6 @@ Central Server: Connected
 cargo test --offline --locked -p devlink-cli --test cli_broker json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect -- --exact --test-threads=1
 ```
 
-[중앙 WebSocket 연동 규칙](docs/central-websocket-contract.md)에 보안 전략·작업 기록과 현재 로컬 서버의 JSON Heartbeat·만료 처리 소스를 기준으로 인증, READY·PRESENCE, 연결 교체·종료 규칙과 Rust 적용 현황을 정리했습니다. MCP 신원 전달·업무 라우팅과 실제 배포 환경 검증은 후속 항목입니다.
+[중앙 WebSocket 연동 규칙](docs/central-websocket-contract.md)에 인증, READY·PRESENCE, 연결 교체·종료 규칙과 Rust 적용 현황을 정리했습니다. READY 신원·작업 수신함·ACK는 로컬 Mock으로 검증했고, 업무 API와 실제 배포 환경 검증은 후속 항목입니다.
 
-[진행 현황](PROJECT_STATUS.md), [TypeScript 분석](docs/typescript-analysis.md), [MCP 실행 구조 및 내부 API](docs/mcp-interface.md), [작업별 현황](docs/task-status.md)을 참고하세요. 로컬 세션 API 4개·소유권·만료·presence는 구현됐으며 중앙 신원 공급부·Agent 등록·업무 API·실제 Host 왕복 연결이 남아 있습니다.
+[진행 현황](PROJECT_STATUS.md), [TypeScript 분석](docs/typescript-analysis.md), [MCP 실행 구조 및 내부 API](docs/mcp-interface.md), [작업별 현황](docs/task-status.md)을 참고하세요. 로컬 세션 API 4개·소유권·만료·presence·READY 신원 공급부는 구현됐으며 Agent 등록·토큰 발급·업무 API·누락 복구·실제 Host 왕복 연결이 남아 있습니다.

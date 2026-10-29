@@ -3,8 +3,8 @@ use devlink_broker::{
     protocol::PresenceStatus,
     session_api,
     sessions::{
-        Identifier, IdentityError, IdentityFuture, IdentityProvider, SessionManager,
-        UnconfiguredIdentityProvider,
+        Identifier, IdentityError, IdentityFuture, IdentityProvider, ReadyIdentityProvider,
+        SessionManager, UnconfiguredIdentityProvider,
     },
 };
 use reqwest::{Client, Method};
@@ -64,7 +64,12 @@ struct Fixture {
 
 impl Fixture {
     async fn new(identity: Arc<dyn IdentityProvider>) -> Self {
+        Self::with_provider(|_| identity).await
+    }
+
+    async fn with_provider(build: impl FnOnce(CentralState) -> Arc<dyn IdentityProvider>) -> Self {
         let central = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)));
+        let identity = build(central.clone());
         let manager = SessionManager::new(identity, central.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -129,6 +134,91 @@ impl Fixture {
             .unwrap()
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn authenticated_ready_identity_flows_through_http_session_bind_and_presence() {
+    use devlink_broker::{central, config::Config};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let f = Fixture::with_provider(|central| Arc::new(ReadyIdentityProvider::new(central))).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        server_url: format!("ws://{}", listener.local_addr().unwrap()),
+        ..Config::default()
+    };
+    let runner = tokio::spawn(central::run_with_state(
+        config,
+        "synthetic-agent-token".into(),
+        f.central.clone(),
+        f.cancel.clone(),
+    ));
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"BROKER_READY","payload":{
+                "connection_id":"verified-ready","agent_id":12,"user_id":3,"team_id":1
+            }})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        while f.central.status().await != ConnectionStatus::Connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (status, claimed) = f.claim("ready-host", "fresh", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        claimed["data"]["principal"],
+        json!({"userId":"3","teamId":"1"})
+    );
+    let session_id = claimed["data"]["sessionId"].as_str().unwrap();
+    let (status, refused) = f
+        .send(
+            Method::POST,
+            &format!("/v1/sessions/{session_id}/bind"),
+            json!({"requestId":"wrong-agent","instanceId":"ready-host","agentId":"13"}),
+        )
+        .await;
+    assert_eq!(status, 403);
+    assert_eq!(refused["error"]["code"], "FORBIDDEN");
+    let (status, bound) = f
+        .send(
+            Method::POST,
+            &format!("/v1/sessions/{session_id}/bind"),
+            json!({"requestId":"bind-ready","instanceId":"ready-host","agentId":"12"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        bound["data"]["principal"],
+        json!({"userId":"3","teamId":"1","agentId":"12"})
+    );
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Ok(Message::Text(text))) = socket.next().await {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "AGENT_PRESENCE" && value["payload"]["status"] == "ONLINE" {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    f.cancel.cancel();
+    timeout(Duration::from_secs(3), runner)
+        .await
+        .unwrap()
+        .unwrap();
+    f.stop().await;
 }
 
 impl Drop for Fixture {

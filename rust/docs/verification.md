@@ -1,5 +1,22 @@
 # 로컬 검증 기록
 
+## 2026-10-29: READY 신원 확장·실제 로컬 세션 공급부
+
+`83169e8` 이후 작업 트리에 합의된 READY user_id/team_id와 ReadyIdentityProvider를 연결했습니다. 중앙에서 받은 숫자 ID를 MCP Principal 문자열로 변환하며, 잘못된/누락 신원·다른 Agent를 거부합니다. 같은 신원의 재접속은 세션을 유지하고, 사용자·팀·Agent 변경과 A → B → A 경합은 subject epoch로 이전 소유권을 무효화합니다. 상세 동작은 [READY 신원 문서](ready-identity.md)를 참고하세요.
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 통과 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 36개·세션 통합 7개·수신 통합 3개·CLI 통합 32개, 총 78개 통과. 실패·무시 0 |
+| `git diff --check` | 통과 |
+
+Windows MSVC에서 임시 디렉터리와 로컬 Mock으로 검증했습니다. 기존 Windows ACL·로컬 소켓 제한에 따라 테스트는 승인된 샌드박스 외부에서 실행했습니다. 단위 묶음 9.75초, 세션 통합 0.05초, 수신 통합 1.66초, CLI 통합 119.08초입니다. 45초 실제 주기 Heartbeat 회귀, 수신함·ACK·재시작·기존 인증 분리 회귀도 포함합니다.
+
+추가 검증은 숫자 신원 pair·null/부분 누락/범위 거부, legacy READY의 세션 거부, 다른 Agent claim/bind 거부, 같은 신원 reconnect의 세션 유지, 신원 변경 후 이전 세션 heartbeat/delete 차단과 요청 없는 소유권 정리입니다. 실제 WebSocket READY → HTTP claim → bind → ONLINE, 실제 CLI의 claim → heartbeat → delete → OFFLINE도 확인했습니다. toolType은 임의 생성하지 않습니다.
+
+업무 REST 인증은 Agent Bearer 방향을 문서화했으며 토큰 발급·업무/복구 API의 경로와 DTO를 임의로 추가하지 않았습니다. 중앙 서버·MCP TypeScript·의존성은 변경하지 않았고 이번 작업의 커밋·Push는 하지 않았습니다. 실제 운영 토큰·중앙 배포·DB·MCP Host 왕복과 Unix 실행은 미검증입니다.
+
 ## 2026-10-29: 작업 수신함·저장 후 ACK
 
 사용자 요청으로 동일 작업 트리를 재검증했습니다. 포맷·Clippy(-D warnings)·전체 73개 테스트·git diff --check가 다시 통과했습니다. 실패·무시 0이며 단위 10.00초, 세션 통합 0.04초, 작업 수신 통합 1.60초, CLI 통합 121.88초입니다. 기존에 확인한 Windows ACL·로컬 소켓 제약에 따라 테스트는 승인된 샌드박스 외부에서 실행했습니다. 실제 중앙·MCP Host 연동은 이번 재검증에도 포함하지 않았고, 기능 코드는 추가 수정하지 않았습니다.

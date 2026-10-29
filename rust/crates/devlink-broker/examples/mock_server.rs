@@ -74,6 +74,8 @@ async fn main() -> Result<()> {
             let ready = serde_json::to_string(&ServerMessage::BrokerReady(BrokerReadyPayload {
                 connection_id: format!("mock-session-{seq}"),
                 agent_id: 1,
+                user_id: Some(1),
+                team_id: Some(1),
             }))
             .expect("serializable BROKER_READY");
 
