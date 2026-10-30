@@ -179,13 +179,15 @@ impl TaskClient {
     /// HTTP POST 통신 및 중앙 서버 응답 엔벨로프 검증 수행
     async fn exchange(
         &self,
-        _team_id: u64,
+        team_id: u64,
         command: &CreateTaskCommand,
     ) -> Result<Value, TaskError> {
-        // The Agent API derives requester/team from its authenticated principal.
-        // Never send actor IDs to the legacy user/temporary-parameter route.
+        // The caller verified this team against the Agent context. The server
+        // authenticates the requester from the Bearer token, never body/query IDs.
         let body = json!({"requestKey":command.request_key,"receiverAgentId":command.receiver_agent_id,"prompt":command.prompt});
-        let (status, envelope) = self.request("/api/v1/agent/tasks", Some(body)).await?;
+        let (status, envelope) = self
+            .request(&format!("/api/v1/tasks/{team_id}"), Some(body))
+            .await?;
         self.map_created(status, envelope, command)
     }
 
@@ -268,7 +270,7 @@ impl TaskClient {
             || data.replayed != (status == 200)
             || !matches!(
                 data.status.as_str(),
-                "PENDING" | "IN_PROGRESS" | "COMPLETED" | "FAILED"
+                "PENDING" | "IN_PROGRESS" | "COMPLETED" | "FAILED" | "REJECTED"
             )
         {
             return Err(protocol_error());

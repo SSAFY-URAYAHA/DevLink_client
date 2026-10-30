@@ -51,6 +51,7 @@ clear는 control.lock/broker.lock/inbox.lock 하에서 **해당 프로필의 모
 - 단위/실소켓: 기존 schema1 보존·schema2 이력·event/task 충돌·원자 batch·정리/기록 상호 배제·손상 거부, 느린 기록 중 heartbeat와 무선행 ACK, 오래된 generation 무ACK, 16건 burst의 기본5초 예산을 회귀로 검증한다.
 - 실제 CLI: start→수신→ACK→stop→새 instanceId start→새 event로 같은 task 재수신·ACK, 업무1건 유지와 event 이력 추가, 실행 중 clear 거부와 정지 후 정리, 제어 문자·로컬 Agent 필터를 확인한다.
 - 실제 중앙 재현: loopback Spring/PostgreSQL을 준비하고 DEVLINK_TEST_CENTRAL_URL과 절대 DEVLINK_TEST_CLI를 지정해 저장소 루트에서 node rust/scripts/verify-task-inbox.mjs를 실행한다. 합성 사용자2명·실제 Rust 수신자·확인된 세션 presence로16건 ACK_RECEIVED, 재시작 후 새 업무 ACK, 실제 로컬 기록 실패의 무ACK/DELIVERY_UNKNOWN을 점검한다.
+- 현재 재현 스크립트의 생성 경로는 Agent Bearer `POST /api/v1/tasks/{teamId}`다. 팀은 발급된 송신 Agent의 teamId를 사용한다. 이전 생성 URL만 제공하는 server snapshot은 지원하지 않으며, 최신 경로 변경의 실행 결과는 [생성 계약 검증 기록](task-create-contract-verification.md)에 구분한다.
 - 실제 중앙의 requestKey 재조회는 기존 업무를 재전송하지 않는다. 이를 wire 재전달 검증으로 세지 않으며, 같은/새 event 재전달과 재시작 dedup은 실소켓 fixture에서 별도로 검증한다.
 
 ~~~powershell
