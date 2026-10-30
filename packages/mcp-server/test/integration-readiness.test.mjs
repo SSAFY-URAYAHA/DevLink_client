@@ -26,7 +26,8 @@ function respond(res, status, body = '') { res.writeHead(status); res.end(body);
 
 test('real credential reader + health-only Rust shape blocks all 11 routes without mutations or secret output', async (t) => {
   const f = await fixture(t, (req, res) => respond(res, req.url === '/health' ? 200 : 404,
-    req.url === '/health' ? JSON.stringify({ ...health, centralServer: 'Disconnected', secret: token }) : token));
+    req.url === '/health' ? JSON.stringify({ ...health, centralServer: 'Disconnected',
+      inbox: { rejectedEvents: 1, lastError: 'STORE_FAILED' }, secret: token }) : token));
   const file = await privateSettings(f.settings);
   t.after(file.cleanup);
   const result = await checkIntegration(file.path);
@@ -35,6 +36,8 @@ test('real credential reader + health-only Rust shape blocks all 11 routes witho
   assert.equal(result.routes.length, 11);
   assert.ok(result.routes.every((r) => r.observation === 'NOT_FOUND'));
   assert.ok(result.blockers.includes('CENTRAL_NOT_CONNECTED'));
+  assert.deepEqual(result.health.health, { centralServer: 'Disconnected' });
+  assert.ok(!JSON.stringify(result).includes('STORE_FAILED'));
   assert.equal(f.calls[0].method, 'GET');
   assert.deepEqual(f.calls.slice(1).map((c) => c.path), requiredRoutes);
   assert.ok(f.calls.slice(1).every((c) => c.method === 'OPTIONS'));

@@ -1,53 +1,63 @@
-# 작업 수신함·ACK
+# 작업 수신함·ACK — S15P31D108-95 통합
 
-2026-10-29. 중앙의 기존 `TASK_CREATED`와 `ACK` 형식으로 Rust 로컬 수신 경로를 구현했다. 이후 중앙 담당자와 저장 후 ACK·기본 5초 유지 방향을 확인했다. 실제 운영 중앙·MCP Host의 업무 왕복 완료를 의미하지 않는다. [READY 신원과 후속 계약](ready-identity.md)을 참고한다.
+2026-10-30. 최신 develop의 TASK_CREATED/ACK 타입, Inbox::open/record/list_for, 중앙·세션 코드를 유지하고 닫힌 PR #16의 필요한 CLI·영속성 보완을 통합했다. 이전 PR 전체를 덮어쓰거나 별도 수신함을 병행하지 않는다. ACK는 저장 확인이며 열람·사용자 수락·편집·IN_PROGRESS 전이가 아니다.
 
-## 수신 순서
+## 수신과 기록
 
-1. 유효한 `BROKER_READY` 이후 `TASK_CREATED`를 받는다. 합의된 user_id/team_id가 있는 READY를 지원하며, team_id가 있으면 수신 작업의 팀도 대조한다.
-2. 양의 숫자 ID·비어 있지 않은 event_id/prompt/created_at, 현재 인증된 Agent와 receiver_agent_id의 일치를 검증한다. created_at은 시간대를 추정하지 않고 서버 문자열 그대로 보존한다.
-3. `.devlink-runtime/inbox.json`에 기록한다. 임시 파일 비공개 권한 → 쓰기 → sync_all → 권한 검사 → 원자 교체 순서이며 Unix는 부모 디렉터리도 sync한다.
-4. 저장 성공 뒤 현재 WebSocket으로 `{"type":"ACK","payload":{"event_id":"현재 전송 ID","task_id":101}}`를 보낸다. 작업 수락·실행·완료는 하지 않는다.
+1. 유효한 BROKER_READY 이후 양의 signed64-bit ID, event_id/prompt/created_at, 인증된 receiver_agent_id를 확인한다. READY team_id가 있으면 팀도 대조한다. 수신 payload를 사용자 신원으로 승격하지 않는다.
+2. 최대5ms/16건을 묶어 하나의 snapshot으로 저장한다. blocking writer는 Inbox당1개이고 현재 연결은 기록 중 batch1개 + 대기16건까지만 보관한다. heartbeat/control Ping/close 처리는 계속한다. 초과하면 ACK 없이 연결을 닫는 기존 재연결 정책을 따른다.
+3. 안전한 경로·기존 private 파일을 확인하고 inbox.lock을 잡는다. 임시 파일의 사용자 전용 권한 설정·검사 → 쓰기·sync_all → 원자 교체 → 최종 ACL 검사·열려 있는 write 핸들 sync_all, Unix 부모 디렉터리 sync를 거쳐야 ACK를 반환한다.
+4. ACK 직전 현재 연결 generation과 Agent를 다시 확인하고 같은 소켓으로 해당 event_id/task_id를 보낸다. 이전 generation의 완료는 새 신원/연결을 덮어쓰거나 ACK하지 않는다. 전송에 실패하면 기록을 되돌리지 않는다.
+5. batch 안에 충돌·용량·저장 실패가 있으면 batch 전체에 성공 ACK를 보내지 않고 InboxFailed로 닫는다. 원자 교체 전 검증 실패에는 부분 기록도 없다. 교체 후 최종 flush/권한 실패는 결과가 불확실하므로 성공으로 간주하지 않는다.
 
-수신함은 설정 디렉터리 단위로 보존되며 stop/start·토큰 회전에 삭제하지 않는다. snapshot schema_version은 1이다. 정규화된 중앙 URL + 수신 Agent ID + task_id로 중복을 판별한다. 다른 중앙 URL·Agent의 기록은 내부 조회에서도 분리한다. URL의 host 별칭은 자동 통합하지 않으며 중앙 DB 자체 교체 시 과거 ID 재사용 처리는 후속 운영 계약이다.
+Windows 파일 점유로 교체가 거부되면 private 임시 파일을 유지해 최대10회(재시도 간50ms, 최대450ms)만 다시 시도한다. 계속 점유되면 ACK 없이 실패하며 원본은 유지한다. 교체 전 실패로 인메모리 store를 영구 오염시키지 않고, 교체 후 검증/flush 실패만 불확실한 게시 상태로 잠근다. 중앙 연결의 실패 후 재시작 정책은 동일하다.
 
-같은 키와 같은 payload의 재수신은 새 항목을 만들지 않고 현재 전송의 event_id로 다시 ACK한다. event_id만 다른 재전달은 허용하지만 prompt·team·생성 시각 등 payload가 바뀌면 원본을 보존하고 ACK하지 않는다. 이것은 중복 수신함 항목 방지이며 Agent 실행의 exactly-once 보장이 아니다. 실제 실행 소유권·업무 상태 연결은 미구현이다.
+정규화된 중앙 URL + receiver_agent_id + task_id로 사용자 업무 중복을 방지한다. origin + receiver + event_id는 연결 재전달 이력이며 같은 event가 다른 task로 재사용되면 거부한다. 같은 task·payload에 새 event_id가 도착하면 업무는1건을 유지하고 새 영수증만 저장·ACK한다. **따라서 다른 event_id의 재전달은 journal 바이트를 바꿀 수 있다.** 같은 event/task의 완전 중복은 재기록 없이 확인 ACK한다. 실행의 exactly-once를 보장하는 계약이 아니다.
 
-## 실패·자원 제한
+## 파일과 호환
 
-- 신규 저장 실패·충돌·수신함 용량 초과·미구성 수신함은 ACK하지 않고 중앙 연결을 닫아 `InboxFailed`로 표시한다. 자동 재접속은 중단한다. 로컬 HTTP health·stop과 세션 lease 관리는 유지되므로 원인을 해결한 뒤 stop/start한다.
-- 잘못된 수신자나 유효하지 않은 작업 값은 `ProtocolViolation`이다. 초기 READY 이전 작업도 거부한다. 알 수 없거나 역직렬화할 수 없는 READY 이후 JSON은 기존대로 무시하며 ACK하지 않는다.
-- 손상·지원하지 않는 schema·중복 키·안전하지 않은 경로/권한의 기존 수신함은 기동 시 거부한다. 조용히 초기화하지 않는다. 원본을 보존한 뒤 복구해야 한다.
-- 파일은 최대 64 MiB, 기록은 전체 1,024건이다. 자동 삭제·오래된 항목 퇴출은 없다. 확정된 보관/정리 정책이 생기면 확장한다. 이는 로컬 자원 제한이며 중앙 API의 합의된 상한이 아니다.
-- 연결당 저장 대기 최대 16건, 실제 blocking writer는 Inbox당 1개다. 파일·ACL 처리는 spawn_blocking에서 수행해 Heartbeat·종료 처리를 막지 않는다. 연결당 대기가 가득 차면 해당 연결을 닫고 기존 재접속 정책을 따른다. 저장하지 못한 메시지에 ACK하지 않는다.
-- 단절·취소 직전에 이미 시작된 디스크 쓰기는 완료될 수 있다. 그 결과의 ACK를 새 연결에 옮겨 보내지 않는다. 이후 같은 작업을 재수신하면 저장된 기록으로 중복을 확인한다.
-- ACK의 중앙 기본 제한은 5초다. 느린 디스크나 큐 대기로 이 제한을 넘을 수 있으며 중앙 ACK 성공을 보장하지 않는다. 늦은 ACK·누락 조회·재전달은 공동 계약으로 남아 있다.
+현재 경로는 프로필별 .devlink-runtime/inbox.json이다. origin·Agent가 다른 기록을 함께 보관하되 조회에서 분리한다. 중앙 host alias는 자동 통합하지 않는다.
 
-## Mock 데모
+- 기존 upstream schema_version=1/tasks 파일을 원본 payload·origin·Agent 그대로 읽는다. 기존 첫 event는 해당 task의 dedup 근거로 사용한다.
+- tests/fixtures/inbox-v1-d49cdba.json은 d49cdba 원본 Inbox를 별도 빌드·실행해 생성한 파일이다. 기존 writer도 같은 endpoint_url 정규화와 StoredTask 필드를 사용함을 대조했고, 이 원본의 읽기·완전 중복 무변경·다음 기록 업그레이드를 회귀로 확인한다.
+- 새 기록/새 영수증을 저장할 때 schema_version=2로 전환하며 tasks와 receipts를 함께 원자 저장한다. 기존 파일의 완전 중복 조회만으로는 업그레이드하지 않는다.
+- 구버전 바이너리는 schema2를 읽지 못한다. 다운그레이드 전 private 원본을 별도로 보관·내보내야 하며 새 파일을 구버전 형식으로 임의 변경하지 않는다.
+- 최대64MiB·task1024건·추가 receipt16384건을 명시적 clear까지 보존한다. 자동 축출·기간 삭제는 없다. 한도 초과는 ACK 없이 거부하며 이미 아는 event의 확인은 가능하다.
+- 닫힌 PR16의 별도 inbox/tasks.json 형식은 최신 develop의 저장 계약이 아니다. 출처/Agent를 추측해 자동 병합·이동하거나 삭제하지 않는다. 필요하면 해당 브랜치와 원본을 보관한 뒤 별도 마이그레이션으로 다룬다.
+- 손상/schema/충돌/안전하지 않은 경로나 권한은 자동 초기화하지 않는다. 원본을 private 보관하고 원인을 수정한 후 재시작한다.
 
-개발용 Mock에서만 다음 값을 사용한다. 실제 작업 실행·운영 인증을 흉내 내는 설정은 아니다.
+stop/start·재연결·토큰 회전으로 수신함을 삭제하지 않는다. 종료 시 새 쓰기를 금지하고, 늦은 blocking writer도 파일 lock 획득 후 stop 상태를 확인한다. 실제 기록 중에는 inbox.lock이 clear와 겹치지 않게 하므로 정지 후 정리된 파일을 이전 worker가 되살리지 않는다. 단절 전에 시작된 저장은 완료될 수 있지만 ACK future는 그 연결에만 속한다.
 
-```powershell
-# 첫 번째 터미널: 동일 task_id를 서로 다른 event_id로 두 번 전달
-$env:DEVLINK_TOKEN = 'local-development-token'
-$env:DEVLINK_MOCK_TASK_DEMO = '1'
-cargo run -p devlink-broker --example mock_server
+## CLI 조회·정리
 
-# 두 번째 터미널: 별도 테스트 설정 사용
-$env:DEVLINK_TOKEN = 'local-development-token'
-cargo run -p devlink-cli -- --config .\.demo\config.json init
-cargo run -p devlink-cli -- --config .\.demo\config.json start
-cargo run -p devlink-cli -- --config .\.demo\config.json status
-cargo run -p devlink-cli -- --config .\.demo\config.json stop
-```
+다음 명령은 중앙 업무 상태를 변경하지 않는다. Host는 기존 get_tasks(received)를 사용하며 새 MCP push/tool을 추가하지 않는다.
 
-Mock에 ACK 2건이 표시되지만 `.demo/.devlink-runtime/inbox.json`에는 1건만 저장된다. 재시작 후에도 같은 작업은 추가되지 않는다. 데모 재전달은 Mock의 명시적인 테스트 동작이며 운영 중앙의 자동 재전송을 뜻하지 않는다.
+~~~powershell
+devlink --config C:\work\profile\config.json inbox list --limit 20
+devlink --config C:\work\profile\config.json inbox list --agent-id 34 --limit 100
+devlink --config C:\work\profile\config.json status
+devlink --config C:\work\profile\config.json stop
+devlink --config C:\work\profile\config.json inbox clear
+~~~
 
-## 계약이 필요한 후속 작업
+list는 디스크의 현재 원자 snapshot을 읽고 중앙 호출·디렉터리 생성·ACK·수락을 수행하지 않는다. 기본은 현재 serverUrl과 로컬 바인딩된 Agent다. 바인딩이 없는 legacy 프로필은 같은 서버의 기록을 표시한다. --agent-id는 로컬 표시 필터이며 인증 주체를 만들지 않는다. 최신 저장 순서부터 limit1~1024건의 server_url/message JSON을 표시해 requester_agent_id/task_id/prompt를 확인할 수 있다. C0는 JSON escape, DEL/C1/bidi/서식 문자는 표시 escape를 적용해 재파싱한 원문은 보존한다. 로컬 보관 데이터는 서버 최신 업무 상태가 아니다.
 
-- 중앙 업무 REST의 Agent 인증 적용, Agent 등록/토큰 발급·갱신. READY 기반 IdentityProvider는 연결했으며 실제 운영 중앙에서 검증해야 한다.
-- MCP 업무 경로와 get_tasks 수신함 노출·상태 병합. 지금은 내부 `Inbox::list_for`만 제공하며 공개 HTTP API를 추가하지 않았다.
-- 중앙 누락 조회·늦은 ACK·전달 결과 조회와 재전달 식별자 정책.
-- 작업 수락·실패·완료, version 충돌·결과 제출, 실제 Agent 실행·완료 알림.
+clear는 control.lock/broker.lock/inbox.lock 하에서 **해당 프로필의 모든 origin·Agent 기록과 dedup 이력**, private .inbox- 예약 임시 파일을 삭제한다. 실행 중인 브로커에서는 거부한다. 필요한 자료를 먼저 별도 private 보관해야 한다. 사용자/Agent/MCP 자격 파일과 중앙 업무·ACK·수락·완료는 변경하지 않는다. 손상된 원본이나 위험 경로를 자동 삭제하는 복구 명령으로 사용하지 않는다.
 
-중앙 구현 기준: [5891ef2의 생성·ACK 문서](https://github.com/SSAFY-URAYAHA/DevLink_server/blob/5891ef2a6adb4a3d3a7c7e89a5c064386a9c1bb9/docs/task-creation-implementation.md). 이 버전은 ACK_PENDING/ACK_RECEIVED/DELIVERY_NOT_SENT/DELIVERY_UNKNOWN을 사용하며 생성 HTTP는 ACK를 기다리지 않는다. 로컬 수신은 이 상태를 중앙에 임의 보고하지 않고 기존 ACK만 전송한다.
+## 실패 진단과 검증
+
+인증된 health의 선택적 inbox.rejectedEvents/lastError 및 CLI status에 내용 없는 STORE_FAILED/QUEUE_FULL 진단을 제공한다. 진단은 프로세스 수명 동안 유지되며 재시작 시 초기화된다. Connected는 디스크 수신 성공을 뜻하지 않는다. 저장 실패는 InboxFailed에서 자동 재접속하지 않는 upstream 정책을 유지한다.
+
+- 단위/실소켓: 기존 schema1 보존·schema2 이력·event/task 충돌·원자 batch·정리/기록 상호 배제·손상 거부, 느린 기록 중 heartbeat와 무선행 ACK, 오래된 generation 무ACK, 16건 burst의 기본5초 예산을 회귀로 검증한다.
+- 실제 CLI: start→수신→ACK→stop→새 instanceId start→새 event로 같은 task 재수신·ACK, 업무1건 유지와 event 이력 추가, 실행 중 clear 거부와 정지 후 정리, 제어 문자·로컬 Agent 필터를 확인한다.
+- 실제 중앙 재현: loopback Spring/PostgreSQL을 준비하고 DEVLINK_TEST_CENTRAL_URL과 절대 DEVLINK_TEST_CLI를 지정해 저장소 루트에서 node rust/scripts/verify-task-inbox.mjs를 실행한다. 합성 사용자2명·실제 Rust 수신자·확인된 세션 presence로16건 ACK_RECEIVED, 재시작 후 새 업무 ACK, 실제 로컬 기록 실패의 무ACK/DELIVERY_UNKNOWN을 점검한다.
+- 실제 중앙의 requestKey 재조회는 기존 업무를 재전송하지 않는다. 이를 wire 재전달 검증으로 세지 않으며, 같은/새 event 재전달과 재시작 dedup은 실소켓 fixture에서 별도로 검증한다.
+
+~~~powershell
+# rust 디렉터리
+cargo +stable-x86_64-pc-windows-msvc test --locked --offline --workspace --all-targets -- --test-threads=1
+cargo +stable-x86_64-pc-windows-msvc clippy --locked --offline --workspace --all-targets -- -D warnings
+cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check
+~~~
+
+실제 중앙 ACK 확인과 최종 TaskEvent 연결(-71), 전체 Rust 통합(-52), 사용자 수락 후 코드 수정·결과 회신(-66), 업무 중계/조회(-93/-94/-97)는 각 범위로 구분한다. 최신 중앙이 READY 사용자·팀을 공급하더라도 -92의 모든 인증 무효화·소유권·lease 수용을 이 스토리 테스트만으로 완료 처리하지 않는다.

@@ -124,6 +124,17 @@ impl Profile {
 pub fn path(config_path: &Path) -> PathBuf {
     config::state_directory(config_path).join("agent-profile.json")
 }
+
+/// Local display filter only. This is not an authenticated business principal.
+pub fn bound_agent_id(config_path: &Path) -> Result<Option<u64>> {
+    let Some(profile) = load(config_path)? else {
+        return Ok(None);
+    };
+    if profile.origin != user_auth::origin(&Config::load(config_path)?)?.as_str() {
+        return Ok(None);
+    }
+    Ok(profile.agent().map(|agent| agent.agent_id))
+}
 fn valid_id(id: u64) -> bool {
     id > 0 && id <= i64::MAX as u64
 }

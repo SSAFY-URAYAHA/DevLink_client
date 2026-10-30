@@ -227,6 +227,10 @@ impl CentralState {
         Ok(())
     }
 
+    pub fn inbox_diagnostics(&self) -> Option<crate::inbox::InboxDiagnostics> {
+        self.inbox.as_ref().map(Inbox::diagnostics)
+    }
+
     /// 새 연결 세션을 시작하며 세대(generation)를 증가시키고 이전 연결의 식별 정보를 즉시 무효화합니다.
     pub async fn begin_session(&self) -> SessionHandle {
         let mut guard = self.inner.write().await;
@@ -589,6 +593,16 @@ async fn send_presence<S: Sink<Message> + Unpin>(
 }
 
 /// 단일 WebSocket 연결 세션을 수립하고 `BROKER_READY` 확인, 확인된 `AGENT_PRESENCE` 보고 및 메시지 루프를 실행합니다.
+type Receipt = Pin<Box<dyn Future<Output = Result<(u64, Vec<TaskAckPayload>)>> + Send>>;
+fn receipt(inbox: Inbox, origin: String, agent: u64, messages: Vec<TaskCreatedMessage>) -> Receipt {
+    Box::pin(async move {
+        inbox
+            .record_batch(origin, agent, messages)
+            .await
+            .map(|acks| (agent, acks))
+    })
+}
+
 async fn session(
     config: &Config,
     token: &str,
@@ -657,8 +671,10 @@ async fn session(
     let mut ready = false;
     // 디스크 저장은 백그라운드 태스크에서 진행되어 PING/PONG 등 소켓 루프를 차단하지 않습니다.
     // 세션이 끊기면 미완료된 ACK future는 폐기되며, 완료된 디스크 기록은 안전하게 보존되어 새 연결에서 처리됩니다.
-    type Receipt = Pin<Box<dyn Future<Output = Result<TaskAckPayload>> + Send>>;
     let mut receipts: FuturesUnordered<Receipt> = FuturesUnordered::new();
+    let mut pending = Vec::new();
+    let batch_deadline = sleep(Duration::from_millis(5));
+    tokio::pin!(batch_deadline);
 
     loop {
         tokio::select! {
@@ -672,23 +688,34 @@ async fn session(
             }
             // 수신함 디스크 저장이 완료되면 중앙 WebSocket으로 ACK 회신
             saved = receipts.next(), if !receipts.is_empty() => {
-                // Serialize the final ACK write with authentication revocation.
-                // Never hold this guard while awaiting the disk write itself.
-                let auth = handle.state.inner.read().await;
-                if auth.generation != handle.generation { return Outcome::Stopped; }
-                if auth.status != ConnectionStatus::Connected || auth.identity.is_none() {
-                    let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
-                    return Outcome::AuthFailed;
-                }
-                let Some(Ok(ack)) = saved else {
+                let Some(Ok((agent, acknowledgements))) = saved else {
+
                     let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
                     return Outcome::InboxFailed;
                 };
-                let text = serde_json::to_string(&ClientMessage::Ack(ack))
-                    .expect("serializable task ACK");
-                if !matches!(timeout(Duration::from_secs(1), socket.send(Message::Text(text.into()))).await, Ok(Ok(()))) {
-                    return Outcome::Retry { was_connected: ready };
+                for ack in acknowledgements {
+                    // Fence each send against a newer generation/identity, including during I/O.
+                    let current = handle.state.inner.read().await;
+                    if current.generation != handle.generation {
+                        return Outcome::Stopped;
+                    }
+                    if current.status != ConnectionStatus::Connected || current.identity.as_ref().is_none_or(|id| id.agent_id != agent) {
+                        let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                        return Outcome::AuthFailed;
+                    }
+                    let text = serde_json::to_string(&ClientMessage::Ack(ack)).expect("serializable task ACK");
+                    if !matches!(timeout(Duration::from_secs(1), socket.send(Message::Text(text.into()))).await, Ok(Ok(()))) {
+                        return Outcome::Retry { was_connected: ready };
+                    }
                 }
+            }
+            _ = &mut batch_deadline, if !pending.is_empty() && receipts.is_empty() => {
+                let Some(inbox) = handle.state.inbox.clone() else { return Outcome::InboxFailed; };
+                let current = handle.state.inner.read().await;
+                if current.generation != handle.generation { return Outcome::Stopped; }
+                if current.status != ConnectionStatus::Connected { return Outcome::AuthFailed; }
+                let Some(identity) = &current.identity else { return Outcome::ProtocolViolation; };
+                receipts.push(receipt(inbox, config.server_url.clone(), identity.agent_id, std::mem::take(&mut pending)));
             }
             // 브로커 종료 요청 시 정상적으로 웹소켓 Close 프레임 전송 후 종료
             _ = cancel.cancelled() => {
@@ -828,6 +855,7 @@ async fn session(
                                         return Outcome::AuthFailed;
                                     }
                                     let identity = auth.identity.as_ref();
+
                                     // 1. BROKER_READY 완료 여부 및 수신 Agent 일치 검증
                                     let Some(identity) = identity else { return Outcome::ProtocolViolation; };
                                     if !message.is_valid() || message.payload.receiver_agent_id != identity.agent_id
@@ -840,16 +868,18 @@ async fn session(
                                         return Outcome::InboxFailed;
                                     };
                                     // 2. 동시 쓰기 대기열 상한 (16건 초과 시 재연결 유도)
-                                    if receipts.len() >= 16 {
+                                    if pending.len() >= crate::inbox::MAX_BATCH {
+                                        inbox.reject_queue();
                                         let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
                                         return Outcome::Retry { was_connected: true };
                                     }
                                     // 3. 비동기 디스크 기록 작업 큐에 등록 (소켓 이벤트 루프 블로킹 방지)
-                                    let origin = config.server_url.clone();
-                                    let agent_id = identity.agent_id;
-                                    receipts.push(Box::pin(async move {
-                                        inbox.record(origin, agent_id, message).await
-                                    }));
+                                    if pending.is_empty() { batch_deadline.as_mut().reset(Instant::now() + Duration::from_millis(5)); }
+                                    pending.push(message);
+                                    if pending.len() == crate::inbox::MAX_BATCH && receipts.is_empty() {
+                                        receipts.push(receipt(inbox, config.server_url.clone(), identity.agent_id, std::mem::take(&mut pending)));
+                                    }
+
                                 }
                                 // 원문은 출력하지 않으며 알 수 없는 메시지로 PONG 대기를 연장하지 않습니다.
                                 Err(_) => {}
@@ -977,6 +1007,15 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_receipt_storage_keeps_heartbeat_alive_without_early_ack() {
+        stalled_receipt(false).await;
+    }
+
+    #[tokio::test]
+    async fn completed_storage_from_an_old_generation_cannot_ack_or_replace_new_identity() {
+        stalled_receipt(true).await;
+    }
+
+    async fn stalled_receipt(replace_generation: bool) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let inbox = Inbox::open(&path).unwrap();
@@ -1052,6 +1091,45 @@ mod tests {
         .unwrap();
         assert!(!Inbox::path(&path).exists());
         assert_eq!(state.status().await, ConnectionStatus::Connected);
+        if replace_generation {
+            let next = state.begin_session().await;
+            let identity = CentralIdentity {
+                connection_id: "new-generation".into(),
+                agent_id: 12,
+                user_id: None,
+                team_id: None,
+            };
+            assert!(next.set_identity(identity.clone()).await);
+            release.send(()).unwrap();
+            timeout(Duration::from_secs(5), async {
+                while let Some(Ok(frame)) = socket.next().await {
+                    match frame {
+                        Message::Text(text) => assert!(!matches!(
+                            serde_json::from_str::<ClientMessage>(&text),
+                            Ok(ClientMessage::Ack(_))
+                        )),
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            timeout(Duration::from_secs(3), runner)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.identity().await, Some(identity));
+            assert_eq!(
+                Inbox::open(&path)
+                    .unwrap()
+                    .list_for(&origin, 12)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            return;
+        }
         release.send(()).unwrap();
         timeout(Duration::from_secs(5), async {
             loop {

@@ -96,6 +96,8 @@ impl Runtime {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Health {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<crate::inbox::InboxDiagnostics>,
     pub service: String,
     pub api_version: u32,
     pub pid: u32,
