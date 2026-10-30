@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -49,9 +49,11 @@ struct MockState {
 
 async fn central_create(
     State(state): State<MockState>,
+    Path(team_id): Path<u64>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    assert_eq!(team_id, 1, "creation must use the verified actor's team");
     assert_eq!(
         headers.get("authorization").unwrap(),
         &format!("Bearer {AGENT}")
@@ -151,6 +153,9 @@ async fn central_agent(State(state): State<MockState>, headers: HeaderMap) -> Re
         agent["agentId"] = json!(99);
         agent["name"] = json!("Other Agent");
     }
+    if mode == 10 {
+        agent["teamId"] = json!(999);
+    }
     Json(json!({"success":true,"data":agent})).into_response()
 }
 async fn central_agents(State(state): State<MockState>, headers: HeaderMap) -> Response {
@@ -200,7 +205,7 @@ impl Central {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new()
-            .route("/api/v1/tasks/1", post(central_create))
+            .route("/api/v1/tasks/{team_id}", post(central_create))
             .route("/api/v1/agents/me", get(central_agent))
             .route("/api/v1/agents/teams/{teamId}", get(central_agents))
             .with_state(state.clone());
@@ -355,6 +360,56 @@ fn agent_request(session: &Value, operation: &str, args: Value) -> Value {
     body["operation"] = json!(operation);
     body["arguments"] = args;
     body
+}
+
+#[tokio::test]
+async fn changed_central_team_blocks_creation_before_any_task_post() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_secs(1)).await;
+    let session = broker.claim("host", true).await;
+    remote.state.agent_mode.store(10, Ordering::SeqCst);
+
+    let (status, result) = broker
+        .post(
+            "/v1/tasks/create",
+            &request(&session, "changed-central-team"),
+        )
+        .await;
+    assert_eq!(status, 403, "{result}");
+    assert_eq!(result["error"]["code"], "FORBIDDEN");
+    assert_eq!(remote.state.agent_calls.load(Ordering::SeqCst), 1);
+    assert!(remote.state.calls.lock().await.is_empty());
+    assert!(remote.state.saved.lock().await.is_empty());
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn verified_team_creation_replays_a_rejected_task_without_creating_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_secs(1)).await;
+    let session = broker.claim("host", true).await;
+    let body = request(&session, "rejected-replay");
+    let (status, created) = broker.post("/v1/tasks/create", &body).await;
+    assert_eq!(status, 200, "{created}");
+    assert_eq!(created["data"]["status"], "PENDING");
+
+    remote.state.mode.store(17, Ordering::SeqCst);
+    let (status, replayed) = broker.post("/v1/tasks/create", &body).await;
+    assert_eq!(status, 200, "{replayed}");
+    assert_eq!(replayed["data"]["status"], "REJECTED");
+    assert_eq!(replayed["data"]["replayed"], true);
+    assert_eq!(replayed["data"]["taskId"], created["data"]["taskId"]);
+    assert_eq!(replayed["requestKey"], created["requestKey"]);
+    assert_eq!(remote.state.saved.lock().await.len(), 1);
+    let calls = remote.state.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["requestKey"], calls[1]["requestKey"]);
+    drop(calls);
+    broker.stop().await;
 }
 
 #[tokio::test]
