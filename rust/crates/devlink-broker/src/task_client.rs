@@ -182,7 +182,8 @@ impl TaskClient {
         team_id: u64,
         command: &CreateTaskCommand,
     ) -> Result<Value, TaskError> {
-        // Current central routes use Agent Bearer and derive requester from it.
+        // The caller verified this team against the Agent context. The server
+        // authenticates the requester from the Bearer token, never body/query IDs.
         let body = json!({"requestKey":command.request_key,"receiverAgentId":command.receiver_agent_id,"prompt":command.prompt});
         let (status, envelope) = self
             .request(&format!("/api/v1/tasks/{team_id}"), Some(body))
@@ -302,7 +303,7 @@ impl TaskClient {
             || data.replayed != (status == 200)
             || !matches!(
                 data.status.as_str(),
-                "PENDING" | "IN_PROGRESS" | "COMPLETED" | "FAILED"
+                "PENDING" | "IN_PROGRESS" | "COMPLETED" | "FAILED" | "REJECTED"
             )
         {
             return Err(protocol_error());

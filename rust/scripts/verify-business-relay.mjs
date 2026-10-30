@@ -144,6 +144,26 @@ try {
   const conflict = await local(brokerA, '/v1/tasks/create', changed, 'REQUEST_KEY_CONFLICT');
   assert.equal(conflict.requestKey, created.requestKey);
   assert.equal(sql(`SELECT count(*) FROM tasks WHERE id=${taskId}`), '1');
+  // Reject through the authoritative provider, then explicitly replay the same
+  // logical creation. This must return the existing REJECTED task, not recreate it.
+  const detailResponse = await fetch(new URL(`/api/v1/tasks/${taskId}`, base), {
+    headers: { authorization: `Bearer ${agentB.token}` }, signal: AbortSignal.timeout(10000) });
+  assert.equal(detailResponse.status, 200);
+  const detail = await detailResponse.json(); assert(detail.success);
+  const rejectionResponse = await fetch(new URL(`/api/v1/tasks/${taskId}/status`, base), {
+    method: 'PATCH', headers: { authorization: `Bearer ${agentB.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ status: 'REJECTED', version: detail.data.version, rejectionReason: 'Synthetic explicit rejection' }),
+    signal: AbortSignal.timeout(10000) });
+  assert.equal(rejectionResponse.status, 200);
+  const rejection = await rejectionResponse.json(); assert(rejection.success);
+  assert.equal(rejection.data.status, 'REJECTED');
+  const rejectedReplay = await local(brokerA, '/v1/tasks/create', create);
+  assert.equal(rejectedReplay.data.status, 'REJECTED');
+  assert.equal(rejectedReplay.data.replayed, true);
+  assert.equal(rejectedReplay.data.taskId, taskId);
+  assert.equal(rejectedReplay.requestKey, created.requestKey);
+  assert.equal(sql(`SELECT count(*) FROM tasks WHERE request_key='${created.requestKey}'`), '1');
+  assert.equal(sql(`SELECT status FROM tasks WHERE id=${taskId}`), 'REJECTED');
   for (const receiver of [String(other.agentId), '9223372036854775807'])
     await local(brokerA, '/v1/tasks/create', business(sessionA, 'create_task', { receiverAgentId: receiver, prompt: 'denied' }), 'RESOURCE_NOT_FOUND');
   const spoof = business(sessionA, 'list_agents', {}); spoof.context.userId = '9223372036854775807';
@@ -153,7 +173,7 @@ try {
   // Rust recovery. Never correct a 409 by querying or sending a new key.
   const concurrentKey = randomUUID();
   const concurrent = await Promise.all([0,1].map(async () => {
-    const r = await fetch(new URL(`/api/v1/tasks/${team.teamId}`, base), { method: 'POST',
+    const r = await fetch(new URL(`/api/v1/tasks/${agentA.teamId}`, base), { method: 'POST',
       headers: { authorization: `Bearer ${agentA.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ requestKey: concurrentKey, receiverAgentId: agentB.agentId, prompt: 'provider concurrent-key probe' }),
       signal: AbortSignal.timeout(10000) });
@@ -166,7 +186,7 @@ try {
   report = { passed: true, storyComplete: blockers.length === 0, actualRustHttp: true, actualCentral: true,
     actualPostgres: true, mcpRequired: false, offlinePreSaveRejection, concurrentProviderProbe: concurrent, blockers,
     checks: ['existing Agent confirmation without creation', 'authenticated team list', 'exact prompt',
-      'actual task persistence', 'receiver disk persistence and ACK', 'explicit same-key replay',
+      'actual task persistence', 'receiver disk persistence and ACK', 'explicit same-key replay', 'REJECTED same-key replay without recreation',
       'changed-payload conflict/key preservation', 'cross-team/missing receiver', 'spoofed principal', 'metadata mismatch', 'no secret output'] };
 } finally {
   for (const { child } of children) if (child.exitCode === null) {

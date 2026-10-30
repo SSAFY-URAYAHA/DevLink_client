@@ -1,8 +1,8 @@
 # Rust 중앙 업무 중계 (-93)
 
-후속 -94는 최신 고정 중앙 `a5c7987`의 생성 URL `/api/v1/tasks/{teamId}`를 반영했다. 아래 `02de434` 기록은 당시 검증 증거다. 새 4개 중계·DTO·검증·남은 조건은 [task-operations.md](task-operations.md)를 참고한다. 과거 중앙 정책 blocker가 해결됐다는 의미는 아니다.
+2026-10-30 (Asia/Seoul). 초기 구현의 Gemini 검토 이력은 아래에 보존한다. 이번 공식 생성 경로·REJECTED 호환 수정은 사용자가 지정한 Claude Code CLI `claude-opus-5-5`, effort `high`로 커밋 전 교차검증한다. [현재 수정·검증 기록](task-create-contract-verification.md)을 참고한다.
 
-2026-10-30 (Asia/Seoul). 사용자 요청으로 구현 커밋 전 교차검증 도구를 Claude Code에서 **사용자가 실행하는 Gemini 검토**로 변경했다. Gemini 결과를 받기 전에는 커밋하지 않는다.
+후속 -94는 최신 고정 중앙 `a5c7987`의 생성 URL `/api/v1/tasks/{teamId}`를 반영했다. 아래 `02de434` 기록은 당시 검증 증거다. 새 4개 중계·DTO·검증·남은 조건은 [task-operations.md](task-operations.md)를 참고한다. 과거 중앙 정책 blocker가 해결됐다는 의미는 아니다.
 
 ## 범위와 상태
 
@@ -16,9 +16,9 @@
 | --- | --- | --- |
 | `/v1/agents/register` | GET `/api/v1/agent/context` | 현재 자격의 기존 Agent만 확인. 생성·수정·토큰 발급 호출 없음 |
 | `/v1/agents/list` | GET `/api/v1/agent/context`, GET `/api/v1/agent/agents` | 현재 user/team/Agent를 대조한 뒤 같은 팀 목록 제공 |
-| `/v1/tasks/create` | GET `/api/v1/agent/context`, POST `/api/v1/agent/tasks` | 로컬 actor 확인 후 중앙이 Bearer에서 requester/team을 결정 |
+| `/v1/tasks/create` | GET `/api/v1/agent/context`, POST `/api/v1/tasks/{teamId}` | 중앙 context와 대조한 로컬 actor의 팀을 경로에 사용하고 요청자는 Bearer로 결정 |
 
-사용자용 `/api/v1/tasks/{teamId}`와 임시 `agentId` 파라미터는 사용하지 않는다. 사용자 cookie·CSRF를 업무 provider에 전달하지 않는다. 모든 로컬 경로는 MCP localToken만 사용하며 CLI controlToken이나 중앙 Agent 토큰으로 인증할 수 없다.
+중앙 `a5c7987`의 공식 생성 경로 `/api/v1/tasks/{teamId}`는 Agent Bearer API다. 이전 `/api/v1/agent/tasks`로의 호출·자동 fallback과 임시 `agentId` 파라미터는 사용하지 않는다. teamId는 검증된 세션에서 가져오며 MCP arguments/body에 actor ID를 추가하지 않는다. 사용자 cookie·CSRF를 업무 provider에 전달하지 않는다. 모든 로컬 경로는 MCP localToken만 사용하며 CLI controlToken이나 중앙 Agent 토큰으로 인증할 수 없다.
 
 `register_agent`만 미바인딩 세션을 허용한다. 중앙 Agent가 현재 READY/신원 공급부와 일치하는지도 재확인한다. 성공 data의 Agent를 기존 MCP 소비자가 별도 `/v1/sessions/:id/bind`로 바인딩한다. 이 확인 응답 자체가 bind 성공이나 ONLINE을 뜻하지 않는다. 기존 MCP 인자 name/toolType/role은 주어졌다면 기존 메타데이터와 일치해야 하고, 다르면 새 Agent 생성/갱신 대신 거부한다. `{}`로 현재 Agent를 확인할 수도 있다. 나머지 업무는 bound 세션이 필수다.
 
@@ -37,9 +37,9 @@
 }
 ```
 
-prompt의 공백·개행을 보존하고 중앙 WebSocket 64 KiB 전송 한도 안에 들어가는지도 검증한다. 중앙 POST 본문은 `requestKey`, 숫자 `receiverAgentId`, `prompt` 세 필드만 포함한다. requesterAgentId/teamId는 전송하지 않는다.
+prompt의 공백·개행을 보존하고 중앙 WebSocket 64 KiB 전송 한도 안에 들어가는지도 검증한다. 중앙 POST 본문은 `requestKey`, 숫자 `receiverAgentId`, `prompt` 세 필드만 포함한다. 본문에는 requesterAgentId/teamId를 넣지 않으며, teamId는 검증된 세션 값으로 경로에만 사용한다.
 
-현재 MCP의 `recipientAgentId/title/description/taskContext?` 입력도 호환한다. 이 기존 입력은 이전 구현과 같은 JSON 문자열 prompt로 직렬화한다. 두 입력을 섞거나 actor·requestKey를 인자에 추가하면 거부한다. MCP schema/문구의 최종 수렴은 -97이며 이 스토리에서 MCP 소스를 변경하지 않는다.
+현재 MCP의 `recipientAgentId/title/description/taskContext?` 입력도 호환한다. 이 기존 입력은 이전 구현과 같은 JSON 문자열 prompt로 직렬화한다. 두 입력을 섞거나 actor·requestKey를 인자에 추가하면 거부한다. MCP schema/문구의 최종 수렴은 -97이며 이 스토리에서 MCP 소스를 변경하지 않는다. 같은 키로 기존 작업을 확인할 때 중앙의 `REJECTED`도 결과 상태로 보존한다. 이는 새 작업 생성·자동 수락·상태 변경이 아니다.
 
 중앙 숫자 ID를 Rust 정수로 검증하고 로컬에는 정규 10진 문자열로 반환한다. 범위는 1..9223372036854775807이다. 부호·공백·leading zero·범위 초과·opaque ID를 거부하며 JS Number 변환을 거치지 않는다. Agent 공개 DTO의 ID·이름·역할·도구·프로젝트·상태·시각을 매핑하고 알려지지 않은 필드나 서버 메시지/비밀 원문은 복사하지 않는다. 목록은 `data.agents`다.
 
