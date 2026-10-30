@@ -32,7 +32,7 @@ impl ContextClient {
         };
         url.set_scheme(scheme)
             .map_err(|_| anyhow::anyhow!("Invalid context origin"))?;
-        url.set_path("/api/v1/agent/context");
+        url.set_path("/api/v1/agents/me");
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| anyhow::anyhow!("Invalid Agent credential"))?;
         authorization.set_sensitive(true);

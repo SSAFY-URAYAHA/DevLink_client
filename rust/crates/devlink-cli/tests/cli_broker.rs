@@ -37,7 +37,7 @@ async fn serve_context_request(stream: &mut tokio::net::TcpStream, agent: Option
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut head = [0; 4096];
     let count = stream.peek(&mut head).await.unwrap();
-    if !head[..count].starts_with(b"GET /api/v1/agent/context ") {
+    if !head[..count].starts_with(b"GET /api/v1/agents/me ") {
         return false;
     }
     let mut request = Vec::new();

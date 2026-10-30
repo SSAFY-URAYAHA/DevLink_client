@@ -14,9 +14,9 @@
 
 | 로컬 POST | 중앙 Agent Bearer provider | 동작 |
 | --- | --- | --- |
-| `/v1/agents/register` | GET `/api/v1/agent/context` | 현재 자격의 기존 Agent만 확인. 생성·수정·토큰 발급 호출 없음 |
-| `/v1/agents/list` | GET `/api/v1/agent/context`, GET `/api/v1/agent/agents` | 현재 user/team/Agent를 대조한 뒤 같은 팀 목록 제공 |
-| `/v1/tasks/create` | GET `/api/v1/agent/context`, POST `/api/v1/agent/tasks` | 로컬 actor 확인 후 중앙이 Bearer에서 requester/team을 결정 |
+| `/v1/agents/register` | GET `/api/v1/agents/me` | 현재 자격의 기존 Agent만 확인. 생성·수정·토큰 발급 호출 없음 |
+| `/v1/agents/list` | GET `/api/v1/agents/me`, GET `/api/v1/agents/teams/{teamId}` | 현재 user/team/Agent를 대조한 뒤 같은 팀 목록 제공 |
+| `/v1/tasks/create` | GET `/api/v1/agents/me`, POST `/api/v1/tasks/{teamId}` | 로컬 actor 확인 후 중앙이 Bearer에서 requester/team을 결정 |
 
 사용자용 `/api/v1/tasks/{teamId}`와 임시 `agentId` 파라미터는 사용하지 않는다. 사용자 cookie·CSRF를 업무 provider에 전달하지 않는다. 모든 로컬 경로는 MCP localToken만 사용하며 CLI controlToken이나 중앙 Agent 토큰으로 인증할 수 없다.
 
