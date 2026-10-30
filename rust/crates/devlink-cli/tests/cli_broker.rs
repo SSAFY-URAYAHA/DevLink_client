@@ -33,6 +33,44 @@ use tokio_tungstenite::{
 
 const TOKEN: &str = "test-only-secret-never-print";
 
+async fn serve_context_request(stream: &mut tokio::net::TcpStream, agent: Option<u64>) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut head = [0; 4096];
+    let count = stream.peek(&mut head).await.unwrap();
+    if !head[..count].starts_with(b"GET /api/v1/agent/context ") {
+        return false;
+    }
+    let mut request = Vec::new();
+    loop {
+        let count = stream.read(&mut head).await.unwrap();
+        if count == 0 {
+            return true;
+        }
+        request.extend_from_slice(&head[..count]);
+        if request.windows(4).any(|part| part == b"\r\n\r\n") {
+            break;
+        }
+        assert!(request.len() < 16384);
+    }
+    let headers = String::from_utf8(request).unwrap().to_lowercase();
+    assert!(headers.contains(&format!("authorization: bearer {TOKEN}\r\n")));
+    assert!(!headers.contains("cookie:") && !headers.contains("origin:"));
+    let body = match agent {
+        Some(id) => {
+            serde_json::json!({"success":true,"data":{"agentId":id,"ownerUserId":3,"teamId":1}})
+                .to_string()
+        }
+        None => serde_json::json!({"success":false,"code":"AUTHENTICATION_REQUIRED"}).to_string(),
+    };
+    let status = if agent.is_some() {
+        "200 OK"
+    } else {
+        "401 Unauthorized"
+    };
+    stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    true
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_creates_tasks_with_agent_bearer_and_reuses_request_key_after_restart() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,6 +87,7 @@ async fn cli_creates_tasks_with_agent_bearer_and_reuses_request_key_after_restar
             clients.spawn(async move {
                 let mut method = [0;3];
                 while stream.peek(&mut method).await.unwrap() < 3 { sleep(Duration::from_millis(1)).await; }
+                if serve_context_request(&mut stream, Some(12)).await { return; }
                 if &method == b"GET" {
                     let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
                     socket.send(Message::Text(serde_json::json!({"type":"BROKER_READY","payload":{
@@ -634,7 +673,7 @@ impl Mock {
         let task = tokio::spawn(async move {
             let mut clients = JoinSet::new();
             loop {
-                let (stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) = listener.accept().await.unwrap();
                 let attempts = attempts_clone.clone();
                 let received = received_clone.clone();
                 let heartbeat_pings = heartbeat_pings_clone.clone();
@@ -642,6 +681,7 @@ impl Mock {
                 let seq = next_seq.fetch_add(1, Ordering::SeqCst);
 
                 clients.spawn(async move {
+                    if serve_context_request(&mut stream, if matches!(behavior, Behavior::VerifiedReady) {Some(11)} else {None}).await {return;}
                     attempts.fetch_add(1, Ordering::SeqCst);
                     let handshake = accept_hdr_async(
                         stream,
@@ -1019,7 +1059,12 @@ async fn session_routes_require_verified_identity_and_reject_cli_control_token()
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 401);
-    assert_eq!(f.health().await.central_server, ConnectionStatus::Connected);
+    // The earlier context REST denial invalidated the central principal;
+    // rejecting a CLI control token must not restore it to Connected.
+    assert_eq!(
+        f.health().await.central_server,
+        ConnectionStatus::AuthFailed
+    );
     assert!(
         server.received.lock().await.is_empty(),
         "Rejected claims must not activate presence"
@@ -1059,7 +1104,7 @@ async fn cli_uses_ready_identity_for_real_local_sessions() {
         .bearer_auth(&credentials.local_token)
         .json(&serde_json::json!({"requestId":"wrong-agent","instanceId":"other-host","mode":"fresh","agentId":"12"}))
         .send().await.unwrap();
-    assert_eq!(response.status().as_u16(), 403);
+    assert_eq!(response.status().as_u16(), 422);
     let response = client
         .post(runtime.url(&format!("/v1/sessions/{session}/heartbeat")))
         .bearer_auth(&credentials.local_token)

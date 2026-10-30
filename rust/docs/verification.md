@@ -1,5 +1,25 @@
 # 로컬 검증 기록
 
+## 2026-10-30: 중앙 02de434 확장 READY·실제 세션 재검증
+
+클라이언트 `d4c3754`와 중앙 `02de43468e9dd208a4a3cbc9bf142858e315e156`의 격리 빌드로 검증했다. 실제 Bearer WebSocket READY의 `connection_id/agent_id/user_id/team_id`와 발급 토큰 신원 일치를 확인했고, 실제 CLI·MCP SDK·PostgreSQL 17.11의 세션 4경로·소유권·재시작 복구·생산 lease 90초 만료·SQL ONLINE/OFFLINE/last_seen_at·토큰 교체 거부가 통과했다. READY 관련 회귀 8개도 같은 작업 세션에서 통과했다. 임시 서버·DB를 종료하고 최종 OFFLINE 및 임시 실행 환경 제거를 확인했다. 기능 소스 수정은 없으며 기록만 갱신했다. 실제 Host·업무 목록 성공·전체 MVP·운영 마이그레이션 검증과는 구분한다. [세부 증거와 실행 범위](session-story-verification.md)의 2026-10-30 절을 따른다.
+
+## 2026-10-29: Gemini 지적 4건 후속 보완
+
+기준 e69f363의 Gemini 리뷰를 재현해 동시 context 보완/거부 처리, legacy 재접속 즉시 업무 인가, heartbeat 로컬 오류 우선, AuthFailed 후 WS 수신·ACK 차단을 수정했다. 추가로 잠금 대기 중 90초 만료 경계를 넘는 heartbeat의 부활을 막았다. 최종 Rust 전체 129개, SDK 명시 2개, MCP 100개, 별도 DELETE wire 1개와 포맷·Clippy·diff 검사가 통과했다. 실제 중앙·DB 재실행과 수정본에 대한 Gemini/Opus 재승인은 하지 않았다. 변경은 rust/에만 있으며 커밋하지 않았다. [후속 수정 상세](session-story-verification.md)의 마지막 절을 따른다.
+
+## 2026-10-29: 추가 검토·A→B→A legacy 소유권 차단
+
+legacy READY의 Agent 전환 A→B→A에서 이전 세션이 유지되는 결함을 테스트로 재현하고 같은 Agent 재접속에서만 소유권을 보존하도록 수정했다. 최신 Rust 기본 회귀 112개는 기대값 1건 수정 후 분할 재실행을 포함해 최종 통과했고 SDK 2개(96.25초), MCP 101개, 포맷·Clippy·diff 검사도 통과했다. 최초 workspace 실행의 실패와 개별 재실행을 [세션 검증 기록](session-story-verification.md)의 마지막 절에 구분했다. 이번에는 실제 중앙/DB를 다시 기동하지 않았다. Opus 검토·커밋은 미실행이다.
+
+## 2026-10-29: 기존 중앙 context 신원 공급·실제 DB presence
+
+기본 CLI에 `/api/v1/agent/context` 공급부를 연결하고 중앙 소스 `30b7d70` + PostgreSQL 17.11 + 실제 CLI/SDK 세션 검증을 통과했다. 세션 4경로·소유권·90초 lease·브로커 재시작 첫 recover·토큰 회전 거부와 SQL ONLINE/OFFLINE/last_seen_at을 확인했다. [상세 증거와 미완료 항목](session-story-verification.md)의 마지막 절을 따른다. SDK의 list_agents 업무 provider는 미제공이며 세션 성공과 분리했다. -91 자동화·실제 Host/최종 두 사용자 업무 왕복·Opus 검토·커밋은 완료하지 않았다.
+
+## 2026-10-29: 세션 SDK 회귀·DELETE 본문·신원 오류 분류
+
+[세션 스토리 검증](session-story-verification.md)에 최종 대상 Rust 59개·MCP 기존 100개 및 신규 1개 통과를 기록했다. 실제 SDK→MCP→Rust의 90초 lease 만료·복구와 종료 OFFLINE을 확인했다. 중앙 신원/업무는 fixture이며 중앙 READY 불일치 및 실제 중앙·DB 연동은 blocked/미검증이다. 지정 Claude CLI 교차검증을 실행할 수 없어 구현 커밋은 보류했다.
+
 ## 2026-10-29: READY 신원 확장·실제 로컬 세션 공급부
 
 `83169e8` 이후 작업 트리에 합의된 READY user_id/team_id와 ReadyIdentityProvider를 연결했습니다. 중앙에서 받은 숫자 ID를 MCP Principal 문자열로 변환하며, 잘못된/누락 신원·다른 Agent를 거부합니다. 같은 신원의 재접속은 세션을 유지하고, 사용자·팀·Agent 변경과 A → B → A 경합은 subject epoch로 이전 소유권을 무효화합니다. 상세 동작은 [READY 신원 문서](ready-identity.md)를 참고하세요.

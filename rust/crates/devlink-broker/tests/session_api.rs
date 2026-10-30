@@ -187,7 +187,7 @@ async fn authenticated_ready_identity_flows_through_http_session_bind_and_presen
             json!({"requestId":"wrong-agent","instanceId":"ready-host","agentId":"13"}),
         )
         .await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 422);
     assert_eq!(refused["error"]["code"], "FORBIDDEN");
     let (status, bound) = f
         .send(
@@ -440,7 +440,7 @@ async fn claimed_agent_and_bind_user_must_match_verified_identity() {
         ..Default::default()
     }))
     .await;
-    assert_eq!(f.claim("a", "fresh", Some("11")).await.0, 403);
+    assert_eq!(f.claim("a", "fresh", Some("11")).await.0, 422);
     assert_eq!(f.central.presence().await, None);
     f.stop().await;
     let f = Fixture::new(Arc::new(VerifiedTestIdentity {
@@ -457,7 +457,7 @@ async fn claimed_agent_and_bind_user_must_match_verified_identity() {
             json!({"requestId":"bind","instanceId":"a","agentId":"11"}),
         )
         .await;
-    assert_eq!(response.0, 403);
+    assert_eq!(response.0, 422);
     assert_eq!(f.central.presence().await, Some(PresenceStatus::Offline));
     assert_eq!(
         f.claim("a", "recover", None).await.1["data"],

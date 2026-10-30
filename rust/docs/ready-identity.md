@@ -1,5 +1,23 @@
 # READY 신원과 로컬 세션
 
+2026-10-30 실제 연동 확인: 중앙 `02de43468e9dd208a4a3cbc9bf142858e315e156`은 `connection_id/agent_id/user_id/team_id`를 모두 포함한 READY를 전송한다. 실제 WebSocket에서 필드·타입·토큰 신원 일치를 검사했고, 현재 Rust CLI·MCP SDK·격리 PostgreSQL 17.11로 세션·소유권·90초 lease·DB presence·재시작 복구·토큰 교체 거부가 통과했다. READY 확장에 따른 Rust 기능 수정은 필요하지 않았다. 기존 실시간 context 조회와 READY 신원 대조도 유지한다. 아래의 중앙 READY 신원 누락 설명은 이전 커밋에 관한 기록이며 현재 서버의 차단 사유가 아니다. [상세 검증 결과](session-story-verification.md)의 2026-10-30 절을 따른다.
+
+2026-10-29 후속 구현: 기본 CLI는 기존 `GET /api/v1/agent/context`를 같은 중앙 Agent Bearer로 조회해 검증된 신원을 공급한다. 아래의 READY 필드 누락에 따른 차단 설명은 이전 기록이다. 중앙 `30b7d70`의 READY 자체는 변경하지 않는다. 실제 중앙/DB 검증 결과는 [세션 검증 기록](session-story-verification.md)의 최신 항목을 따른다.
+
+## 현재 운영 경로: READY + 실시간 context 조회
+
+- CLI는 검증된 중앙 origin에 고정된 ContextClient를 CentralState에 주입한다. MCP에는 중앙 토큰을 전달하지 않는다. 수동 테스트용 공급부와 기존 확장 READY 테스트는 이 클라이언트를 주입하지 않는 별도 경계다.
+- claim/bind/heartbeat마다 기존 `/api/v1/agent/context`를 조회한다. heartbeat는 로컬 만료·소유권·instance 사전 검사를 통과한 경우에만 조회하며 조회 후에도 다시 검사한다. 캐시만으로 lease를 갱신하지 않는다. 업무 authorize도 로컬 세션·principal을 먼저 검사하고, 재접속 직후 legacy 신원이 미확정인 경우에만 잠금 밖에서 조회한 뒤 최종 재검증한다. 이미 확인된 신원의 반복 인가는 추가 REST 조회를 만들지 않는다. JSON `success=true`, 양의 Java Long 범위의 숫자 `ownerUserId/teamId/agentId`가 필요하다. 요청의 ID·config·bootstrap 파일로 신원을 추측하지 않는다. toolType은 기존과 같이 생략한다.
+- 현재 WS가 Connected이고 REST의 agentId와 READY의 Agent가 같아야 한다. READY에 user/team이 있으면 그 값도 일치해야 한다. 응답 적용 때 WS generation·connection_id·agent_id를 다시 비교한다. 동시 요청이 user/team을 먼저 채운 것은 연결 변경으로 취급하지 않으며 이미 확인된 user/team과 모순되는 성공은 Forbidden으로 무효화한다. 같은 연결의 401/403은 동시 보완 여부와 무관하게 적용하고 인증 거부 뒤 늦은 200은 권한을 복원하지 못한다. 조회 중 재접속하면 늦은 응답은 새 연결에 적용하지 않는다.
+- REST는 redirect·proxy·자동 retry·cookie를 사용하지 않는다. 응답 본문까지 총 3초, 256KiB 상한이다. 외부 오류 본문이나 자격을 로컬 응답에 복사하지 않는다. 401/403은 중앙 인증 거부이고 나머지 HTTP 오류·형식/전송 오류는 중앙 불가로 처리한다.
+- 중앙 인증 거부·신원 모순은 subject epoch를 바꾸고 식별자를 제거한 뒤 AuthFailed/OFFLINE으로 전환한다. 해당 generation의 WS 루프를 깨워 연결을 종료하고 자동 재접속을 중단한다. 같은 WS를 legacy READY로 재해석해 다시 권한을 얻을 수 없다. 새 연결 후 재검증이 필요하다. 기존 세션은 epoch 변화로 만료된다. 새 TASK_CREATED 수신 및 대기 ACK는 현재 generation·Connected·identity 검사를 통과해야 하며, ACK 송신과 무효화 상태 변경은 같은 신원 잠금으로 순서를 보장한다. 인증 유효 시 이미 접수되어 진행 중인 디스크 기록은 완료·보존될 수 있지만 무효화 후 ACK는 송신하지 않는다.
+- 같은 신원의 새 WS는 lease 안의 소유권을 유지한다. legacy READY에서도 agent_id가 바뀌면 즉시 subject epoch를 증가시켜 이전 소유권을 무효화한다. 중간 Agent의 context 조회 없이 A → B → A로 돌아와도 이전 세션은 복원하지 않는다. legacy READY 재접속 직후에는 context 확인까지 OFFLINE을 유지하고, 백그라운드 만료 정리도 이전 ONLINE을 재게시하지 않는다. 성공한 claim/bind/heartbeat가 현재 신원을 확인한 뒤 실제 슬롯에 따라 presence를 게시한다.
+- DELETE는 현재 sessionId/instanceId 검증으로 해제하며 중앙 재인증을 요구하지 않는다. 중앙이 불가해도 로컬 해제와 OFFLINE 정리가 가능하다.
+
+Agent 등록·기존 Agent 선택·토큰 안전 저장을 자동화하는 -91 CLI bootstrap 명령은 이 변경에 포함하지 않는다. 실제 중앙 검증의 자격은 기존 사용자 세션·CSRF·Agent API로 합성 계정에서 준비하며 Agent 생성 API를 복제하지 않는다.
+
+2026-10-29 중앙 소스 재대조: 서버 develop `30b7d7073150771b2e83877d7edee71baee7c56f`의 `DevLinkWebSocketHandler`는 아직 `connection_id/agent_id`만 전송한다. 아래 확장 READY는 Rust가 지원하는 계약이며 해당 중앙 커밋의 제공 형식이 아니다. 현 조합의 세션 발급은 `CENTRAL_UNAUTHENTICATED`로 차단된다. 기존 `GET /api/v1/agent/context`는 `ownerUserId/teamId/agentId`를 제공하지만 현재 ReadyIdentityProvider는 이를 조회하지 않는다. READY 확장 반영 또는 REST 공급부의 신선도·현재 WS 신원 일치·재접속/폐기 정책 연결 전에는 실제 연동 완료로 처리하지 않는다.
+
 2026-10-29. 중앙 담당자 답변에 따라 READY 신원 확장과 저장 후 ACK를 적용한다. 작업 REST의 Agent Bearer 인증도 방향이 확인됐다. 토큰 발급·누락 복구·재전달 정책은 사용자가 제안안을 구현 기준으로 채택했으며 중앙 API의 실제 경로·DTO·배포 완료를 의미하지 않는다.
 
 ## READY 계약
@@ -24,7 +42,7 @@ ID는 기존 중앙 숫자 ID와 같은 양의 Java Long 범위로 받는다. Ru
 
 - 기본 CLI는 UnconfiguredIdentityProvider 대신 현재 중앙 연결의 ReadyIdentityProvider를 사용한다.
 - READY가 확인된 Connected 상태에서만 사용자·팀을 공급한다. 연결 중·단절·재접속 상태는 503 CENTRAL_UNAVAILABLE, 중앙 인증 실패나 구버전 READY의 신원 누락은 503 CENTRAL_UNAUTHENTICATED다.
-- agentId 없는 claim은 기존 MCP 계약처럼 unbound Principal을 반환한다. 같은 READY의 agent_id로 bind하거나, 검증된 동일 agentId를 명시한 claim만 bound 세션을 얻는다. 다른 Agent를 요청하면 403 FORBIDDEN이다.
+- agentId 없는 claim은 기존 MCP 계약처럼 unbound Principal을 반환한다. 같은 READY의 agent_id로 bind하거나, 검증된 동일 agentId를 명시한 claim만 bound 세션을 얻는다. 다른 Agent를 요청하면 422 FORBIDDEN(domain)이다.
 - toolType은 READY에 없으므로 config.agent나 요청 입력에서 추측하지 않고 생략한다. Agent 등록·메타데이터 연결은 후속 계약이다.
 - 동일 사용자·팀·Agent로 재접속하면 lease 안의 로컬 세션을 유지한다. 연결 ID 변경만으로 소유권을 교체하지 않는다.
 - 사용자·팀·Agent 조합이 달라지거나 전체 신원이 없는 READY로 바뀌면 subject epoch를 증가시키고 이전 세션·소유권을 무효화한다. A → B → A의 빠른 변경도 이전 세션을 복원하지 않는다. 오래된 세션 heartbeat/delete는 SESSION_EXPIRED다.

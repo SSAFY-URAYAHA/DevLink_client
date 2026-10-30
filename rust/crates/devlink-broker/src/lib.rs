@@ -1,6 +1,9 @@
+pub mod agent_context;
 pub mod agent_profile;
 pub mod broker;
 pub mod central;
+#[cfg(test)]
+mod central_auth_tests;
 pub mod config;
 pub mod credentials;
 pub mod inbox;
