@@ -53,3 +53,14 @@ npm.cmd test
 ~~~
 
 업무 중계 스크립트는 `DEVLINK_TEST_CENTRAL_URL`, 절대 `DEVLINK_TEST_CLI`/`DEVLINK_TEST_PSQL`, 전용 DB port인 `DEVLINK_TEST_DB_PORT`를 사용한다. DB/role은 `devlink_relay_test`이며 비밀번호는 검증 프로세스 환경으로만 전달한다. 합성 자료와 private 임시 프로필만 사용하고 출력의 비밀 포함 여부를 검사한다. 원격·운영 DB를 대상으로 실행하지 않는다.
+
+## PR #26 develop 충돌 통합
+
+2026-10-30. PR #25의 -94 네 업무 중계가 포함된 develop `a3fb5113b50de8e6bc216aec59f827be2f24c04b`를 PR #26 브랜치에 병합했다. 기존 `4188973` 커밋을 재작성하지 않고 충돌 해소 커밋을 추가한다.
+
+- `task_client.rs`: -94의 공통 `request_http`와 PATCH/조회·완료 처리를 유지하고, 생성 응답의 `REJECTED` 허용 및 검증된 teamId 경로 사용을 보존한다.
+- `task_creation.rs`: 고정 `/tasks/1` 대신 팀 경로를 추출·검사하는 fixture와 REJECTED/팀 불일치 회귀를 유지한다.
+- 두 실제 검증 스크립트: 공식 생성 경로를 유지하고 동일 키·거절 재조회·수신함 실패 검증을 보존한다.
+- `business-relay.md`: -94 안내와 -93의 Claude 교차검증·이전 Gemini 검토 이력을 함께 유지한다.
+
+위 전체159건·HTTP20건·실제 중앙 결과는 최초 `4188973`의 증거다. 충돌 통합본의 재검증과 커밋 전 `claude-opus-5-5`/high 판정은 같은 날짜 Notion 기록에 별도로 남기며, 이전 결과를 최신 통합본의 실행 결과로 세지 않는다. 이번 병합은 -94 기존 커밋을 수용하는 것이며 -94 구현이나 Jira 완료를 이 스토리에 새로 귀속하지 않는다.

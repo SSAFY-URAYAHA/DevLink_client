@@ -196,12 +196,45 @@ impl TaskClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<(u16, CentralEnvelope), TaskError> {
+        let method = if body.is_some() {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::GET
+        };
+        self.request_http(method, path, &[], body).await
+    }
+
+    pub(crate) async fn request_http(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<Value>,
+    ) -> Result<(u16, CentralEnvelope), TaskError> {
+        if body.as_ref().is_some_and(|value| {
+            !serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= REQUEST_LIMIT)
+        }) {
+            return Err(TaskError::rejected("VALIDATION_FAILED", 400));
+        }
+        tokio::time::timeout(self.timeout, self.exchange_http(method, path, query, body))
+            .await
+            .unwrap_or_else(|_| Err(TaskError::unknown("CENTRAL_TIMEOUT")))
+    }
+
+    async fn exchange_http(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<Value>,
+    ) -> Result<(u16, CentralEnvelope), TaskError> {
         let mut url = self.origin.clone();
         url.set_path(path);
+        let builder = self.client.request(method, url).query(query);
         let builder = if let Some(body) = body {
-            self.client.post(url).json(&body)
+            builder.json(&body)
         } else {
-            self.client.get(url)
+            builder
         };
         let mut response = builder
             .header(AUTHORIZATION, self.authorization.clone())
@@ -397,7 +430,7 @@ fn known_task_id(value: &Value, receiver: u64) -> Option<u64> {
 }
 
 /// 중앙 서버가 반환한 HTTP 상태 코드 및 비즈니스 에러 코드를 로컬 TaskError로 매핑
-fn central_error(status: u16, code: Option<&str>) -> TaskError {
+pub(crate) fn central_error(status: u16, code: Option<&str>) -> TaskError {
     if status >= 500 {
         return TaskError::unknown("CENTRAL_UNAVAILABLE");
     }
@@ -405,6 +438,8 @@ fn central_error(status: u16, code: Option<&str>) -> TaskError {
         (400, Some("VALIDATION_FAILED")) => TaskError::rejected("VALIDATION_FAILED", 400),
         (404, Some("RESOURCE_NOT_FOUND")) => TaskError::rejected("RESOURCE_NOT_FOUND", 404),
         (409, Some("RECEIVER_OFFLINE")) => TaskError::rejected("RECEIVER_OFFLINE", 409),
+        (409, Some("TASK_VERSION_CONFLICT")) => TaskError::rejected("TASK_VERSION_CONFLICT", 409),
+        (409, Some("TASK_STATE_CONFLICT")) => TaskError::rejected("TASK_STATE_CONFLICT", 409),
         // Identical concurrent inserts can also produce this provider code.
         // Preserve the conflict without claiming no transaction committed.
         (409, Some("REQUEST_KEY_CONFLICT")) => TaskError {
@@ -418,10 +453,10 @@ fn central_error(status: u16, code: Option<&str>) -> TaskError {
 }
 
 #[derive(Deserialize)]
-struct CentralEnvelope {
-    success: bool,
-    data: Option<Value>,
-    code: Option<String>,
+pub(crate) struct CentralEnvelope {
+    pub success: bool,
+    pub data: Option<Value>,
+    pub code: Option<String>,
 }
 
 #[derive(Deserialize)]

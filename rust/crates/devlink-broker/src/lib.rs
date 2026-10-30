@@ -16,6 +16,8 @@ pub mod session_api;
 pub mod sessions;
 pub mod task_api;
 pub mod task_client;
+pub mod task_operations;
 pub mod task_requests;
+pub mod task_routes;
 pub mod teams;
 pub mod user_auth;

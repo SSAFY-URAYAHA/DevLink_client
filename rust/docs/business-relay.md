@@ -2,6 +2,8 @@
 
 2026-10-30 (Asia/Seoul). 초기 구현의 Gemini 검토 이력은 아래에 보존한다. 이번 공식 생성 경로·REJECTED 호환 수정은 사용자가 지정한 Claude Code CLI `claude-opus-5-5`, effort `high`로 커밋 전 교차검증한다. [현재 수정·검증 기록](task-create-contract-verification.md)을 참고한다.
 
+후속 -94는 최신 고정 중앙 `a5c7987`의 생성 URL `/api/v1/tasks/{teamId}`를 반영했다. 아래 `02de434` 기록은 당시 검증 증거다. 새 4개 중계·DTO·검증·남은 조건은 [task-operations.md](task-operations.md)를 참고한다. 과거 중앙 정책 blocker가 해결됐다는 의미는 아니다.
+
 ## 범위와 상태
 
 검증된 로컬 세션·중앙 Agent Bearer로 기존 Agent 확인, 팀 Agent 목록, 작업 생성을 중계한다. 공통 요청·응답 envelope, 중앙 응답 크기/시간 제한, canonical Long ID, private requestKey 기록을 제공한다. 중앙 인증 필터·권한·DB·ACK·중복 생성 정책은 변경하지 않는다.
