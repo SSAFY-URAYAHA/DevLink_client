@@ -200,7 +200,7 @@ impl Central {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new()
-            .route("/api/v1/agent/tasks", post(central_create))
+            .route("/api/v1/tasks/1", post(central_create))
             .route("/api/v1/agent/context", get(central_agent))
             .route("/api/v1/agent/agents", get(central_agents))
             .with_state(state.clone());

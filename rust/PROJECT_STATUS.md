@@ -1,5 +1,7 @@
 # CLI·브로커 진행 현황
 
+2026-10-30 (-94): 상태·완료·목록·결과 4개 로컬 HTTP를 최신 중앙 `a5c7987`에 연결하고 실제 Rust → Spring → PostgreSQL 왕복을 검증했다. 중앙 생성 URL 변경도 반영했다. [현재 계약·증거·남은 조건](docs/task-operations.md)이 아래 과거 업무 API 미구현 설명보다 우선한다. [Gemini 교차검토](docs/story94-gemini-result.md)는 신규 결함 0건으로 완료했다. 구조화 verification 계약 및 -97 MCP DTO·-66 Host 수용은 남아 있다. 커밋·푸시는 사용자가 수행한다.
+
 2026-10-30 (-93): Rust Agent 확인/목록·작업 생성 중계를 실제 Agent Bearer provider에 연결했다. 공통 envelope/예산, canonical ID, requestKey 유지와 회귀를 보완했다. 실제 고정 중앙 02de434 + PostgreSQL에서 중계를 검증했지만 오프라인 수신자 저장 전 거부와 같은 키 동시 요청 409가 남아 스토리 전체 완료는 보류한다. [현재 구현·검증·남은 조건](docs/business-relay.md)이 아래 과거 업무 API 미구현 설명보다 우선한다. 나머지 네 업무 API는 -94다.
 
 2026-10-29 READY 신원 연결: 중앙 담당자와 합의한 user_id/team_id를 받아 실제 ReadyIdentityProvider로 로컬 세션을 생성·bind하도록 연결했다. 같은 신원 재접속은 lease를 유지하고 신원 변경은 이전 세션·ONLINE을 무효화한다. [상세 계약](docs/ready-identity.md)이 아래 과거 미구성 공급부 설명보다 우선한다. 토큰 발급·업무 REST·복구 API·실제 운영 중앙/Host 검증은 남아 있다.

@@ -1,5 +1,7 @@
 # Rust 중앙 업무 중계 (-93)
 
+후속 -94는 최신 고정 중앙 `a5c7987`의 생성 URL `/api/v1/tasks/{teamId}`를 반영했다. 아래 `02de434` 기록은 당시 검증 증거다. 새 4개 중계·DTO·검증·남은 조건은 [task-operations.md](task-operations.md)를 참고한다. 과거 중앙 정책 blocker가 해결됐다는 의미는 아니다.
+
 2026-10-30 (Asia/Seoul). 사용자 요청으로 구현 커밋 전 교차검증 도구를 Claude Code에서 **사용자가 실행하는 Gemini 검토**로 변경했다. Gemini 결과를 받기 전에는 커밋하지 않는다.
 
 ## 범위와 상태
