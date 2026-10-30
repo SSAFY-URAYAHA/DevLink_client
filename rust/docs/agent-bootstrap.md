@@ -28,7 +28,7 @@ devlink agent token
 
 CSRF 선행 조회가 실패하면 생성 POST 전이므로 pending을 남기지 않는다. 실제 POST의 결과가 불확실하고 목록에도 생성된 Agent를 찾을 수 없으면, 서버 기록·지연 처리를 확인한 사용자가 `devlink agent reset-pending --accept-duplicate-risk`로 해당 pending만 명시적으로 비울 수 있다. 이 명령은 생성 요청을 보내지 않는다. 중앙에 지연 생성이 남았을 가능성은 사라지지 않으므로 기존 ID 복구를 우선하며, 이후 새 생성은 사용자의 별도 명령이다. 이미 ID가 알려진 프로필은 reset할 수 없다.
 
-`agent token`은 중앙에서 지원하는 명시적 발급/회전이다. 먼저 `needs_token`을 내구 저장하므로 응답 유실 시 옛 토큰을 계속 사용하지 않는다. 발급 후 Agent Bearer `GET /api/v1/agent/context`의 ID/ownerUserId/teamId가 일치해야 `ready`를 게시한다. 발급 성공 후 검증이나 저장이 실패해도 새 Agent를 생성하지 않고 같은 ID에서 명시적으로 다시 발급한다. 중앙에 없는 메타데이터 수정·삭제·폐기 API를 가정하지 않는다.
+`agent token`은 중앙에서 지원하는 명시적 발급/회전이다. 먼저 `needs_token`을 내구 저장하므로 응답 유실 시 옛 토큰을 계속 사용하지 않는다. 발급 후 Agent Bearer `GET /api/v1/agents/me`의 ID/ownerUserId/teamId가 일치해야 `ready`를 게시한다. 발급 성공 후 검증이나 저장이 실패해도 새 Agent를 생성하지 않고 같은 ID에서 명시적으로 다시 발급한다. 중앙에 없는 메타데이터 수정·삭제·폐기 API를 가정하지 않는다.
 
 ## 자격과 소유권
 
