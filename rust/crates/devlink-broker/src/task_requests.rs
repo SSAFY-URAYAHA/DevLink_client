@@ -1,4 +1,4 @@
-//! 작업 생성 요청의 영속 로그 및 멱등성 보장 관리자
+//! 작업 생성 요청의 영속 키 관리자 (중앙 멱등 정책을 대체하지 않음)
 //!
 //! HTTP 요청을 보내기 전 서버 멱등키(UUID)를 파일에 안전하게 영속화합니다.
 //! 동일한 클라이언트가 동일한 requestId로 재요청할 경우 기발급된 동일 멱등키를 재사용하여 중복 작업을 방지합니다.
@@ -61,6 +61,23 @@ pub struct TaskRequests {
 pub struct PreparedTask {
     pub command: CreateTaskCommand,
     pub gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Preparation failed before central dispatch. A published key is returned
+/// under the same store lock as conflict detection, only to its original actor.
+#[derive(Debug)]
+pub struct PrepareError {
+    pub error: TaskError,
+    pub request_key: Option<String>,
+}
+
+impl From<TaskError> for PrepareError {
+    fn from(error: TaskError) -> Self {
+        Self {
+            error,
+            request_key: None,
+        }
+    }
 }
 
 impl TaskRequests {
@@ -136,7 +153,7 @@ impl TaskRequests {
         principal: Principal,
         request_id: Identifier,
         mut command: CreateTaskCommand,
-    ) -> Result<PreparedTask, TaskError> {
+    ) -> Result<PreparedTask, PrepareError> {
         let user_id = numeric_id(principal.user_id.as_str()).ok_or_else(validation)?;
         let team_id = numeric_id(principal.team_id.as_str()).ok_or_else(validation)?;
         let agent = principal
@@ -145,12 +162,12 @@ impl TaskRequests {
             .and_then(|id| numeric_id(id.as_str()))
             .ok_or_else(validation)?;
         if agent != command.requester_agent_id || !valid_origin(&origin) {
-            return Err(validation());
+            return Err(validation().into());
         }
-        // 신규 요청 시 사용할 기본 UUID 멱등키 생성
-        command.request_key = uuid::Uuid::new_v4().to_string();
+        // Validate before IO without minting another key for an existing request.
+        command.request_key = "pending".into();
         if !command.valid() {
-            return Err(validation());
+            return Err(validation().into());
         }
         let record = Record {
             origin,
@@ -176,17 +193,32 @@ impl TaskRequests {
     }
 
     /// 동기 방식으로 요청 로그 검사, 중복/재시도 판정 및 파일 영속화 수행
-    fn prepare_sync(&self, mut incoming: Record) -> Result<PreparedTask, TaskError> {
+    fn prepare_sync(&self, mut incoming: Record) -> Result<PreparedTask, PrepareError> {
         let mut store = self.store.lock().map_err(|_| storage_error())?;
+        let known_key = store
+            .records
+            .iter()
+            .find(|record| {
+                record.origin == incoming.origin
+                    && record.user_id == incoming.user_id
+                    && record.team_id == incoming.team_id
+                    && record.request_id == incoming.request_id
+                    && record.command.requester_agent_id == incoming.command.requester_agent_id
+            })
+            .map(|record| record.command.request_key.clone());
+        let storage_failure = || PrepareError {
+            error: storage_error(),
+            request_key: known_key.clone(),
+        };
         if store.failed {
-            return Err(storage_error());
+            return Err(storage_failure());
         }
-        let parent = store.path.parent().ok_or_else(storage_error)?;
-        credentials::verify_parent_safety(parent).map_err(|_| storage_error())?;
-        let exists =
-            credentials::ensure_safe_target_if_exists(&store.path).map_err(|_| storage_error())?;
+        let parent = store.path.parent().ok_or_else(storage_failure)?;
+        credentials::verify_parent_safety(parent).map_err(|_| storage_failure())?;
+        let exists = credentials::ensure_safe_target_if_exists(&store.path)
+            .map_err(|_| storage_failure())?;
         if !exists && !store.records.is_empty() {
-            return Err(storage_error());
+            return Err(storage_failure());
         }
         // 기존 동일 요청(origin, user_id, request_id 일치)이 있는지 검색
         if let Some(previous) = store.records.iter().find(|record| {
@@ -198,13 +230,17 @@ impl TaskRequests {
             incoming.command.request_key = previous.command.request_key.clone();
             // 단, 요청 내용(팀 ID 또는 페이로드)이 변경되었으면 충돌(409) 에러 반환
             if previous.team_id != incoming.team_id || previous.command != incoming.command {
-                return Err(TaskError::rejected("REQUEST_KEY_CONFLICT", 409));
+                return Err(PrepareError {
+                    error: TaskError::rejected("REQUEST_KEY_CONFLICT", 409),
+                    request_key: known_key.clone(),
+                });
             }
         } else {
             // 신규 요청인 경우 최대 보관 건수 검사 후 파일에 스냅샷 저장
             if store.records.len() >= MAX_RECORDS {
-                return Err(storage_error());
+                return Err(storage_failure());
             }
+            incoming.command.request_key = uuid::Uuid::new_v4().to_string();
             let mut records = store.records.clone();
             records.push(incoming.clone());
             if persist(
@@ -217,7 +253,7 @@ impl TaskRequests {
             .is_err()
             {
                 store.failed = true;
-                return Err(storage_error());
+                return Err(storage_failure());
             }
             store.records = records;
         }
@@ -334,14 +370,74 @@ mod tests {
         assert_ne!(first.command.request_key, other.command.request_key);
         let mut changed = command();
         changed.prompt = "changed".into();
+        let conflict = log
+            .prepare(
+                "http://localhost:8080/".into(),
+                actor(),
+                id.clone(),
+                changed,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(conflict.error.code, "REQUEST_KEY_CONFLICT");
         assert_eq!(
-            log.prepare("http://localhost:8080/".into(), actor(), id, changed)
-                .await
-                .err()
-                .unwrap()
-                .code,
-            "REQUEST_KEY_CONFLICT"
+            conflict.request_key.as_deref(),
+            Some(first.command.request_key.as_str())
         );
+        let mut other_team = actor();
+        other_team.team_id = Identifier::parse("99").unwrap();
+        let conflict = log
+            .prepare(
+                "http://localhost:8080/".into(),
+                other_team,
+                id.clone(),
+                command(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(conflict.error.code, "REQUEST_KEY_CONFLICT");
+        assert!(
+            conflict.request_key.is_none(),
+            "another team must not see the existing key"
+        );
+        let mut other_agent = actor();
+        other_agent.agent_id = Some(Identifier::parse("99").unwrap());
+        let mut other_command = command();
+        other_command.requester_agent_id = 99;
+        let conflict = log
+            .prepare(
+                "http://localhost:8080/".into(),
+                other_agent,
+                id.clone(),
+                other_command,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(conflict.error.code, "REQUEST_KEY_CONFLICT");
+        assert!(
+            conflict.request_key.is_none(),
+            "another Agent must not see the existing key"
+        );
+        // A later disk failure must not erase a key already published to this
+        // actor. Lookup and failure metadata share the preparation store lock.
+        let saved = std::fs::read(TaskRequests::path(&path)).unwrap();
+        std::fs::remove_file(TaskRequests::path(&path)).unwrap();
+        std::fs::create_dir(TaskRequests::path(&path)).unwrap();
+        let failure = log
+            .prepare("http://localhost:8080/".into(), actor(), id, command())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.error.code, "BROKER_STORAGE_FAILED");
+        assert_eq!(
+            failure.request_key.as_deref(),
+            Some(first.command.request_key.as_str())
+        );
+        std::fs::remove_dir(TaskRequests::path(&path)).unwrap();
+        std::fs::write(TaskRequests::path(&path), saved).unwrap();
         credentials::verify_private_permissions(&TaskRequests::path(&path)).unwrap();
         std::fs::write(TaskRequests::path(&path), b"partial-json").unwrap();
         assert!(TaskRequests::open(&path).is_err());

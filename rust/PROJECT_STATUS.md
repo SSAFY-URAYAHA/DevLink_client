@@ -1,5 +1,7 @@
 # CLI·브로커 진행 현황
 
+2026-10-30 (-93): Rust Agent 확인/목록·작업 생성 중계를 실제 Agent Bearer provider에 연결했다. 공통 envelope/예산, canonical ID, requestKey 유지와 회귀를 보완했다. 실제 고정 중앙 02de434 + PostgreSQL에서 중계를 검증했지만 오프라인 수신자 저장 전 거부와 같은 키 동시 요청 409가 남아 스토리 전체 완료는 보류한다. [현재 구현·검증·남은 조건](docs/business-relay.md)이 아래 과거 업무 API 미구현 설명보다 우선한다. 나머지 네 업무 API는 -94다.
+
 2026-10-29 READY 신원 연결: 중앙 담당자와 합의한 user_id/team_id를 받아 실제 ReadyIdentityProvider로 로컬 세션을 생성·bind하도록 연결했다. 같은 신원 재접속은 lease를 유지하고 신원 변경은 이전 세션·ONLINE을 무효화한다. [상세 계약](docs/ready-identity.md)이 아래 과거 미구성 공급부 설명보다 우선한다. 토큰 발급·업무 REST·복구 API·실제 운영 중앙/Host 검증은 남아 있다.
 
 2026-10-29 추가: 작업 수신함·저장 후 ACK와 재시작 후 중복 수신 방지를 구현했습니다. [상세 문서](docs/task-inbox.md), [검증 기록](docs/verification.md)을 참고하세요. 아래 2026-10-28 현황에서 수신함·ACK 미구현으로 기재된 부분은 이번 추가로 대체하며, 중앙 신원·업무 API·실제 Host 왕복은 계속 미완료입니다.
@@ -15,30 +17,30 @@ Rust CLI·독립 브로커, MCP 자격·권한 분리와 중앙 WebSocket·JSON 
 
 HTTP 라우터에는 health/shutdown과 세션 생성·bind·heartbeat·해제가 있습니다. 기본 CLI의 신원 공급부는 미구성이어서 생성 요청을 503 CENTRAL_UNAUTHENTICATED로 거부합니다. 성공 흐름은 테스트 내부 신원 공급부로 검증했으며, 업무 API 7개·실제 중앙 신원 전달·Host 업무 왕복은 아직 남아 있습니다. 상세 계약은 [로컬 세션 API](docs/local-sessions.md)를 참고하세요.
 
-| 영역 | 현재 상태 | 확인 내용·남은 조건 |
-| --- | --- | --- |
-| Rust 구조 | 구현 | `devlink-cli` 실행 파일·`devlink-broker` 라이브러리의 Cargo workspace |
-| CLI·설정 | 구현 | init/start/stop/status/config, mcp path/rotate, 설정 검증·원자 저장 |
-| 브로커 수명 주기 | 구현 | 독립 프로세스·OS 잠금·정상 종료·강제 종료 후 복구 |
-| MCP 자격·권한 | 구현 | broker.json 원자 발행·Windows 권한 검사·토큰 유지·중지 중 회전·CLI/MCP 권한 분리 |
-| 중앙 연결 | 로컬 검증 | `/ws/broker` Bearer 인증·READY·presence 변경 보고·재연결·종료 분류. 실제 중앙 인증·DB 연동은 미검증 |
-| MCP 서버·업무 도구 | 구현·가짜 브로커 검증 | stdio MCP 서버·업무 도구 7개·세션 복구 클라이언트. 실제 Rust 세션·업무 연동 필요 |
-| Rust 로컬 세션 | 구현·로컬 검증 | HTTP 4개 경로·fresh/recover·90초 lease·presence. READY 기반 실제 신원 공급부 연결, 신원 변경 시 소유권 무효화. 운영 중앙 검증 필요 |
-| 작업 수신함·ACK | 구현·로컬 검증 | 기존 TASK_CREATED/ACK 형식, 디스크 원자 저장·재시작 중복 방지·실패 시 ACK 차단. 저장 후 ACK·기본 5초 방향 확인, 운영 검증 필요 |
-| Rust 업무 API | 미구현 | 업무 7개 경로·중앙 인증/DTO·라우팅·수신함 연결 필요 |
-| 실제 MVP 통합 | 미검증 | 서로 다른 두 사용자·프로젝트에서 요청·수락·편집·결과 조회까지 검증 필요 |
-| CI·Unix | 미검증 | `.github/workflows/` 없음. Ubuntu 빌드·테스트와 Unix 권한 분기 실행 필요 |
+| 영역               | 현재 상태             | 확인 내용·남은 조건                                                                                                                |
+| ------------------ | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Rust 구조          | 구현                  | `devlink-cli` 실행 파일·`devlink-broker` 라이브러리의 Cargo workspace                                                              |
+| CLI·설정           | 구현                  | init/start/stop/status/config, mcp path/rotate, 설정 검증·원자 저장                                                                |
+| 브로커 수명 주기   | 구현                  | 독립 프로세스·OS 잠금·정상 종료·강제 종료 후 복구                                                                                  |
+| MCP 자격·권한      | 구현                  | broker.json 원자 발행·Windows 권한 검사·토큰 유지·중지 중 회전·CLI/MCP 권한 분리                                                   |
+| 중앙 연결          | 로컬 검증             | `/ws/broker` Bearer 인증·READY·presence 변경 보고·재연결·종료 분류. 실제 중앙 인증·DB 연동은 미검증                                |
+| MCP 서버·업무 도구 | 구현·가짜 브로커 검증 | stdio MCP 서버·업무 도구 7개·세션 복구 클라이언트. 실제 Rust 세션·업무 연동 필요                                                   |
+| Rust 로컬 세션     | 구현·로컬 검증        | HTTP 4개 경로·fresh/recover·90초 lease·presence. READY 기반 실제 신원 공급부 연결, 신원 변경 시 소유권 무효화. 운영 중앙 검증 필요 |
+| 작업 수신함·ACK    | 구현·로컬 검증        | 기존 TASK_CREATED/ACK 형식, 디스크 원자 저장·재시작 중복 방지·실패 시 ACK 차단. 저장 후 ACK·기본 5초 방향 확인, 운영 검증 필요     |
+| Rust 업무 API      | 미구현                | 업무 7개 경로·중앙 인증/DTO·라우팅·수신함 연결 필요                                                                                |
+| 실제 MVP 통합      | 미검증                | 서로 다른 두 사용자·프로젝트에서 요청·수락·편집·결과 조회까지 검증 필요                                                            |
+| CI·Unix            | 미검증                | `.github/workflows/` 없음. Ubuntu 빌드·테스트와 Unix 권한 분기 실행 필요                                                           |
 
 ## 2. 구현된 자격 파일·토큰 관리
 
 설정 디렉터리의 `.devlink-runtime/`에 내부 파일을 저장합니다. 별도 설정 디렉터리는 별도 브로커·자격 파일을 사용합니다.
 
-| 파일·자격 | 용도·수명 주기 |
-| --- | --- |
-| `runtime.json`의 controlToken | CLI 제어용. 기동마다 재생성하며 health·shutdown 허용 |
-| `broker.json`의 localToken | MCP용. 정상·강제 종료 후 재시작에 유지하며 현재 health만 허용, shutdown 거부 |
-| `broker.lock`·`control.lock` | 중복 실행 및 start/stop/토큰 회전 조정 |
-| 환경변수 `DEVLINK_TOKEN` | 중앙 Agent 인증용. MCP 자격 파일에 포함하지 않음 |
+| 파일·자격                     | 용도·수명 주기                                                               |
+| ----------------------------- | ---------------------------------------------------------------------------- |
+| `runtime.json`의 controlToken | CLI 제어용. 기동마다 재생성하며 health·shutdown 허용                         |
+| `broker.json`의 localToken    | MCP용. 정상·강제 종료 후 재시작에 유지하며 현재 health만 허용, shutdown 거부 |
+| `broker.lock`·`control.lock`  | 중복 실행 및 start/stop/토큰 회전 조정                                       |
+| 환경변수 `DEVLINK_TOKEN`      | 중앙 Agent 인증용. MCP 자격 파일에 포함하지 않음                             |
 
 `devlink [--config <FILE>] mcp path`는 자격 파일의 절대 경로만 출력합니다. 브로커 기동 시 `schemaVersion`, `brokerUrl`, `localToken`을 원자적으로 발행합니다. 현재 Rust 발행 스키마에는 `agentId`가 없으며 Agent ID 영속 저장·재사용은 후속 작업입니다.
 
@@ -58,11 +60,11 @@ Upgrade HTTP `401`·`403`은 AuthFailed, Close `4002`는 Replaced, `1008`·잘�
 
 2026-10-28 로컬 세션 구현 후 다음 검사를 실행했습니다. ACL·로컬 HTTP/WebSocket 테스트는 승인된 샌드박스 외부에서 실행했습니다.
 
-| 검사 | 결과 |
-| --- | --- |
-| `cargo check --offline --locked --workspace --all-targets` | 통과 |
-| `cargo fmt --all -- --check` | 통과 |
-| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | 통과 |
+| 검사                                                                          | 결과                                                 |
+| ----------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `cargo check --offline --locked --workspace --all-targets`                    | 통과                                                 |
+| `cargo fmt --all -- --check`                                                  | 통과                                                 |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`    | 통과                                                 |
 | `cargo test --offline --locked --workspace --all-targets -- --test-threads=1` | 단위 27개·세션 HTTP/WebSocket 6개·CLI 통합 30개 통과 |
 
 MCP 전체 테스트·일반/릴리스 빌드·준비 상태 재현 도구는 이번 추가에서 다시 실행하지 않았습니다. MCP 100개 테스트 등 기존 실행 결과는 [로컬 검증 기록](docs/verification.md)에 실행 시점별로 보관합니다. JSON Heartbeat에는 시간 단축 방식의 만료·재접속 테스트와 실제 CLI를 45초 동안 같은 연결로 유지하는 자동 회귀 테스트가 있습니다. 후자는 기본 전체 테스트에 포함하며 PING 20초·PONG 대기 20초·서버 만료 40초를 단축하지 않습니다. 로컬 검증 통과는 실제 중앙 인증·DB·Host 업무 왕복 통과를 의미하지 않습니다.

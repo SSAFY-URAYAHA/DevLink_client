@@ -3,7 +3,7 @@
 //! WebSocket 접속 origin으로부터 HTTP/HTTPS 엔드포인트를 도출하며,
 //! Bearer 인증 토큰을 안전하게 주입하고 로그, URL, 에러 메시지에 인증 정보가 누출되지 않도록 보장합니다.
 
-use crate::{central::endpoint_url, protocol::MAX_CENTRAL_MESSAGE_BYTES};
+use crate::{central::endpoint_url, protocol::MAX_CENTRAL_MESSAGE_BYTES, sessions::Principal};
 use anyhow::{Context, Result, ensure};
 use reqwest::{
     Client,
@@ -28,7 +28,7 @@ pub struct CreateTaskCommand {
     pub requester_agent_id: u64,
     /// 대상(수신) 에이전트 ID
     pub receiver_agent_id: u64,
-    /// 프롬프트 본문 (제목, 설명 등 JSON 직렬화된 문자열)
+    /// 중앙에 전달할 불투명 prompt 원문 (기존 MCP 입력은 별도 호환 변환)
     pub prompt: String,
 }
 
@@ -179,16 +179,30 @@ impl TaskClient {
     /// HTTP POST 통신 및 중앙 서버 응답 엔벨로프 검증 수행
     async fn exchange(
         &self,
-        team_id: u64,
+        _team_id: u64,
         command: &CreateTaskCommand,
     ) -> Result<Value, TaskError> {
+        // The Agent API derives requester/team from its authenticated principal.
+        // Never send actor IDs to the legacy user/temporary-parameter route.
+        let body = json!({"requestKey":command.request_key,"receiverAgentId":command.receiver_agent_id,"prompt":command.prompt});
+        let (status, envelope) = self.request("/api/v1/agent/tasks", Some(body)).await?;
+        self.map_created(status, envelope, command)
+    }
+
+    async fn request(
+        &self,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, CentralEnvelope), TaskError> {
         let mut url = self.origin.clone();
-        url.set_path(&format!("/api/v1/tasks/{team_id}"));
-        let mut response = self
-            .client
-            .post(url)
+        url.set_path(path);
+        let builder = if let Some(body) = body {
+            self.client.post(url).json(&body)
+        } else {
+            self.client.get(url)
+        };
+        let mut response = builder
             .header(AUTHORIZATION, self.authorization.clone())
-            .json(command)
             .send()
             .await
             .map_err(transport_error)?;
@@ -218,6 +232,15 @@ impl TaskClient {
         }
         let envelope: CentralEnvelope = serde_json::from_slice(&bytes)
             .map_err(|_| TaskError::unknown("CENTRAL_PROTOCOL_ERROR"))?;
+        Ok((status, envelope))
+    }
+
+    fn map_created(
+        &self,
+        status: u16,
+        envelope: CentralEnvelope,
+        command: &CreateTaskCommand,
+    ) -> Result<Value, TaskError> {
         let known_id = envelope
             .data
             .as_ref()
@@ -259,6 +282,100 @@ impl TaskClient {
             "requestKey":command.request_key,"delivery":data.delivery}),
         )
     }
+
+    /// Confirm only the Agent already authenticated by the broker credential.
+    pub async fn confirm_agent(&self, actor: &Principal) -> Result<Value, TaskError> {
+        tokio::time::timeout(self.timeout, async {
+            let data = self.read("/api/v1/agent/context").await?;
+            let agent = PublicAgent::decode(data)?;
+            if agent.owner_user_id.to_string() != actor.user_id.as_str()
+                || agent.team_id.to_string() != actor.team_id.as_str()
+                || actor
+                    .agent_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() != agent.agent_id.to_string())
+            {
+                return Err(TaskError::rejected("FORBIDDEN", 403));
+            }
+            Ok(agent.local())
+        })
+        .await
+        .unwrap_or_else(|_| Err(TaskError::unknown("CENTRAL_TIMEOUT")))
+    }
+
+    pub async fn list_agents(&self, actor: &Principal) -> Result<Value, TaskError> {
+        tokio::time::timeout(self.timeout, async {
+            // Verify the credential still represents the local actor before using
+            // a provider whose team selection is implicit in that credential.
+            self.confirm_agent(actor).await?;
+            let data = self.read("/api/v1/agent/agents").await?;
+            let rows = data.as_array().ok_or_else(protocol_error)?;
+            let mut ids = std::collections::HashSet::new();
+            let mut agents = Vec::with_capacity(rows.len());
+            for row in rows {
+                let agent = PublicAgent::decode(row.clone())?;
+                if agent.team_id.to_string() != actor.team_id.as_str()
+                    || !ids.insert(agent.agent_id)
+                {
+                    return Err(protocol_error());
+                }
+                agents.push(agent.local());
+            }
+            Ok(json!({"agents":agents}))
+        })
+        .await
+        .unwrap_or_else(|_| Err(TaskError::unknown("CENTRAL_TIMEOUT")))
+    }
+
+    async fn read(&self, path: &str) -> Result<Value, TaskError> {
+        let (status, envelope) = self.request(path, None).await?;
+        if status != 200 || !envelope.success {
+            return Err(central_error(status, envelope.code.as_deref()));
+        }
+        envelope.data.ok_or_else(protocol_error)
+    }
+}
+
+fn protocol_error() -> TaskError {
+    TaskError::unknown("CENTRAL_PROTOCOL_ERROR")
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicAgent {
+    agent_id: u64,
+    team_id: u64,
+    owner_user_id: u64,
+    name: String,
+    role_description: Option<String>,
+    tool_type: String,
+    project_name: String,
+    status: String,
+    last_seen_at: Option<String>,
+    created_at: String,
+}
+impl PublicAgent {
+    fn decode(data: Value) -> Result<Self, TaskError> {
+        let agent: Self = serde_json::from_value(data).map_err(|_| protocol_error())?;
+        if [agent.agent_id, agent.team_id, agent.owner_user_id]
+            .into_iter()
+            .any(|id| id == 0 || id > i64::MAX as u64)
+            || !matches!(agent.tool_type.as_str(), "CODEX" | "CLAUDE_CODE")
+            || !matches!(agent.status.as_str(), "ONLINE" | "OFFLINE")
+            || agent.name.trim().is_empty()
+            || agent.created_at.is_empty()
+        {
+            return Err(protocol_error());
+        }
+        Ok(agent)
+    }
+    fn local(&self) -> Value {
+        let mut data = serde_json::to_value(self).expect("public Agent serialization");
+        data["agentId"] = json!(self.agent_id.to_string());
+        data["teamId"] = json!(self.team_id.to_string());
+        data["ownerUserId"] = json!(self.owner_user_id.to_string());
+        data
+    }
 }
 
 /// HTTP 전송 오류를 표준 TaskError로 변환
@@ -282,13 +399,18 @@ fn central_error(status: u16, code: Option<&str>) -> TaskError {
     if status >= 500 {
         return TaskError::unknown("CENTRAL_UNAVAILABLE");
     }
-    match code {
-        Some("VALIDATION_FAILED") => TaskError::rejected("VALIDATION_FAILED", 400),
-        Some("RESOURCE_NOT_FOUND") => TaskError::rejected("RECEIVER_NOT_FOUND", 404),
-        Some("RECEIVER_OFFLINE") => TaskError::rejected("RECEIVER_OFFLINE", 409),
-        Some("REQUEST_KEY_CONFLICT") => TaskError::rejected("REQUEST_KEY_CONFLICT", 409),
+    match (status, code) {
+        (400, Some("VALIDATION_FAILED")) => TaskError::rejected("VALIDATION_FAILED", 400),
+        (404, Some("RESOURCE_NOT_FOUND")) => TaskError::rejected("RESOURCE_NOT_FOUND", 404),
+        (409, Some("RECEIVER_OFFLINE")) => TaskError::rejected("RECEIVER_OFFLINE", 409),
+        // Identical concurrent inserts can also produce this provider code.
+        // Preserve the conflict without claiming no transaction committed.
+        (409, Some("REQUEST_KEY_CONFLICT")) => TaskError {
+            outcome: "unknown",
+            ..TaskError::rejected("REQUEST_KEY_CONFLICT", 409)
+        },
         // A concurrent insert conflict may refer to a task already committed.
-        Some("DUPLICATE_REQUEST") => TaskError::unknown("CENTRAL_RESULT_UNKNOWN"),
+        (409, Some("DUPLICATE_REQUEST")) => TaskError::unknown("CENTRAL_RESULT_UNKNOWN"),
         _ => TaskError::unknown("CENTRAL_PROTOCOL_ERROR"),
     }
 }
