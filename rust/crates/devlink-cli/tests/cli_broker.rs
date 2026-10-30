@@ -115,7 +115,7 @@ async fn cli_creates_tasks_with_agent_bearer_and_reuses_request_key_after_restar
                     if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
                 };
                 let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap().to_lowercase();
-                assert!(headers.starts_with("post /api/v1/agent/tasks http/1.1\r\n"));
+                assert!(headers.starts_with("post /api/v1/tasks/1 http/1.1\r\n"));
                 assert!(headers.contains(&format!("authorization: bearer {TOKEN}\r\n")));
                 assert!(!headers.contains("cookie:") && !headers.contains("origin:"));
                 let size: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();

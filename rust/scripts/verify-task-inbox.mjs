@@ -61,7 +61,7 @@ try{
  await agent(a,'codex');await agent(b,'claude-code');await start(b);
  const firstRuntime=b.runtime.instanceId;
  const bodies=Array.from({length:16},(_,i)=>({requestKey:randomUUID(),receiverAgentId:b.agent.agentId,prompt:`Synthetic inbox ${i} ${randomUUID()}`}));
- const created=await Promise.all(bodies.map(body=>api(a,'/api/v1/agent/tasks',body)));
+ const created=await Promise.all(bodies.map(body=>api(a,`/api/v1/tasks/${a.agent.teamId}`,body)));
  assert(created.every(task=>task.status==='PENDING'&&!task.replayed));
  await until(()=>Promise.all(created.map(task=>details(a,task.taskId))),values=>values.every(value=>has(value,'ACK_RECEIVED')&&!has(value,'DELIVERY_UNKNOWN')&&value.status==='PENDING'),'16 durable central receipts');
  const received=run(b,['inbox','list','--limit','1024']);assert.equal(received.length,16);
@@ -70,15 +70,15 @@ try{
  assert(run(b,['inbox','clear'],undefined,false).includes('Stop the broker'));assert((await readFile(file,'utf8'))===before);
  stop(b);await start(b);assert(b.runtime.instanceId!==firstRuntime,'Broker process instance must change');assert((await readFile(file,'utf8'))===before);
  // The real server does not resend a created task on request-key replay. Wire-redelivery dedup is tested by the socket fixture.
- const replay=await api(a,'/api/v1/agent/tasks',bodies[0]);assert(replay.replayed&&replay.taskId===created[0].taskId);assert((await readFile(file,'utf8'))===before);
- const next=await api(a,'/api/v1/agent/tasks',{requestKey:randomUUID(),receiverAgentId:b.agent.agentId,prompt:'Synthetic receipt after broker restart'});
+ const replay=await api(a,`/api/v1/tasks/${a.agent.teamId}`,bodies[0]);assert(replay.replayed&&replay.taskId===created[0].taskId);assert((await readFile(file,'utf8'))===before);
+ const next=await api(a,`/api/v1/tasks/${a.agent.teamId}`,{requestKey:randomUUID(),receiverAgentId:b.agent.agentId,prompt:'Synthetic receipt after broker restart'});
  await until(()=>details(a,next.taskId),value=>has(value,'ACK_RECEIVED')&&value.status==='PENDING','receipt after restart');
  assert.equal(run(b,['inbox','list','--limit','1024']).length,17);
  // Inject an actual local write failure in an owned disposable profile, preserve and restore its original file.
  assert.equal(dirname(resolve(file)),resolve(join(b.folder,'.devlink-runtime')));assert(resolve(file).startsWith(`${resolve(root)}\\`)||resolve(file).startsWith(`${resolve(root)}/`));
  const backup=join(b.folder,'.devlink-runtime','inbox95-backup.json');await rename(file,backup);await mkdir(file);
  restore=async()=>{await rmdir(file);await rename(backup,file);};
- const failed=await api(a,'/api/v1/agent/tasks',{requestKey:randomUUID(),receiverAgentId:b.agent.agentId,prompt:'Synthetic failed local persistence must not ACK'});
+ const failed=await api(a,`/api/v1/tasks/${a.agent.teamId}`,{requestKey:randomUUID(),receiverAgentId:b.agent.agentId,prompt:'Synthetic failed local persistence must not ACK'});
  const health=await until(async()=>(await fetch(`${b.mcp.brokerUrl}/health`,{headers:{Authorization:`Bearer ${b.mcp.localToken}`}})).json(),h=>h.centralServer==='InboxFailed','local failure status');assert(health.inbox.rejectedEvents>0);
  const failure=await until(()=>details(a,failed.taskId),value=>has(value,'DELIVERY_UNKNOWN'),'central failed-receipt history');assert(!has(failure,'ACK_RECEIVED'));assert.equal(failure.status,'PENDING');
  stop(b);await restore();restore=undefined;assert.equal(run(b,['inbox','list','--limit','1024']).length,17);

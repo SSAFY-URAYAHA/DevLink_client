@@ -153,7 +153,7 @@ try {
   // Rust recovery. Never correct a 409 by querying or sending a new key.
   const concurrentKey = randomUUID();
   const concurrent = await Promise.all([0,1].map(async () => {
-    const r = await fetch(new URL('/api/v1/agent/tasks', base), { method: 'POST',
+    const r = await fetch(new URL(`/api/v1/tasks/${team.teamId}`, base), { method: 'POST',
       headers: { authorization: `Bearer ${agentA.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ requestKey: concurrentKey, receiverAgentId: agentB.agentId, prompt: 'provider concurrent-key probe' }),
       signal: AbortSignal.timeout(10000) });

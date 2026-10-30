@@ -139,10 +139,16 @@ pub async fn run(path: &Path) -> Result<()> {
             cancel.clone(),
         ))
         .merge(crate::task_api::router(
+            mcp_token.clone(),
+            sessions.clone(),
+            task_client.clone(),
+            task_requests,
+            cancel.clone(),
+        ))
+        .merge(crate::task_routes::router(
             mcp_token,
             sessions,
             task_client,
-            task_requests,
             cancel.clone(),
         ));
 
