@@ -1,4 +1,5 @@
 pub mod agent_context;
+pub mod agent_profile;
 pub mod broker;
 pub mod central;
 #[cfg(test)]

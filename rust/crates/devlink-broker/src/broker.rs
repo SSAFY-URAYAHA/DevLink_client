@@ -50,10 +50,13 @@ impl Drop for RuntimeGuard {
 pub async fn run(path: &Path) -> Result<()> {
     // 설정 로드 및 환경변수 토큰 확인
     let config = Config::load(path)?;
-    let token = central_token()?;
-
     // 중복 실행 방지를 위한 파일 락 획득 (broker.lock)
     let _lock = config::lock(&state_directory(path).join("broker.lock"))?;
+    let prepared = crate::agent_profile::prepare_broker(path).await?;
+    let (token, _owner_guard) = match prepared {
+        Some(identity) => (identity.token, Some(identity._owner)),
+        None => (central_token()?, None),
+    };
 
     // 로컬 제어용 루프백(127.0.0.1) TCP 포트 바인딩
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, config.local_port))
@@ -174,6 +177,13 @@ pub fn central_token() -> Result<String> {
         "DEVLINK_TOKEN must be nonempty and at most 8192 bytes"
     );
     Ok(token)
+}
+
+pub fn central_token_for(config_path: &Path) -> Result<String> {
+    match crate::agent_profile::stored_token(config_path)? {
+        Some(token) => Ok(token),
+        None => central_token(),
+    }
 }
 
 /// 로컬 HTTP 제어(shutdown) 요청의 Authorization 헤더와 Origin을 검증합니다.

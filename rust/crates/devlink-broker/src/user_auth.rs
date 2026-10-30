@@ -53,12 +53,37 @@ struct Csrf {
     header_name: String,
     token: String,
 }
+/// One-use prepared mutation credential; no Debug or serialization exposes it.
+pub(crate) struct PreparedPost(Csrf);
 
 #[derive(Deserialize)]
 struct Envelope {
     success: bool,
     data: Option<Value>,
     code: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ApiRejection {
+    pub status: u16,
+    pub code: &'static str,
+}
+impl std::fmt::Display for ApiRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.code == "USER_SESSION_EXPIRED" {
+            write!(f, "USER_SESSION_EXPIRED: run devlink auth login (HTTP 401)")
+        } else {
+            write!(
+                f,
+                "{}: central request rejected (HTTP {})",
+                self.code, self.status
+            )
+        }
+    }
+}
+impl std::error::Error for ApiRejection {}
+pub fn rejection_status(error: &anyhow::Error) -> Option<u16> {
+    error.downcast_ref::<ApiRejection>().map(|e| e.status)
 }
 
 /// A locked, authenticated user session. No Debug implementation exposes cookies.
@@ -266,8 +291,21 @@ impl UserClient {
     }
 
     pub async fn post<T: DeserializeOwned>(&mut self, path: &str, body: Value) -> Result<T> {
-        let csrf = self.csrf().await?;
-        self.exchange(Method::POST, path, Some(body), Some(csrf))
+        let prepared = self.prepare_post().await?;
+        self.post_prepared(path, body, prepared).await
+    }
+
+    pub(crate) async fn prepare_post(&mut self) -> Result<PreparedPost> {
+        self.csrf().await.map(PreparedPost)
+    }
+
+    pub(crate) async fn post_prepared<T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+        body: Value,
+        prepared: PreparedPost,
+    ) -> Result<T> {
+        self.exchange(Method::POST, path, Some(body), Some(prepared.0))
             .await
     }
 
@@ -307,7 +345,11 @@ impl UserClient {
         if status == 401 && matches!(self.snapshot.state, SessionState::Authenticated { .. }) {
             self.snapshot.state = SessionState::Expired;
             self.save()?;
-            bail!("USER_SESSION_EXPIRED: run devlink auth login");
+            return Err(ApiRejection {
+                status: 401,
+                code: "USER_SESSION_EXPIRED",
+            }
+            .into());
         }
         ensure!(
             !(300..400).contains(&status),
@@ -351,7 +393,11 @@ fn rejection(status: u16, code: Option<&str>) -> anyhow::Error {
             _ => "CENTRAL_REQUEST_REJECTED",
         },
     };
-    anyhow::anyhow!("{label}: central request rejected (HTTP {status})")
+    ApiRejection {
+        status,
+        code: label,
+    }
+    .into()
 }
 
 pub async fn login(config_path: &Path, email: &str, password: &str) -> Result<User> {
@@ -384,6 +430,7 @@ pub async fn login(config_path: &Path, email: &str, password: &str) -> Result<Us
             valid_user(&verified) && user.user_id == verified.user_id,
             "Central login identity mismatch"
         );
+        crate::agent_profile::before_login_publish(config_path, verified.user_id)?;
         client.csrf().await?; // Login rotates the session and the CSRF token.
         client.snapshot = Snapshot {
             schema_version: 1,
