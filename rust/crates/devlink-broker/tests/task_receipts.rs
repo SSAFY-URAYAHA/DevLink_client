@@ -124,7 +124,11 @@ async fn ack_follows_persistence_and_duplicate_is_safe_across_reconnect_and_rest
     let mut socket = ready(&listener).await;
     send(&mut socket, task("reconnected", 12)).await;
     assert_eq!(ack(&mut socket).await.event_id, "reconnected");
-    assert_eq!(std::fs::read(Inbox::path(&path)).unwrap(), original);
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(Inbox::path(&path)).unwrap()).unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(after["tasks"], original["tasks"]);
+    assert_eq!(after["receipts"].as_array().unwrap().len(), 2);
     cancel.cancel();
     timeout(Duration::from_secs(3), runner)
         .await
@@ -137,7 +141,10 @@ async fn ack_follows_persistence_and_duplicate_is_safe_across_reconnect_and_rest
     let mut socket = ready(&listener).await;
     send(&mut socket, task("after-restart", 12)).await;
     assert_eq!(ack(&mut socket).await.event_id, "after-restart");
-    assert_eq!(std::fs::read(Inbox::path(&path)).unwrap(), original);
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(Inbox::path(&path)).unwrap()).unwrap();
+    assert_eq!(after["tasks"], original["tasks"]);
+    assert_eq!(after["receipts"].as_array().unwrap().len(), 3);
     cancel.cancel();
     timeout(Duration::from_secs(3), runner)
         .await
@@ -246,4 +253,44 @@ async fn conflicting_redelivery_preserves_original_without_ack() {
         .unwrap();
     assert_eq!(state.status().await, ConnectionStatus::InboxFailed);
     assert_eq!(std::fs::read(Inbox::path(&path)).unwrap(), original);
+}
+
+#[tokio::test]
+async fn sixteen_task_burst_persists_and_acknowledges_within_central_receipt_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let inbox = Inbox::open(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("ws://{}", listener.local_addr().unwrap());
+    let config = Config {
+        server_url: origin.clone(),
+        ..Config::default()
+    };
+    let cancel = CancellationToken::new();
+    let (_, runner) = spawn(config, inbox, cancel.clone());
+    let mut socket = ready(&listener).await;
+    let start = std::time::Instant::now();
+    for i in 0..16 {
+        let mut message = task(&format!("burst-{i}"), 12);
+        if let ServerMessage::TaskCreated { payload, .. } = &mut message {
+            payload.task_id = 101 + i;
+        };
+        send(&mut socket, message).await;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..16 {
+        let receipt = ack(&mut socket).await;
+        assert!(seen.insert((receipt.event_id, receipt.task_id)));
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "16 ACKs exceeded central's default receipt timeout"
+    );
+    let disk = Inbox::open(&path).unwrap();
+    assert_eq!(disk.list_for(&origin, 12).unwrap().len(), 16);
+    cancel.cancel();
+    timeout(Duration::from_secs(3), runner)
+        .await
+        .unwrap()
+        .unwrap();
 }

@@ -248,8 +248,13 @@ async fn cli_persists_tasks_before_ack_and_deduplicates_after_restart() {
     );
     let snapshot = std::fs::read(devlink_broker::inbox::Inbox::path(&f.path)).unwrap();
     assert!(!String::from_utf8_lossy(&snapshot).contains(TOKEN));
+    let first_instance = Runtime::load(&f.path).unwrap().instance_id;
+    let list: serde_json::Value = serde_json::from_str(&f.ok(&["inbox", "list"])).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert!(!f.run(&["inbox", "clear"]).status.success());
     f.ok(&["stop"]);
     f.ok(&["start"]);
+    assert_ne!(Runtime::load(&f.path).unwrap().instance_id, first_instance);
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), received.recv())
             .await
@@ -257,11 +262,19 @@ async fn cli_persists_tasks_before_ack_and_deduplicates_after_restart() {
             .unwrap(),
         "cli-task-2"
     );
-    assert_eq!(
-        std::fs::read(devlink_broker::inbox::Inbox::path(&f.path)).unwrap(),
-        snapshot
-    );
+    let current: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(devlink_broker::inbox::Inbox::path(&f.path)).unwrap(),
+    )
+    .unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+    assert_eq!(current["tasks"], original["tasks"]);
+    assert_eq!(current["receipts"].as_array().unwrap().len(), 2);
     f.ok(&["stop"]);
+    f.ok(&["inbox", "clear"]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&f.ok(&["inbox", "list"])).unwrap(),
+        serde_json::json!([])
+    );
     tokio::time::timeout(Duration::from_secs(3), server)
         .await
         .unwrap()
@@ -271,6 +284,74 @@ async fn cli_persists_tasks_before_ack_and_deduplicates_after_restart() {
 struct Fixture {
     _dir: tempfile::TempDir,
     path: PathBuf,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_cli_reads_local_requests_safely_and_clear_requires_stopped_broker() {
+    use devlink_broker::{
+        inbox::Inbox,
+        protocol::{TaskCreatedMessage, TaskCreatedPayload},
+    };
+    let f = Fixture::new();
+    let before: Vec<_> = std::fs::read_dir(config::state_directory(&f.path))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&f.ok(&["inbox", "list"])).unwrap(),
+        serde_json::json!([])
+    );
+    let after: Vec<_> = std::fs::read_dir(config::state_directory(&f.path))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+    assert!(!Inbox::path(&f.path).exists());
+    let origin = Config::load(&f.path).unwrap().server_url;
+    let inbox = Inbox::open(&f.path).unwrap();
+    let prompt = "\u{001b}[31m\u{0085}\u{202e}\u{2067}\u{200f}실행하지 않은 요청";
+    for id in [12, 13] {
+        inbox
+            .record(
+                origin.clone(),
+                id,
+                TaskCreatedMessage {
+                    event_id: format!("cli-inbox-{id}"),
+                    payload: TaskCreatedPayload {
+                        task_id: id,
+                        team_id: 1,
+                        requester_agent_id: 10,
+                        receiver_agent_id: id,
+                        prompt: prompt.into(),
+                        created_at: "2026-10-30T09:00:00".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let shown = f.ok(&["inbox", "list", "--agent-id", "12", "--limit", "1"]);
+    for c in ['\u{001b}', '\u{0085}', '\u{202e}', '\u{2067}', '\u{200f}'] {
+        assert!(!shown.contains(c));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&shown).unwrap();
+    assert_eq!(parsed.as_array().unwrap().len(), 1);
+    assert_eq!(parsed[0]["message"]["payload"]["prompt"], prompt);
+    assert_eq!(parsed[0]["message"]["payload"]["requester_agent_id"], 10);
+    assert!(!f.run(&["inbox", "list", "--limit", "0"]).status.success());
+    let before = std::fs::read(Inbox::path(&f.path)).unwrap();
+    let guard = config::lock(&config::state_directory(&f.path).join("broker.lock")).unwrap();
+    assert!(!f.run(&["inbox", "clear"]).status.success());
+    assert_eq!(std::fs::read(Inbox::path(&f.path)).unwrap(), before);
+    drop(guard);
+    let credentials =
+        devlink_broker::credentials::publish(&f.path, "http://127.0.0.1:43127").unwrap();
+    f.ok(&["inbox", "clear"]);
+    assert!(!Inbox::path(&f.path).exists());
+    assert_eq!(
+        devlink_broker::credentials::load(&f.path).unwrap(),
+        credentials
+    );
 }
 impl Fixture {
     fn new() -> Self {

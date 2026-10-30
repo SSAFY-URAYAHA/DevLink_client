@@ -37,6 +37,12 @@ struct ApiState {
 
 /// 브로커 종료 시 런타임 파일(runtime.json)을 자동으로 정리(삭제)하는 RAII 가드
 struct RuntimeGuard(std::path::PathBuf);
+struct InboxGuard(crate::inbox::Inbox);
+impl Drop for InboxGuard {
+    fn drop(&mut self) {
+        self.0.stop_accepting();
+    }
+}
 impl Drop for RuntimeGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -69,6 +75,7 @@ pub async fn run(path: &Path) -> Result<()> {
     let mcp_creds = crate::credentials::publish(path, &broker_url)?;
     let mcp_token = Arc::new(mcp_creds.local_token);
     let inbox = crate::inbox::Inbox::open(path)?;
+    let inbox_guard = InboxGuard(inbox.clone());
     // 작업 생성 요청 영속화 및 멱등성 로그 초기화
     let task_requests = crate::task_requests::TaskRequests::open(path)?;
     // 중앙 서버 Task API 전송을 위한 HTTP 클라이언트 초기화 (중앙 토큰 주입)
@@ -163,6 +170,7 @@ pub async fn run(path: &Path) -> Result<()> {
 
     // 중앙 서버 태스크 종료 요청 및 대기 (최대 2초 후 강제 취소)
     cancel.cancel();
+    inbox_guard.0.stop_accepting();
     let abort = central.abort_handle();
     if timeout(Duration::from_secs(2), central).await.is_err() {
         abort.abort();
@@ -241,6 +249,7 @@ async fn health(State(state): State<ApiState>, headers: HeaderMap) -> Response {
         return error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     Json(Health {
+        inbox: state.central.inbox_diagnostics(),
         service: SERVICE.into(),
         api_version: API_VERSION,
         pid: state.runtime.pid,

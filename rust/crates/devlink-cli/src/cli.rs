@@ -55,6 +55,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Read or clear locally retained requests; never accepts or executes tasks
+    Inbox {
+        #[command(subcommand)]
+        command: Option<InboxCommand>,
+    },
     /// Internal command: run the broker loop in foreground (spawned by start)
     #[command(hide = true)]
     Broker,
@@ -79,6 +84,19 @@ pub enum McpCommand {
     Path,
     /// Rotate the MCP local token (only allowed when broker is stopped)
     Rotate,
+}
+
+#[derive(Subcommand)]
+pub enum InboxCommand {
+    /// Read newest retained tasks for this server and bound Agent (or explicit local filter)
+    List {
+        #[arg(long, default_value_t = 20, value_parser=clap::value_parser!(u16).range(1..=1024))]
+        limit: u16,
+        #[arg(long)]
+        agent_id: Option<u64>,
+    },
+    /// Delete this profile's entire local inbox and dedup history while broker is stopped
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -160,7 +178,7 @@ fn print_json(value: &serde_json::Value) -> Result<()> {
     let safe: String = json
         .chars()
         .map(|c| {
-            if matches!(c, '\u{7f}'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            if matches!(c, '\u{7f}'..='\u{9f}' | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
             {
                 format!("\\u{:04x}", c as u32)
             } else {
@@ -212,6 +230,44 @@ fn secret_input(label: &str, limit: usize, from_stdin: bool) -> Result<String> {
 pub async fn run(cli: Cli) -> Result<()> {
     let path = config::config_path(cli.config)?;
     match cli.command {
+        Commands::Inbox { command } => {
+            use devlink_broker::inbox::Inbox;
+            match command.unwrap_or(InboxCommand::List {
+                limit: 20,
+                agent_id: None,
+            }) {
+                InboxCommand::List { limit, agent_id } => {
+                    let config = Config::load(&path)?;
+                    let agent = match agent_id {
+                        Some(id) => {
+                            anyhow::ensure!(
+                                id > 0 && id <= i64::MAX as u64,
+                                "Invalid local Agent filter"
+                            );
+                            Some(id)
+                        }
+                        None => devlink_broker::agent_profile::bound_agent_id(&path)?,
+                    };
+                    let tasks =
+                        Inbox::list_config(&path, &config.server_url, agent, limit as usize)?;
+                    print_json(&serde_json::to_value(tasks)?)?;
+                }
+                InboxCommand::Clear => {
+                    let directory = state_directory(&path);
+                    if !directory.try_exists()? {
+                        println!("Inbox already empty");
+                        return Ok(());
+                    }
+                    devlink_broker::credentials::verify_parent_safety(&directory)?;
+                    let _control = config::lock(&directory.join("control.lock"))?;
+                    let _broker = config::lock(&directory.join("broker.lock")).context(
+                        "Stop the broker before clearing inbox retention and dedup history",
+                    )?;
+                    Inbox::clear_config(&path)?;
+                    println!("Inbox data and dedup history cleared; no central task was changed");
+                }
+            }
+        }
         Commands::Agent { command } => {
             use devlink_broker::agent_profile::{self, CreateOptions, Tool};
             let result = match command {
@@ -327,6 +383,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     "Local Broker  : Running (PID: {})\nCentral Server: {:?}",
                     health.pid, health.central_server
                 );
+                if let Some(inbox) = health.inbox {
+                    println!(
+                        "Inbox rejects : {} (last: {:?})",
+                        inbox.rejected_events, inbox.last_error
+                    );
+                }
             }
         }
         // 실행 중인 브로커 정상 종료 (Graceful shutdown)

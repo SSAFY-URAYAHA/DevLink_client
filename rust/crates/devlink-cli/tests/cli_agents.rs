@@ -424,3 +424,42 @@ async fn switching_selected_team_blocks_startup_before_ws_and_keeps_the_agent_bi
     assert!(f.run(&["start"], None).status.success());
     connected(&f.path).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_listing_defaults_to_bound_agent_without_contacting_central_or_accepting_tasks() {
+    use devlink_broker::{
+        inbox::Inbox,
+        protocol::{TaskCreatedMessage, TaskCreatedPayload},
+    };
+    let f = Fixture::new().await;
+    selected(&f);
+    data(create(&f));
+    let inbox = Inbox::open(&f.path).unwrap();
+    let origin = config::Config::load(&f.path).unwrap().server_url;
+    for id in [201, 202] {
+        inbox
+            .record(
+                origin.clone(),
+                id,
+                TaskCreatedMessage {
+                    event_id: format!("bound-{id}"),
+                    payload: TaskCreatedPayload {
+                        task_id: id,
+                        team_id: 71,
+                        requester_agent_id: 301,
+                        receiver_agent_id: id,
+                        prompt: "Inspect only".into(),
+                        created_at: "2026-10-30T09:00:00".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let calls = f.state.calls.lock().unwrap().len();
+    let tasks = data(f.run(&["inbox", "list"], None));
+    assert_eq!(tasks.as_array().unwrap().len(), 1);
+    assert_eq!(tasks[0]["message"]["payload"]["receiver_agent_id"], 201);
+    assert_eq!(f.state.calls.lock().unwrap().len(), calls);
+    assert!(!Runtime::path(&f.path).exists());
+}
