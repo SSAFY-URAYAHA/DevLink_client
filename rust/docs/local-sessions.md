@@ -1,20 +1,12 @@
 # 로컬 MCP 세션 API
 
-2026-10-29 후속 연결: 기본 CLI의 ReadyIdentityProvider에 기존 중앙 `/api/v1/agent/context` 실시간 조회를 연결했다. claim/bind/heartbeat는 현재 WS와 REST 신원을 대조하며 READY의 user/team 누락만으로는 더 이상 차단되지 않는다. 아래의 미구성·legacy 차단 설명은 과거 기록이다. [현재 신원 공급 정책](ready-identity.md)의 최신 절을 따른다.
-
-2026-10-29 세션 계약 보완: 신원/Agent 불일치는 `422 FORBIDDEN / domain`으로 반환한다. MCP 소비자는 세션 경로의 HTTP 403을 로컬 자격의 영구 거부로 취급하므로 도메인 거부에 403을 사용하지 않는다. Origin 거부는 기존 `403 LOCAL_AUTH_FORBIDDEN`을 유지한다. 현재 구현·검증 범위와 중앙 차단 사항은 [세션 스토리 검증](session-story-verification.md)을 따른다.
-
-2026-10-29 갱신: 기본 CLI에 [READY 기반 신원 공급부](ready-identity.md)를 연결했다. 아래 2026-10-28 미구성 공급부 설명은 당시 기록이다. 현재 중앙의 user_id/team_id/agent_id가 있는 READY와 Connected 상태에서는 로컬 세션 생성·bind가 가능하며, legacy READY는 계속 CENTRAL_UNAUTHENTICATED다. 신원이 바뀌면 기존 세션을 만료시키고, 같은 신원 재접속은 lease 안의 소유권을 유지한다. 이 공급부와 실제 로컬 HTTP/WebSocket·CLI는 Mock으로 검증하며 운영 중앙 연동 완료를 뜻하지 않는다.
-
-2026-10-28 (Asia/Seoul). 기존 [MCP 계약](../../packages/mcp-server/docs/broker-contract-v0.1.md)의 로컬 세션 관리 부분을 구현했습니다. 중앙 신원 조회·Agent 등록·토큰 발급과 업무 API는 별도 후속 항목입니다.
+2026-10-30 현재 구현 기준. 중앙 신원은 READY와 Agent Bearer /api/v1/agents/me를 대조한다. [신원 공급·재접속 정책](ready-identity.md)과 [과거 세션 검증](archive/session-verification-2026-10-29-30.md)을 참고한다.
 
 ## 구현 범위와 현재 실행 상태
 
 `sessions.rs`의 SessionManager가 생성·bind·갱신·해제·만료·소유권을 관리하고 `session_api.rs`가 HTTP 요청을 처리합니다. 브로커의 HTTP 핸들러·세션 관리자·중앙 WebSocket은 같은 CentralState를 사용합니다.
 
-중앙 신원은 IdentityProvider 인터페이스로 분리했습니다. 기본 CLI 실행에는 UnconfiguredIdentityProvider를 연결하므로 유효한 MCP 토큰으로 세션 생성을 요청해도 **503 CENTRAL_UNAUTHENTICATED**를 반환합니다. READY의 agent_id, config.agent, 요청 본문으로 사용자·팀 신원을 만들지 않습니다. 실제 신원 공급부가 없는 상태에서 세션 성공을 반환하는 환경변수·설정 우회는 추가하지 않았습니다.
-
-테스트에서만 검증된 사용자·팀·Agent를 반환하는 공급부를 주입합니다. 미래의 실제 공급부는 중앙의 인증·소유권 검증 결과로 Principal을 구성해야 하며 요청의 agentId를 복사하는 것으로 검증을 대체하면 안 됩니다. 공급부는 현재 중앙 연결의 Agent·프로필과 일치하는 범위만 허용하고, 신원 유효기간·폐기·팀 변경 정책도 중앙 계약에 맞춰 연결해야 합니다.
+중앙 신원은 IdentityProvider로 분리하며 기본 CLI는 ContextClient가 연결된 ReadyIdentityProvider를 사용한다. 현재 연결과 REST 신원·소유권을 대조하고 요청 ID나 config 값으로 사용자·팀을 만들지 않는다. 합성 공급부는 테스트에서만 사용한다. 신원 불가·인증 거부는 아래 오류 계약을 따른다.
 
 ## HTTP 계약
 
@@ -78,6 +70,6 @@
 
 ## 검증과 남은 연결
 
-공유 신원 fixture, 동시 claim, fresh/recover 충돌, 오래된 요청, 90초 경계·갱신, 요청 없는 만료, 지연 bind/claim, HTTP 인증·입력·응답과 실제 로컬 WebSocket presence를 검증합니다. 테스트용 신원은 테스트 코드 내부에서만 제공합니다. 실제 CLI에서는 미구성 신원이 503으로 닫히며 health·중앙 연결·shutdown은 유지되는지 검사합니다.
+공유 신원 fixture, 동시 claim·fresh/recover 충돌, 오래된 요청, 90초 경계, 지연 bind/claim, HTTP 인증·입력·응답, 실제 WebSocket presence를 회귀로 검증한다. 고정 중앙과 SDK·PostgreSQL의 신원/소유권/lease/재시작/토큰 거부 실행은 [세션 검증 이력](archive/session-verification-2026-10-29-30.md)에 보존한다.
 
-중앙 신원 전달 API·메시지, Agent 소유권 검증·최초 등록/토큰 발급 순서, 프로필 정책·Agent ID 영속 재사용, 업무 API 7개와 수신함·ACK, 실제 MCP Host·중앙·DB 왕복은 후속 항목입니다. 실행 결과는 [검증 기록](verification.md)을 참고합니다.
+Agent 생성·토큰·ID 재사용은 [bootstrap](agent-bootstrap.md), 업무 7개 provider는 [중계](business-relay.md)·[작업 조회/변경](task-operations.md), 수신함·ACK는 [수신함](task-inbox.md)에 구현되어 있다. MCP 최종 DTO, 실제 Host 전체 왕복·운영 배포·Ubuntu 수용은 [진행 현황](../PROJECT_STATUS.md)의 후속 범위다.

@@ -1,4 +1,6 @@
-# 로컬 세션 provider 스토리 — 구현 및 증거 경계
+# 2026-10-29~30 로컬 세션 구현·검증 이력
+
+이 문서는 당시 코드·환경·검토 상태를 보존한 과거 기록이다. 미구현·차단·검토 대기 표현은 현재 상태가 아니다. 현재 계약과 결과는 [문서 안내](../README.md)·[검증 요약](../verification.md)을 따른다.
 
 최신 상태(2026-10-30): 중앙 `02de434`의 확장 READY와 현재 클라이언트 `d4c3754`로 실제 WebSocket 신원·CLI/SDK 세션·PostgreSQL presence·생산 lease 90초 만료 검증이 통과했다. 기존 `/api/v1/agent/context` 공급부도 유지한다. 아래의 blocked·미검증·미커밋 표현은 각 실행 시점의 기록이며 문서 마지막의 2026-10-30 결과가 우선한다. 이번 검증은 실제 Codex/Claude Host·전체 업무 왕복·-91 bootstrap 자동화의 재검증이나 지정 검토를 포함하지 않는다.
 
@@ -78,7 +80,7 @@ Windows / Node v24.18.0. 최종 변경에서 다음을 실행했다.
 
 ### 구현과 검토 보완
 
-- 새 `agent_context.rs`가 현재 중앙 origin의 `/api/v1/agent/context`를 WS와 같은 Agent Bearer로 조회한다. 기본 CLI에 연결했으며 READY wire는 바꾸지 않았다. 자세한 신원 정책은 [현재 신원 공급](ready-identity.md)의 첫 절을 따른다.
+- 새 `agent_context.rs`가 현재 중앙 origin의 `/api/v1/agent/context`를 WS와 같은 Agent Bearer로 조회한다. 기본 CLI에 연결했으며 READY wire는 바꾸지 않았다. 자세한 신원 정책은 [현재 신원 공급](../ready-identity.md)의 첫 절을 따른다.
 - claim/bind/heartbeat에서 매번 조회하고 현재 WS Agent 및 선택적 READY user/team과 대조한다. generation과 조회 전 identity를 응답 적용 직전에 비교한다. 권한 응답과 레지스트리/presence 사이에는 기존 잠금 및 subject epoch 검사를 유지한다.
 - 검토에서 인증 거부 뒤 같은 WS를 다시 legacy READY로 취급할 수 있는 경계를 보완했다. 거부·신원 모순은 현재 연결을 AuthFailed로 닫아 새 연결 전 재신뢰하지 않는다. 연결 자체의 네트워크 종료·재시도는 기존 중앙 루프 정책을 따른다.
 - 검토에서 legacy 재접속 후 context 확인 전에 만료 타이머가 기존 owner의 ONLINE을 다시 게시할 수 있는 경계를 보완했다. 실시간 공급부가 있는 상태에서는 미확인 신원의 ONLINE을 게시하지 않는다. 같은 신원이 확인되면 lease 안의 owner는 유지한다.

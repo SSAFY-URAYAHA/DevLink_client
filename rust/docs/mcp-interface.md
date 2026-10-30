@@ -1,26 +1,12 @@
 # MCP 실행 구조·로컬 통신 인터페이스
 
-상태: **자격·로컬 세션 API 4개·소유권·만료·presence 연결 구현. 중앙 신원 공급부·업무 API·실제 Host 왕복은 후속 항목**. 작성일 2026-10-26, MCP 규칙 채택일 2026-10-27, 구현 현황 갱신일 2026-10-28 (Asia/Seoul).
+2026-10-30 현재 구현 기준. CLI는 독립 Rust 브로커를 제어하고 Host는 stdio MCP 프로세스를 제어한다. MCP는 인증된 loopback HTTP로 브로커를 호출하며 중앙 토큰과 WebSocket은 브로커가 관리한다. MCP 종료는 공유 브로커 종료로 이어지지 않는다.
 
-## 2026-10-28 중앙 WebSocket 규칙 확인
+CLI/설정·자격 파일·세션 4개·업무 HTTP 7개·중앙 신원·수신함/ACK provider는 구현되어 있다. MCP 도구의 최종 DTO 수렴(-97)과 실제 Host 전체 왕복(-66)은 별도다. [진행 현황](../PROJECT_STATUS.md)과 [검증 요약](verification.md)을 참고한다.
 
-중앙 서버의 보안 전략과 2026-10-27 작업 기록을 확인해 [중앙 WebSocket 연동 규칙](central-websocket-contract.md)에 Rust 적용 기준을 기록했습니다. `/ws/broker`의 Agent 토큰 인증, `BROKER_READY`, `AGENT_PRESENCE`, 동일 Agent 연결 교체·종료 보호는 문서에 정의돼 있으므로 해당 규칙을 따릅니다. 아래의 포괄적인 중앙 인증·메시지 협의 표기는 이 구체적인 규칙과 후속 항목을 구분해 읽습니다.
+## 세션·전송 규칙
 
-중앙은 인증 Principal과 DB의 Agent 소유자·팀을 검증합니다. READY에는 `connection_id`와 숫자 `agent_id`만 있으며 사용자·팀 필드를 추가하는 계약은 없습니다. MCP 세션 principal에 필요한 `userId/teamId` 전달 경로와 최초 Agent 등록·토큰 발급 흐름은 별도 후속 항목입니다. 현재 Rust는 JSON HEARTBEAT PING 20초·동일 ping_id PONG 최대 20초 대기·만료 후 재접속을 구현했습니다. 세션 생성·bind·해제·만료는 같은 CentralState의 set_presence에 연결했고 실제 로컬 WebSocket으로 보고를 검증합니다. 기본 IdentityProvider는 미구성이므로 실제 CLI의 세션 생성은 503 CENTRAL_UNAUTHENTICATED입니다. 업무 라우팅·수신함 ACK와 운영 중앙 검증은 남아 있습니다.
-
-## 협의 상태와 결정 범위
-
-2026-10-27 저장소의 [MCP → 로컬 브로커 계약 v0.1](../../packages/mcp-server/docs/broker-contract-v0.1.md)과 `packages/mcp-server/src/broker/`의 현재 규칙을 Rust 구현 기준으로 채택합니다. 브로커 재시작 후 소유권은 먼저 유효하게 복구한 인스턴스가 해당 Agent의 빈 슬롯을 확보하는 방식으로 정합니다. 이전 소유자는 보존하지 않습니다.
-
-이는 사용자 측 구현 방향의 확정이며 상대 담당자의 추가 승인, 실제 Rust 구현 완료, 실제 MCP·중앙 서버 상호 검증 완료를 의미하지 않습니다. MCP 규칙에 없는 파일 배치·프로필·권한 범위·중앙 메시지·설치 방식까지 함께 확정한 것으로 해석하지 않습니다. 중앙 서버 연결은 중앙 담당자의 계약을 따르며 로컬 세션 규칙과 별도로 연결합니다.
-
-| 핵심 항목                      | 채택 범위                                                                       | Rust 구현 기준                                                                                                                                    | 남은 결정·구현                                                                                                                  |
-| ------------------------------ | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| 세션 활성화와 재시작 후 소유권 | fresh/recover, instanceId 멱등성, 선복구 소유권, 갱신·90초 만료·해제 | 로컬 HTTP 4개 경로·소유권·만료·presence 구현. 진단·거부된 요청은 활성화하지 않음 | 실제 중앙 신원 공급부·Agent 소유 검증, Agent ID 영속 재사용·등록 멱등성, 실제 MCP Host 상호 검증 필요 |
-| CLI 설정 파일과 자격 수명주기  | MCP 스키마 v1, DEVLINK_BROKER_FILE, 비공개 파일 검사, 토큰 유지·회전            | `.devlink-runtime/broker.json` 원자 발행·토큰 유지·중지 중 회전·OS 권한 검사 구현. CLI runtime의 controlToken과 MCP localToken 분리 | Host별 프로필·신원 분리 정책, Agent ID 영속 재사용, 동적 포트에서 주소 변경 후 재시작 흐름과 Unix 실행 검증 필요 |
-| HTTP 계약과 중앙 위임 경계 | loopback HTTP, 세션·업무 DTO, timeout·업무 재전송 금지 | health/shutdown 및 MCP localToken 전용 세션 4개 경로·오류 envelope 구현 | 업무 7개 경로·중앙 인증/DTO 매핑·실제 결과 조회와 프로필/포트 운영 정책 보완 필요 |
-
-검토 기준으로 유지하는 큰 구조는 CLI의 브로커 제어, Host의 stdio MCP 제어, MCP→로컬 HTTP→브로커→중앙 전달, 중앙 토큰의 브로커 관리입니다. 브로커 장애에도 MCP 진단을 유지하고, 오류를 이유로 공유 브로커를 자동 기동·종료하지 않는 방향을 유지합니다.
+기존 [MCP→로컬 브로커 계약](../../packages/mcp-server/docs/broker-contract-v0.1.md)을 기준으로 아래 규칙을 적용한다. 중앙 신원은 [READY 정책](ready-identity.md), 세션 세부 HTTP와 소유권은 [로컬 세션](local-sessions.md)을 따른다.
 
 ### 채택한 MCP 규칙
 
@@ -38,36 +24,13 @@
 - 요청 기본 제한 10초(응답 본문 수신 포함), 요청 128KiB·응답 256KiB를 채택합니다. timeout·단절·취소·프로토콜 오류는 업무 결과 불명이며 중앙 작업을 임의 실패·취소·재할당하지 않습니다. 요청 추적 ID는 중앙 멱등성 보장의 대체물이 아닙니다.
 - MCP 종료 시 진행 요청·타이머를 정리하고 최대 1초 동안 세션 해제를 시도합니다. 해제 실패는 MCP 종료를 막지 않으며 공유 브로커를 종료하지 않습니다.
 
-### MCP 규칙 밖에 남은 결정
+## 프로세스와 자격 파일
 
-- 현재 자격 파일은 `--config`의 설정 디렉터리 아래 `.devlink-runtime/broker.json`이며 runtime과 별도 파일로 발행합니다. 별도 디렉터리는 별도 브로커·자격을 사용합니다. 하나의 브로커에서 Host별 프로필·토큰·신원을 관리하는 제품 정책과 자격 삭제 수명 주기는 후속 항목입니다.
-- 중앙에서 검증된 Agent ID의 저장·재사용, 중앙 등록 성공 응답 유실 시 중복 방지. 현재 MCP는 읽기와 프로세스 메모리 보관만 수행하며 `config.agent`를 등록 ID로 간주하지 않습니다.
-- CLI/MCP 자격 분리와 `/shutdown` 권한은 구현됐고 세션 API는 MCP localToken만 허용합니다. 업무 API 권한과 검증된 중앙 신원은 후속 연결 항목입니다. 현재 Rust 발행 스키마에는 `agentId`가 없습니다.
-- 기본 포트 43127을 포함한 실제 포트 운영과 `localPort: 0` 허용 범위. 재시작 중 주소가 달라지면 현재 MCP의 자동 복구 전제와 맞지 않습니다.
-- 중앙 인증 정보·메시지·업무 DTO와의 매핑, 등록 멱등성·timeout 후 결과 확인 방법, 세부 HTTP 상태 매핑. 중앙 서버 계약을 따르며 필요한 정보가 없을 때 임의 신원을 만들지 않습니다.
-- Host 지원·등록 범위, 설치 경로, Node 사전 설치/동봉, 기존 설정 병합·백업·복구. 현재 MCP의 Node 24 이상 요구사항과 제품 설치 방식을 구분합니다.
+CLI와 브로커는 동일 실행 파일의 별도 프로세스다. CLI의 숨겨진 broker 명령이 라이브러리를 실행하며, CLI 종료 뒤에도 브로커는 유지된다. Host 자동 실행·MCP 자동 등록·부팅 자동 실행은 제공하지 않는다.
 
-수용 검증은 T1~T8과 MCP 재실행 후 Agent ID 재사용(T9)을 기준으로 계획합니다. 자격 파일의 실제 MCP reader 호환성, 정상·강제 종료 후 토큰 유지, 회전·권한 분리는 Rust 통합 테스트로 확인했습니다. 선복구 충돌·오래된 갱신/해제·등록 응답 유실·만료·파일 갱신 중 읽기·무응답 종료·업무 timeout은 실제 Rust 세션·업무 API와 MCP를 연결해 검증해야 합니다. 기존 가짜 브로커 테스트는 실제 연동 완료의 증거가 아닙니다.
+Agent ID의 영속 저장·기존 ID 재사용·토큰 관리는 [Agent bootstrap](agent-bootstrap.md)에 구현되어 있다. 프로필이 있으면 발행 MCP 자격에도 해당 Agent ID를 포함한다. 하나의 브로커에서 Host별 프로필/토큰을 관리하는 제품 정책, 설치·기존 Host 설정 병합·백업, Node 배포 방식은 후속 항목이다.
 
-## 프로세스 소유권 제안
-
-```mermaid
-flowchart LR
-    CLI[DevLink CLI] -->|start / stop| Broker[Rust Local Broker]
-    Agent[AI Agent Host] -->|stdio 프로세스 관리| MCP[DevLink MCP Server]
-    MCP -->|인증된 loopback HTTP| Broker
-    Broker <-->|WebSocket + auth| Central[중앙 서버]
-```
-
-CLI와 브로커는 동일 실행 파일을 다른 모드로 실행하되 별도 프로세스입니다. CLI가 브로커를 시작하고 준비 상태를 확인하며 사용자의 `stop` 요청을 중계합니다. 브로커는 CLI 종료 후 유지됩니다. Agent Host가 MCP stdio 서버를 시작·종료하며 MCP 서버 종료가 브로커 종료로 이어지지 않는 구조를 제안합니다. MCP 서버는 중앙 WebSocket을 직접 소유하지 않습니다.
-
-소스는 `rust/crates/devlink-cli` 실행 파일 크레이트와 `rust/crates/devlink-broker` 라이브러리 크레이트로 분리합니다. CLI의 숨겨진 `broker` 명령이 라이브러리를 실행하므로 별도 브로커 실행 파일 설치 없이 같은 프로세스 구조를 유지합니다.
-
-담당자 1의 제안 범위는 Rust CLI, 설정, 브로커 수명 주기, 로컬 HTTP, 중앙 연결과 통합 테스트입니다. 담당자 2의 제안 범위는 MCP 서버, Tool 스키마, Agent 등록과 Tool→내부 API 매핑입니다. 실제 담당자 번호·소유권은 회의에서 확인해야 합니다. Agent 프로그램 자체 실행·종료와 MCP 자동 등록은 이번 Rust 구현에 포함하지 않습니다.
-
-## 현재 구현된 로컬 연결과 발견
-
-이 절은 2026-10-28 현재 코드의 동작입니다. 자격·세션 API는 구현됐으며 중앙 신원 공급부·업무 API가 후속 작업입니다. 세션 세부 계약은 [로컬 세션 API](local-sessions.md)를 따릅니다.
+## 로컬 연결과 제어 API
 
 - 전송: HTTP/1.1 JSON, IPv4 `127.0.0.1`에만 바인딩. 기본 포트 43127, `localPort: 0`이면 자동 할당. MCP URL 검증과 맞추기 위해 포트 80은 거부합니다.
 - 발견: Rust CLI는 설정 디렉터리 아래의 `.devlink-runtime/runtime.json`을 읽고 MCP는 같은 디렉터리의 `broker.json`을 읽습니다. `devlink [--config <FILE>] mcp path`는 자격 파일 경로만 출력하며 파일을 생성하지 않습니다. 브로커 기동 시 스냅샷을 발행합니다. `broker.lock`과 `control.lock`도 `.devlink-runtime/`에 저장하며, 설정 디렉터리당 한 인스턴스입니다. 구버전 브로커는 업그레이드 전에 구버전 CLI로 종료해야 합니다.
@@ -102,7 +65,7 @@ OS 잠금은 실행 여부의 기준이며 런타임 파일의 PID만 보고 프
 }
 ```
 
-health/shutdown은 요청 본문을 사용하지 않습니다. Health의 상태 enum은 README에 정의되어 있습니다. 두 제어 경로의 인증 실패 401과 기본 404는 아래 legacy JSON입니다. 세션 경로는 이를 사용하지 않고 MCP 계약의 requestId+data/error envelope를 반환합니다. 기본 신원 공급부는 미구성이므로 세션 생성은 503 CENTRAL_UNAUTHENTICATED입니다. 지원하지 않는 HTTP method는 Axum 기본 405 응답이므로 본문 형식을 가정하지 않습니다.
+health/shutdown은 요청 본문을 사용하지 않습니다. Health의 상태 enum은 README에 정의되어 있습니다. 두 제어 경로의 인증 실패 401과 기본 404는 아래 legacy JSON입니다. 세션 경로는 이를 사용하지 않고 MCP 계약의 requestId+data/error envelope를 반환합니다. 지원하지 않는 HTTP method는 Axum 기본 405 응답이므로 본문 형식을 가정하지 않습니다.
 
 ```json
 {
@@ -113,23 +76,20 @@ health/shutdown은 요청 본문을 사용하지 않습니다. Health의 상태 
 
 클라이언트 타임아웃 기준은 조회/종료 요청 1초, 종료 확인 8초입니다. 시작 확인은 기본 준비·health 여유 8초에 Windows 자격 검사의 최대 3회 × 5초를 더한 23초이며, Unix는 기존 8초입니다. ACL 검사를 생략하지 않고 자격 발행 전 준비 시간을 포함합니다. 네트워크 오류·잘못된 JSON·서비스/버전/인스턴스 불일치는 로컬 클라이언트 오류로 다룹니다. 서버 오류 원문, 토큰, 임의 중앙 payload를 Tool 오류에 노출하지 않습니다. 중앙 연결 실패는 HTTP 실패가 아닌 Health의 연결 상태로 표현합니다.
 
-## MCP Tool 매핑과 미구현 범위
+## 업무 HTTP와 MCP DTO
 
-기존 초안의 `devlink_status`·`BROKER_NOT_RUNNING` 예시 대신 현재 MCP의 `devlink_ping`, 7개 업무 도구 및 `BROKER_UNAVAILABLE` 등 실제 오류 해석을 기준으로 합니다. 브로커가 없을 때 MCP가 임의로 실행하지 않고 사용자에게 `devlink start`를 안내하는 구조를 유지합니다.
+| MCP operation | 로컬 POST | 기준 문서 |
+| --- | --- | --- |
+| register_agent | /v1/agents/register | [기존 Agent 확인](business-relay.md) |
+| list_agents | /v1/agents/list | [팀 목록](business-relay.md) |
+| create_task | /v1/tasks/create | [작업 생성·requestKey](business-relay.md) |
+| update_task_status | /v1/tasks/status | [상태 변경](task-operations.md) |
+| complete_task | /v1/tasks/complete | [완료](task-operations.md) |
+| get_tasks | /v1/tasks/list | [목록](task-operations.md) |
+| get_task_result | /v1/tasks/result | [상세·결과](task-operations.md) |
 
-Rust 세션 API 4개·소유권·90초 만료·presence는 구현됐습니다. 테스트용 신원으로 성공·충돌·실제 로컬 WebSocket 보고를 검증하며 실제 CLI에서는 중앙 신원 공급부가 연결될 때까지 세션 생성을 거부합니다. 업무 API 7개는 미구현입니다. 실행 취소·로그 구독을 이번 세션 구현만으로 추가 범위에 포함하지 않습니다.
+register_agent는 최초 Agent 생성이 아니라 bootstrap 자격의 기존 Agent 확인이다. 목록·생성·상태 변경·완료는 bound 세션을 요구한다. 업무 권한·상태 전이·원자 저장은 중앙이 판단한다.
 
-| 협의 항목                      | 결정할 내용                                                                     |
-| ------------------------------ | ------------------------------------------------------------------------------- |
-| 세션 활성화와 재시작 후 소유권 | 채택한 세션 규칙의 Rust 구현·검증, Agent ID 영속 재사용과 중앙 등록 멱등성 보완 |
-| CLI 설정 파일과 자격 수명주기  | 구현된 자격 발행·토큰·권한 분리를 유지하며 Host별 프로필 정책·Agent ID 영속 재사용·주소 변경 흐름과 Unix 실행 검증 보완 |
-| HTTP 계약과 중앙 위임 경계     | MCP API 호환 구현, 중앙 계약 매핑·결과 확인·세부 HTTP 상태·포트 운영 보완       |
+Rust provider가 구현되었다는 사실만으로 MCP의 모든 입력이 호환되는 것은 아니다. 현재 MCP의 version 없는 status/complete와 result:{summary,changedFiles,verification?}는 중앙의 version/resultText/taskFiles와 차이가 있다. Rust가 version을 추측하거나 verification을 조용히 버리지 않으며 최종 소비자 변경은 -97이다.
 
-후속 협의에서는 기존 MCP 규칙 자체를 미확정으로 되돌리지 않고 위 잔여 결정·담당 범위·수용 검증 결과를 기록합니다. 현재 제어 API를 MCP 프로토콜 엔드포인트로 사용하면 안 되며, MCP 서버는 별도 프로토콜 어댑터입니다.
-
-## Rust 세션 API 구현과 남은 연결
-
-1. 구현 완료: 생성·bind·heartbeat·해제, instanceId 멱등성, fresh/recover·교체·충돌, 브로커 시계 90초 lease, 오래된 요청 차단과 presence 연결.
-2. 공급부 분리: IdentityProvider는 중앙이 검증한 Principal을 반환해야 합니다. 기본 구현은 CENTRAL_UNAUTHENTICATED이며 요청·설정·READY를 신원으로 추측하지 않습니다.
-3. 다음 연결: 중앙 신원 조회 API/메시지·REST 인증, Agent 소유권 검증, 최초 등록/토큰 발급 순서를 합의한 뒤 실제 공급부를 구현합니다. 초기 신원 취득과 이후 폐기/팀 변경 정책도 포함합니다.
-4. 실제 MCP Host·중앙 신원으로 생성·bind·갱신·해제·충돌·만료·재시작을 검증한 뒤 업무 API 7개와 중앙 라우팅·수신함·ACK를 연결합니다.
+수신함은 [CLI inbox 조회](task-inbox.md)로 확인한다. Host는 기존 get_tasks(received)를 사용하며 새 push/tool이나 ACK 기반 자동 수락·편집을 추가하지 않는다. 실제 두 사용자 Host 업무 왕복은 -66으로 검증한다.

@@ -6,7 +6,7 @@ Rust CLI와 독립 로컬 브로커입니다. CLI는 설정과 프로세스 수�
 
 이 디렉터리는 `devlink-cli`(실행 파일)와 `devlink-broker`(라이브러리)로 구성한 Cargo workspace입니다. CLI가 브로커 라이브러리를 참조하며 브로커는 CLI에 의존하지 않습니다. 아래 명령은 저장소 루트에서 `cd rust`로 이동한 뒤 실행합니다.
 
-2026-10-29: 중앙 `TASK_CREATED` 수신 → 디스크 수신함 저장 → `ACK` 전송을 추가했습니다. 재접속·재시작 후 중복 수신을 구분하고, 저장 실패는 ACK 없이 `InboxFailed`로 중단합니다. 작업 수락·실행·완료와 MCP 업무 조회 API는 후속 연결입니다. [수신함·ACK와 Mock 데모](docs/task-inbox.md)에 보관 위치·제한·실패 정책과 공동 계약이 필요한 항목을 정리했습니다.
+2026-10-29: 중앙 `TASK_CREATED` 수신 → 디스크 수신함 저장 → `ACK` 전송을 추가했습니다. 재접속·재시작 후 중복 수신을 구분하고, 저장 실패는 ACK 없이 `InboxFailed`로 중단합니다. 상태·완료·목록·결과의 Rust HTTP provider도 구현되어 있으며, MCP 최종 DTO와 실제 Host 전체 왕복은 후속 범위입니다. [수신함·ACK와 Mock 데모](docs/task-inbox.md)에 보관 위치·제한·실패 정책과 공동 계약이 필요한 항목을 정리했습니다.
 
 ## Windows 개발 환경
 
@@ -23,7 +23,7 @@ cargo build --release --locked --workspace
 .\target\release\devlink.exe --help
 ```
 
-`rust-toolchain.toml`은 stable, rustfmt, clippy를 선택합니다. 의존성 버전은 이 디렉터리의 `Cargo.lock`으로 고정하며 공통 의존성은 workspace의 `Cargo.toml`에서 관리합니다. 빌드 산출물은 `rust/target/`에 생성됩니다. 2026-10-28 로컬 세션 구현 후 Windows MSVC에서 컴파일·포맷·Clippy 검사와 단위 27개·통합 36개(세션 HTTP/WebSocket 6개·CLI 30개)가 통과했습니다. MCP 100개 테스트와 일반·릴리스 빌드는 이전 기록입니다. 실행 시점별 결과는 [로컬 검증 기록](docs/verification.md)에 보관합니다. CI 워크플로는 없으며 Ubuntu 실행은 이번에 검증하지 않았습니다.
+`rust-toolchain.toml`은 stable, rustfmt, clippy를 선택합니다. 의존성 버전은 이 디렉터리의 `Cargo.lock`으로 고정하며 공통 의존성은 workspace의 `Cargo.toml`에서 관리합니다. 빌드 산출물은 `rust/target/`에 생성됩니다. 최근 Windows MSVC 검증과 고정 중앙·DB 결과는 [검증 요약](docs/verification.md)에 실행별로 보관합니다. -95 후속 보완의 전체 Rust 회귀는 168건 통과·2건 제외였고, 문서 정리 과정에서 다시 실행한 결과는 아닙니다. Ubuntu·CI·운영 Host 전체 왕복은 별도 검증입니다.
 
 통합 테스트는 로컬 TCP 연결을 사용합니다. 네트워크가 제한된 샌드박스에서 Windows 오류 `10013` 또는 브로커 시작 시간 초과가 발생하면 로컬 통신이 허용된 일반 PowerShell이나 승인된 샌드박스 외부 실행으로 검증하세요.
 
@@ -51,7 +51,7 @@ cargo run -p devlink-cli -- stop
 
 Mock 서버를 Ctrl+C로 종료하면 `status`가 `Reconnecting`으로 바뀝니다. 같은 포트·토큰으로 서버를 다시 실행하면 `Connected`로 돌아옵니다. `Connected`는 `/ws/broker` WebSocket Upgrade 인증(`Authorization: Bearer <DEVLINK_TOKEN>`) 후 유효한 `BROKER_READY` 수신(확인된 로컬 Agent 상태가 있는 경우 초기 `AGENT_PRESENCE` 보고 포함; 로컬 상태 미확인 시 추측한 `AGENT_PRESENCE`는 전송하지 않음)까지 마친 상태입니다. Upgrade HTTP `401`/`403`은 `AuthFailed`, 동일 Agent의 새 연결 교체(`4002`)는 `Replaced`, 메시지/정책 위반(`1008` 또는 잘못된 `BROKER_READY`)은 `ProtocolViolation`이 되며 자동 재시도하지 않습니다. 이 경우 토큰이나 설정을 고친 뒤 `stop`/`start`로 다시 시작합니다. Close `4001`은 하트비트 만료이며 `autoReconnect` 설정에 따라 재접속합니다.
 
-중앙 연결·로컬 HTTP·세션 관리자는 같은 `CentralState`를 공유합니다. 검증된 세션의 생성·bind·해제·만료에서 활성 bound 소유자 유무로 presence를 계산하고 `set_presence(Online/Offline)`에 게시합니다. READY 이후 변경 보고, 동일 상태 중복 생략, 재접속 시 최신 상태 재보고를 사용합니다. 기본 상태는 미확인(`None`)이며 health·거부된 요청만으로 상태를 확정하지 않습니다. READY 신원 공급부는 연결했고 실제 운영 중앙에서의 검증은 후속 항목입니다.
+중앙 연결·로컬 HTTP·세션 관리자는 같은 `CentralState`를 공유합니다. 검증된 세션의 생성·bind·해제·만료에서 활성 bound 소유자 유무로 presence를 계산하고 `set_presence(Online/Offline)`에 게시합니다. READY 이후 변경 보고, 동일 상태 중복 생략, 재접속 시 최신 상태 재보고를 사용합니다. 기본 상태는 미확인(`None`)이며 health·거부된 요청만으로 상태를 확정하지 않습니다. READY 신원 공급부와 고정 중앙·DB의 검증은 연결했으며, 실제 운영 배포·Host 전체 업무 왕복은 별도입니다.
 
 ## 설정
 
@@ -80,11 +80,11 @@ cargo run -p devlink-cli -- --config .\.devlink\config.json start
 
 `config`와 `config show`는 동일합니다. `config set <키> <값>`은 검증한 뒤 임시 파일을 원자적으로 교체합니다. 잘못된 값·알 수 없는 키는 실패하며 기존 파일을 유지합니다. 설정 변경은 브로커 재시작 후 반영됩니다. `init`은 기존 파일을 덮어쓰지 않습니다. TypeScript의 `serverUrl`/`agent`/`autoReconnect` 3필드 설정도 읽을 수 있지만 기존 `.devlink-practice` 파일을 자동 이동하지는 않습니다.
 
-중앙 서버 인증에는 `DEVLINK_TOKEN` 환경 변수만 사용합니다. 토큰은 필수이며 설정·상태·서버 응답·오류에 출력하지 않습니다. CLI 제어 토큰은 `.devlink-runtime/runtime.json`, MCP 로컬 토큰은 같은 디렉터리의 `broker.json`에 별도로 저장합니다. `broker.lock`과 `control.lock`도 `.devlink-runtime/`에 저장합니다. 기본 설정에서는 `$HOME/.devlink/.devlink-runtime/`이며 `--config`를 지정하면 해당 설정 디렉터리를 기준으로 합니다. 이 디렉터리는 사용자 전용으로 관리하고 공유하거나 커밋하지 마세요.
+중앙 서버 인증에는 bootstrap으로 저장한 Agent 토큰 또는 legacy `DEVLINK_TOKEN` 환경 변수를 사용합니다. 우선순위와 재인증은 [Agent bootstrap](docs/agent-bootstrap.md)을 따릅니다. 토큰은 필수이며 설정·상태·서버 응답·오류에 출력하지 않습니다. CLI 제어 토큰은 `.devlink-runtime/runtime.json`, MCP 로컬 토큰은 같은 디렉터리의 `broker.json`에 별도로 저장합니다. `broker.lock`과 `control.lock`도 `.devlink-runtime/`에 저장합니다. 기본 설정에서는 `$HOME/.devlink/.devlink-runtime/`이며 `--config`를 지정하면 해당 설정 디렉터리를 기준으로 합니다. 이 디렉터리는 사용자 전용으로 관리하고 공유하거나 커밋하지 마세요.
 
 ### MCP 자격 파일과 토큰
 
-브로커는 기동 시 `schemaVersion: 1`, `brokerUrl`, `localToken`의 완결된 자격 파일을 원자적으로 발행합니다. 현재 Rust 발행 스키마에는 `agentId`가 없으며 중앙 Agent ID의 영속 저장·재사용은 후속 작업입니다. 자격 파일과 직계 부모의 심볼릭 링크, Windows junction·reparse point를 거부하고 Windows 소유권·DACL을 설정·검증합니다. Unix는 디렉터리 0700·파일 0600과 소유권·권한 검사 코드가 있으나 이 Windows 환경에서 Unix 실행은 검증하지 않았습니다.
+브로커는 기동 시 `schemaVersion: 1`, `brokerUrl`, `localToken`의 완결된 자격 파일을 원자적으로 발행합니다. Agent 프로필이 있으면 `agentId`도 발행하며, 중앙 ID의 저장·재사용은 [Agent bootstrap](docs/agent-bootstrap.md)을 따릅니다. 자격 파일과 직계 부모의 심볼릭 링크, Windows junction·reparse point를 거부하고 Windows 소유권·DACL을 설정·검증합니다. Unix는 디렉터리 0700·파일 0600과 소유권·권한 검사 코드가 있으나 이 Windows 환경에서 Unix 실행은 검증하지 않았습니다.
 
 ```powershell
 # 경로만 출력합니다. 자격 파일을 만들거나 브로커를 시작하지 않습니다.
@@ -153,6 +153,6 @@ Central Server: Connected
 cargo test --offline --locked -p devlink-cli --test cli_broker json_heartbeat_keeps_cli_connected_for_45_seconds_without_reconnect -- --exact --test-threads=1
 ```
 
-[중앙 WebSocket 연동 규칙](docs/central-websocket-contract.md)에 인증, READY·PRESENCE, 연결 교체·종료 규칙과 Rust 적용 현황을 정리했습니다. READY 신원·작업 수신함·ACK는 로컬 Mock으로 검증했고, 업무 API와 실제 배포 환경 검증은 후속 항목입니다.
+[중앙 WebSocket 연동 규칙](docs/central-websocket-contract.md)에 인증, READY·PRESENCE, 연결 교체·종료 규칙과 Rust 적용 현황을 정리했습니다. READY 신원·작업 수신함·ACK·업무 provider는 로컬 회귀와 고정 중앙·DB에서 검증한 기록이 있습니다. 실제 배포 환경과 Host 전체 왕복은 별도입니다.
 
-[진행 현황](PROJECT_STATUS.md), [TypeScript 분석](docs/typescript-analysis.md), [MCP 실행 구조 및 내부 API](docs/mcp-interface.md), [작업별 현황](docs/task-status.md)을 참고하세요. 로컬 세션 API 4개·소유권·만료·presence·READY 신원 공급부는 구현됐으며 Agent 등록·토큰 발급·업무 API·누락 복구·실제 Host 왕복 연결이 남아 있습니다.
+[문서 안내](docs/README.md), [진행 현황](PROJECT_STATUS.md), [검증 요약](docs/verification.md)을 참고하세요. 현재 계약은 기능별 문서에, 과거 실습·검증 기록은 docs/archive에 보관합니다.

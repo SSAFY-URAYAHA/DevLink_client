@@ -54,4 +54,4 @@ CSRF 선행 조회가 실패하면 생성 POST 전이므로 pending을 남기지
 
 `rust/scripts/verify-agent-bootstrap.mjs`는 실제 loopback Spring/PostgreSQL과 두 합성 사용자를 사용한다. `DEVLINK_TEST_CENTRAL_URL`·절대 경로 `DEVLINK_TEST_CLI`를 지정한다. `DEVLINK_TEST_HOSTS=both`는 실제 Codex·Claude Code를 임시 설정으로 기동해 같은 발행 파일의 로딩을 검증한다. 비밀 인자나 전역 설정 수정 없이 실제 MCP tool event를 확인하고 소유한 MCP 자식 프로세스를 정리한다.
 
-현재 중앙 READY에는 user/team이 없어 업무 세션 수립은 `CENTRAL_UNAUTHENTICATED`로 닫힌다. 유효한 MCP 파일로 해당 응답을 받는 것은 reader와 로컬 자격 인증을 통과했다는 범위의 증거다. **Agent 등록/WS 연결·Host 파일 읽기 성공과 업무 세션/전체 MVP 왕복 성공은 구분한다.** -92의 신원 공급, -93/-94/-97 업무 연결 및 기존 -66 최종 왕복 수용을 완료했다고 주장하지 않는다.
+초기 검증의 과거 중앙 READY에는 user/team이 없어 업무 세션 수립이 `CENTRAL_UNAUTHENTICATED`로 닫혔다. 현재 CLI는 [READY와 실시간 신원 조회](ready-identity.md)로 세션을 공급하므로 이 과거 제한을 현재 차단 사유로 사용하지 않는다. 유효한 MCP 파일로 해당 응답을 받는 것은 reader와 로컬 자격 인증을 통과했다는 범위의 증거다. **Agent 등록/WS 연결·Host 파일 읽기 성공과 업무 세션/전체 MVP 왕복 성공은 구분한다.** -92의 신원 공급, -93/-94/-97 업무 연결 및 기존 -66 최종 왕복 수용을 완료했다고 주장하지 않는다.
