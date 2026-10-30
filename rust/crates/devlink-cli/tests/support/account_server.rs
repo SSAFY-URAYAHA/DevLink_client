@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, WebSocketUpgrade, ws::Message},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -13,7 +13,7 @@ use std::{
     process::{Command, Output, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -22,6 +22,7 @@ pub const PASSWORD: &str = "test-password-do-not-print";
 pub const COOKIE: &str = "post-login-cookie-do-not-print";
 pub const CSRF: &str = "post-login-csrf-do-not-print";
 pub const INVITE: &str = "synthetic-invite-code-read-from-stdin-only";
+pub const AGENT_SECRET: &str = "synthetic-agent-token-never-print";
 
 #[derive(Clone, Default)]
 pub struct MockState {
@@ -34,6 +35,18 @@ pub struct MockState {
     pub joined: Arc<AtomicBool>,
     pub membership_missing: Arc<AtomicBool>,
     pub teams: Arc<Mutex<std::collections::BTreeMap<u64, Value>>>,
+    pub user_id: Arc<AtomicU64>,
+    pub agents: Arc<Mutex<std::collections::BTreeMap<u64, Value>>>,
+    pub tokens: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
+    pub create_calls: Arc<AtomicUsize>,
+    pub token_calls: Arc<AtomicUsize>,
+    pub create_mode: Arc<AtomicU8>,
+    pub token_mode: Arc<AtomicU8>,
+    pub wrong_context: Arc<AtomicBool>,
+    pub csrf_failure: Arc<AtomicBool>,
+    pub pause_token: Arc<AtomicBool>,
+    pub token_entered: Arc<tokio::sync::Notify>,
+    pub token_resume: Arc<tokio::sync::Notify>,
 }
 
 pub fn success(value: Value) -> Response {
@@ -47,13 +60,17 @@ fn cookie(headers: &HeaderMap, value: &str) -> bool {
         .get("cookie")
         .is_some_and(|v| v == &format!("JSESSIONID={value}"))
 }
-fn user() -> Value {
-    json!({"userId":51,"email":"verified@example.test","name":"Verified\u{1b}[31m\u{202e}","nickname":null,"createdAt":"2026-10-29T00:00:00"})
+fn user(state: &MockState) -> Value {
+    let id = state.user_id.load(Ordering::SeqCst);
+    json!({"userId":if id==0{51}else{id},"email":"verified@example.test","name":"Verified\u{1b}[31m\u{202e}","nickname":null,"createdAt":"2026-10-29T00:00:00"})
 }
 
 async fn csrf(State(state): State<MockState>, headers: HeaderMap) -> Response {
     assert!(!headers.contains_key("authorization"));
     state.calls.lock().unwrap().push("csrf".into());
+    if state.csrf_failure.load(Ordering::SeqCst) {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "UNTRUSTED");
+    }
     let authenticated = cookie(&headers, COOKIE);
     let token = if authenticated {
         CSRF
@@ -89,7 +106,7 @@ async fn login(
         return failure(StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS");
     }
     state.expired.store(false, Ordering::SeqCst);
-    let mut response = success(user());
+    let mut response = success(user(&state));
     response.headers_mut().insert(
         "set-cookie",
         format!("JSESSIONID={COOKIE}; Path=/; HttpOnly")
@@ -108,11 +125,179 @@ async fn me(State(state): State<MockState>, headers: HeaderMap) -> Response {
     if state.me_failure.load(Ordering::SeqCst) {
         return failure(StatusCode::SERVICE_UNAVAILABLE, "UNTRUSTED_SECRET_RESPONSE");
     }
-    let mut value = user();
+    let mut value = user(&state);
     if state.changed_user.load(Ordering::SeqCst) {
         value["userId"] = json!(52);
     }
     success(value)
+}
+
+fn agent_value(id: u64, user: u64, team: u64, name: &str, tool: Value, project: Value) -> Value {
+    json!({"agentId":id,"teamId":team,"ownerUserId":user,"name":name,"roleDescription":null,"toolType":tool,"projectName":project,"status":"OFFLINE","lastSeenAt":null,"createdAt":"2026-10-29T00:00:00"})
+}
+fn agent_for(state: &MockState, id: u64) -> Option<Value> {
+    match id {
+        301 => Some(agent_value(
+            301,
+            51,
+            71,
+            "Existing",
+            json!("CODEX"),
+            json!("Existing project"),
+        )),
+        302 => Some(agent_value(
+            302,
+            88,
+            71,
+            "Other owner",
+            json!("CODEX"),
+            json!("Other project"),
+        )),
+        303 => Some(agent_value(
+            303,
+            51,
+            99,
+            "Other team",
+            json!("CODEX"),
+            json!("Other project"),
+        )),
+        _ => state.agents.lock().unwrap().get(&id).cloned(),
+    }
+}
+async fn agent_create(
+    Path(team): Path<u64>,
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    assert!(authorized(&state, &headers, true));
+    assert_eq!(team, 71);
+    state.create_calls.fetch_add(1, Ordering::SeqCst);
+    if state.create_mode.load(Ordering::SeqCst) == 2 {
+        return failure(StatusCode::BAD_REQUEST, "VALIDATION_FAILED");
+    }
+    if state.create_mode.load(Ordering::SeqCst) == 3 {
+        return failure(StatusCode::INTERNAL_SERVER_ERROR, "UNTRUSTED");
+    }
+    assert!(body.get("ownerUserId").is_none() && body.get("agentId").is_none());
+    let count = state.agents.lock().unwrap().len();
+    let id = 201 + count as u64;
+    let user = user(&state)["userId"].as_u64().unwrap();
+    let mut agent = agent_value(
+        id,
+        user,
+        team,
+        body["name"].as_str().unwrap(),
+        body["toolType"].clone(),
+        body["projectName"].clone(),
+    );
+    agent["roleDescription"] = body["roleDescription"].clone();
+    state.agents.lock().unwrap().insert(id, agent.clone());
+    if state.create_mode.load(Ordering::SeqCst) == 1 {
+        return failure(StatusCode::INTERNAL_SERVER_ERROR, "UNTRUSTED");
+    }
+    success(agent)
+}
+async fn agent_list(
+    Path(team): Path<u64>,
+    State(state): State<MockState>,
+    headers: HeaderMap,
+) -> Response {
+    assert!(authorized(&state, &headers, false));
+    assert_eq!(team, 71);
+    let mut agents = state
+        .agents
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    agents.push(agent_for(&state, 301).unwrap());
+    agents.push(agent_for(&state, 302).unwrap());
+    success(json!(agents))
+}
+async fn agent_get(
+    Path(id): Path<u64>,
+    State(state): State<MockState>,
+    headers: HeaderMap,
+) -> Response {
+    assert!(authorized(&state, &headers, false));
+    if id == 303 {
+        return failure(StatusCode::FORBIDDEN, "ACCESS_DENIED");
+    }
+    agent_for(&state, id)
+        .map(success)
+        .unwrap_or_else(|| failure(StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND"))
+}
+async fn agent_token(
+    Path(id): Path<u64>,
+    State(state): State<MockState>,
+    headers: HeaderMap,
+) -> Response {
+    assert!(authorized(&state, &headers, true));
+    if state.pause_token.load(Ordering::SeqCst) {
+        state.token_entered.notify_one();
+        state.token_resume.notified().await;
+    }
+    let Some(agent) = agent_for(&state, id) else {
+        return failure(StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND");
+    };
+    if agent["ownerUserId"] != user(&state)["userId"] {
+        return failure(StatusCode::FORBIDDEN, "ACCESS_DENIED");
+    }
+    let count = state.token_calls.fetch_add(1, Ordering::SeqCst) + 1;
+    let token = format!("{AGENT_SECRET}-{id}-{count}");
+    let mut tokens = state.tokens.lock().unwrap();
+    tokens.retain(|_, owner| *owner != id);
+    tokens.insert(token.clone(), id);
+    drop(tokens);
+    if state.token_mode.load(Ordering::SeqCst) == 1 {
+        return failure(StatusCode::INTERNAL_SERVER_ERROR, "UNTRUSTED");
+    }
+    success(json!({"agentId":id,"token":token}))
+}
+fn token_agent(state: &MockState, headers: &HeaderMap) -> Option<u64> {
+    let bearer = headers
+        .get("authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    state.tokens.lock().unwrap().get(bearer).copied()
+}
+async fn agent_context(State(state): State<MockState>, headers: HeaderMap) -> Response {
+    assert!(!headers.contains_key("cookie"));
+    let Some(mut id) = token_agent(&state, &headers) else {
+        return failure(StatusCode::UNAUTHORIZED, "AUTHENTICATION_REQUIRED");
+    };
+    if state.wrong_context.load(Ordering::SeqCst) {
+        id = 301;
+    }
+    agent_for(&state, id)
+        .map(success)
+        .unwrap_or_else(|| failure(StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND"))
+}
+async fn websocket(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    use futures_util::StreamExt;
+    let Some(id) = token_agent(&state, &headers) else {
+        return failure(StatusCode::UNAUTHORIZED, "AUTHENTICATION_REQUIRED");
+    };
+    upgrade.on_upgrade(move |mut socket|async move{
+        state.calls.lock().unwrap().push(format!("ws:{id}"));
+        let ready=json!({"type":"BROKER_READY","payload":{"connection_id":format!("profile-{id}"),"agent_id":id}});
+        if socket.send(Message::Text(ready.to_string().into())).await.is_err(){return;}
+        while let Some(Ok(message))=socket.next().await{
+            if let Message::Text(text)=message
+                && let Ok(value)=serde_json::from_str::<Value>(&text)
+                    && value["type"]=="HEARTBEAT_PING"{
+                        let pong=json!({"type":"HEARTBEAT_PONG","payload":{"ping_id":value["payload"]["ping_id"]}});
+                        if socket.send(Message::Text(pong.to_string().into())).await.is_err(){break;}
+            }
+        }
+    })
 }
 
 async fn logout(State(state): State<MockState>, headers: HeaderMap) -> Response {
@@ -211,7 +396,7 @@ async fn team_members(
     let user = if state.membership_missing.load(Ordering::SeqCst) {
         777
     } else {
-        51
+        user(&state)["userId"].as_u64().unwrap()
     };
     success(
         json!([{"userId":user,"name":"Verified","nickname":null,"role":team["myRole"],"joinedAt":"2026-10-29T00:00:00"}]),
@@ -248,6 +433,14 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let state = MockState::default();
         let app = Router::new()
+            .route(
+                "/api/v1/agents/teams/{id}",
+                get(agent_list).post(agent_create),
+            )
+            .route("/api/v1/agents/{id}", get(agent_get))
+            .route("/api/v1/agents/{id}/token", post(agent_token))
+            .route("/api/v1/agent/context", get(agent_context))
+            .route("/ws/broker", get(websocket))
             .route("/api/v1/teams", get(team_list).post(team_create))
             .route("/api/v1/teams/join", post(team_join))
             .route("/api/v1/teams/{id}", get(team_detail))
@@ -265,6 +458,7 @@ impl Fixture {
             &path,
             &Config {
                 server_url: format!("ws://{address}"),
+                local_port: 0,
                 ..Config::default()
             },
         )
@@ -278,43 +472,52 @@ impl Fixture {
     }
 
     pub fn run(&self, args: &[&str], input: Option<&str>) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_devlink"));
-        command
-            .arg("--config")
-            .arg(&self.path)
-            .args(args)
-            .env_remove("DEVLINK_TOKEN")
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().unwrap();
-        if let Some(input) = input {
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(input.as_bytes())
-                .unwrap();
-        }
-        child.wait_with_output().unwrap()
+        run_at(&self.path, args, input)
     }
 
     pub fn login(&self) -> Output {
-        self.run(
-            &[
-                "auth",
-                "login",
-                "--email",
-                "input@example.test",
-                "--password-stdin",
-            ],
-            Some(&format!("{PASSWORD}\n")),
-        )
+        login_at(&self.path)
     }
+}
+
+pub fn run_at(path: &std::path::Path, args: &[&str], input: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_devlink"));
+    command
+        .arg("--config")
+        .arg(path)
+        .args(args)
+        .env_remove("DEVLINK_TOKEN")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    if let Some(input) = input {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    child.wait_with_output().unwrap()
+}
+
+pub fn login_at(path: &std::path::Path) -> Output {
+    run_at(
+        path,
+        &[
+            "auth",
+            "login",
+            "--email",
+            "input@example.test",
+            "--password-stdin",
+        ],
+        Some(&format!("{PASSWORD}\n")),
+    )
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -331,7 +534,14 @@ pub fn text(output: &Output) -> String {
 }
 pub fn assert_no_secrets(output: &Output) {
     let value = text(output);
-    for secret in [PASSWORD, COOKIE, CSRF, "pre-login-cookie", "pre-login-csrf"] {
+    for secret in [
+        PASSWORD,
+        COOKIE,
+        CSRF,
+        AGENT_SECRET,
+        "pre-login-cookie",
+        "pre-login-csrf",
+    ] {
         assert!(!value.contains(secret));
     }
 }
