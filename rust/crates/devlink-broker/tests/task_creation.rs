@@ -111,7 +111,7 @@ async fn central_create(
         7 => (StatusCode::CREATED, "x".repeat(256 * 1024 + 1)).into_response(),
         _ => (if replayed {StatusCode::OK} else {StatusCode::CREATED}, Json(json!({
             "success":true,"data":{"taskId":task_id,"receiverAgentId":body["receiverAgentId"],
-            "status":if mode == 12 {"FUTURE_STATUS"} else if mode == 17 && replayed {"REJECTED"} else {"PENDING"},"version":1,"replayed":replayed,
+            "status":if mode == 12 {"FUTURE_STATUS"} else if mode == 17 {"REJECTED"} else {"PENDING"},"version":1,"replayed":replayed,
             "delivery": if mode == 10 {json!({"status":"ACK_RECEIVED","reasonCode":SECRET})}
                 else if mode == 8 {json!({"status":"DELIVERY_UNKNOWN","reasonCode":"ACK_TIMEOUT"})} else {json!({"status":"ACK_PENDING","reasonCode":null})}},
             "code":null,"message":null
@@ -206,8 +206,8 @@ impl Central {
         let address = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/api/v1/tasks/{team_id}", post(central_create))
-            .route("/api/v1/agent/context", get(central_agent))
-            .route("/api/v1/agent/agents", get(central_agents))
+            .route("/api/v1/agents/me", get(central_agent))
+            .route("/api/v1/agents/teams/{teamId}", get(central_agents))
             .with_state(state.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -836,6 +836,12 @@ async fn authenticated_creation_maps_actor_payload_ids_and_delivery_without_wait
     assert_eq!(status, 200);
     assert_eq!(unknown["data"]["status"], "PENDING");
     assert_eq!(unknown["data"]["delivery"]["status"], "DELIVERY_UNKNOWN");
+    remote.state.mode.store(17, Ordering::SeqCst);
+    let (status, rejected) = broker
+        .post("/v1/tasks/create", &request(&session, "create-rejected"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(rejected["data"]["status"], "REJECTED");
     broker.stop().await;
 }
 

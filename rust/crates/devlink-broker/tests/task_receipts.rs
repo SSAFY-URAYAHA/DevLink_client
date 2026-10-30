@@ -118,6 +118,14 @@ async fn ack_follows_persistence_and_duplicate_is_safe_across_reconnect_and_rest
     assert_eq!(disk.list_for(&origin, 12).unwrap().len(), 1);
     let original = std::fs::read(Inbox::path(&path)).unwrap();
     drop(disk);
+    // The same delivery is acknowledged again without rewriting the durable snapshot.
+    send(&mut socket, task("first", 12)).await;
+    let duplicate = ack(&mut socket).await;
+    assert_eq!(
+        (duplicate.event_id.as_str(), duplicate.task_id),
+        ("first", 101)
+    );
+    assert_eq!(std::fs::read(Inbox::path(&path)).unwrap(), original);
     // Simulate another delivery after the server loses its receipt observation.
     socket.close(None).await.unwrap();
     drop(socket);
@@ -139,6 +147,14 @@ async fn ack_follows_persistence_and_duplicate_is_safe_across_reconnect_and_rest
     let cancel = CancellationToken::new();
     let (_, runner) = spawn(config, Inbox::open(&path).unwrap(), cancel.clone());
     let mut socket = ready(&listener).await;
+    let before = std::fs::read(Inbox::path(&path)).unwrap();
+    send(&mut socket, task("first", 12)).await;
+    let duplicate = ack(&mut socket).await;
+    assert_eq!(
+        (duplicate.event_id.as_str(), duplicate.task_id),
+        ("first", 101)
+    );
+    assert_eq!(std::fs::read(Inbox::path(&path)).unwrap(), before);
     send(&mut socket, task("after-restart", 12)).await;
     assert_eq!(ack(&mut socket).await.event_id, "after-restart");
     let after: serde_json::Value =
@@ -150,6 +166,113 @@ async fn ack_follows_persistence_and_duplicate_is_safe_across_reconnect_and_rest
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn unready_or_invalid_delivery_never_persists_or_acknowledges() {
+    for case in [
+        "before-ready",
+        "wrong-team",
+        "wrong-receiver",
+        "missing-task-id",
+        "string-task-id",
+        "missing-event",
+        "zero-requester",
+        "oversized-task-id",
+        "empty-event",
+        "blank-prompt",
+        "null-prompt",
+        "empty-created-at",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Config {
+            server_url: format!("ws://{}", listener.local_addr().unwrap()),
+            auto_reconnect: false,
+            ..Config::default()
+        };
+        let (state, runner) = spawn(
+            config,
+            Inbox::open(&path).unwrap(),
+            CancellationToken::new(),
+        );
+        let (stream, _) = timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        if case != "before-ready" {
+            send(
+                &mut socket,
+                ServerMessage::BrokerReady(BrokerReadyPayload {
+                    connection_id: format!("invalid-delivery-{case}"),
+                    agent_id: 12,
+                    user_id: Some(3),
+                    team_id: Some(1),
+                }),
+            )
+            .await;
+        }
+        let mut message = serde_json::to_value(task("invalid-delivery", 12)).unwrap();
+        match case {
+            "wrong-team" => message["payload"]["team_id"] = 999.into(),
+            "wrong-receiver" => message["payload"]["receiver_agent_id"] = 13.into(),
+            "missing-task-id" => {
+                message["payload"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("task_id");
+            }
+            "string-task-id" => message["payload"]["task_id"] = "101".into(),
+            "missing-event" => {
+                message.as_object_mut().unwrap().remove("event_id");
+            }
+            "zero-requester" => message["payload"]["requester_agent_id"] = 0.into(),
+            "oversized-task-id" => message["payload"]["task_id"] = u64::MAX.into(),
+            "empty-event" => message["event_id"] = "".into(),
+            "blank-prompt" => message["payload"]["prompt"] = " \n ".into(),
+            "null-prompt" => message["payload"]["prompt"] = serde_json::Value::Null,
+            "empty-created-at" => message["payload"]["created_at"] = "".into(),
+            "before-ready" => {}
+            _ => unreachable!(),
+        }
+        socket
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            while let Some(Ok(frame)) = socket.next().await {
+                match frame {
+                    Message::Text(text) => assert!(
+                        !matches!(
+                            serde_json::from_str::<ClientMessage>(&text),
+                            Ok(ClientMessage::Ack(_))
+                        ),
+                        "invalid {case} delivery was acknowledged"
+                    ),
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("invalid {case} delivery was silently ignored"));
+        timeout(Duration::from_secs(3), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.status().await,
+            ConnectionStatus::ProtocolViolation,
+            "{case}"
+        );
+        assert_eq!(state.identity().await, None, "{case}");
+        assert!(
+            !Inbox::path(&path).exists(),
+            "invalid {case} delivery was persisted"
+        );
+    }
 }
 
 #[tokio::test]

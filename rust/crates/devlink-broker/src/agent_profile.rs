@@ -241,7 +241,7 @@ async fn context(origin: &str, token: &str) -> Result<Agent> {
         .build()
         .map_err(|_| anyhow::anyhow!("Cannot initialize Agent verifier"))?;
     let url = reqwest::Url::parse(origin)
-        .and_then(|u| u.join("/api/v1/agent/context"))
+        .and_then(|u| u.join("/api/v1/agents/me"))
         .map_err(|_| anyhow::anyhow!("Invalid Agent verification origin"))?;
     let mut response = client
         .get(url)

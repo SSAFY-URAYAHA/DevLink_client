@@ -1,6 +1,6 @@
 # Rust 중앙 업무 중계 (-93)
 
-2026-10-30 (Asia/Seoul). 초기 구현의 Gemini 검토 이력은 아래에 보존한다. 이번 공식 생성 경로·REJECTED 호환 수정은 사용자가 지정한 Claude Code CLI `claude-opus-5-5`, effort `high`로 커밋 전 교차검증한다. [현재 수정·검증 기록](task-create-contract-verification.md)을 참고한다.
+2026-10-30 현재 계약. 생성 URL·REJECTED 호환 검증과 교차검토 이력은 아래에 통합했다. 과거 중앙 커밋의 정책 관찰을 현재 서버 전체의 수용 판정으로 확대하지 않는다.
 
 후속 -94는 최신 고정 중앙 `a5c7987`의 생성 URL `/api/v1/tasks/{teamId}`를 반영했다. 아래 `02de434` 기록은 당시 검증 증거다. 새 4개 중계·DTO·검증·남은 조건은 [task-operations.md](task-operations.md)를 참고한다. 과거 중앙 정책 blocker가 해결됐다는 의미는 아니다.
 
@@ -12,11 +12,11 @@
 
 ## 실제 공급 경로
 
-| 로컬 POST | 중앙 Agent Bearer provider | 동작 |
-| --- | --- | --- |
-| `/v1/agents/register` | GET `/api/v1/agent/context` | 현재 자격의 기존 Agent만 확인. 생성·수정·토큰 발급 호출 없음 |
-| `/v1/agents/list` | GET `/api/v1/agent/context`, GET `/api/v1/agent/agents` | 현재 user/team/Agent를 대조한 뒤 같은 팀 목록 제공 |
-| `/v1/tasks/create` | GET `/api/v1/agent/context`, POST `/api/v1/tasks/{teamId}` | 중앙 context와 대조한 로컬 actor의 팀을 경로에 사용하고 요청자는 Bearer로 결정 |
+| 로컬 POST             | 중앙 Agent Bearer provider                                   | 동작                                                         |
+| --------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| `/v1/agents/register` | GET `/api/v1/agents/me`                                      | 현재 자격의 기존 Agent만 확인. 생성·수정·토큰 발급 호출 없음 |
+| `/v1/agents/list`     | GET `/api/v1/agents/me`, GET `/api/v1/agents/teams/{teamId}` | 현재 user/team/Agent를 대조한 뒤 같은 팀 목록 제공           |
+| `/v1/tasks/create`    | GET `/api/v1/agents/me`, POST `/api/v1/tasks/{teamId}`       | 로컬 actor 확인 후 중앙이 Bearer에서 requester/team을 결정   |
 
 중앙 `a5c7987`의 공식 생성 경로 `/api/v1/tasks/{teamId}`는 Agent Bearer API다. 이전 `/api/v1/agent/tasks`로의 호출·자동 fallback과 임시 `agentId` 파라미터는 사용하지 않는다. teamId는 검증된 세션에서 가져오며 MCP arguments/body에 actor ID를 추가하지 않는다. 사용자 cookie·CSRF를 업무 provider에 전달하지 않는다. 모든 로컬 경로는 MCP localToken만 사용하며 CLI controlToken이나 중앙 Agent 토큰으로 인증할 수 없다.
 
@@ -77,28 +77,51 @@ node rust/scripts/verify-business-relay.mjs
 
 ## 2026-10-30 최초 구현 검사 (Gemini 지적 전)
 
-| 검사 | 결과 |
-| --- | --- |
-| 전체 Rust workspace/all-targets | 종료 0, 145 통과·실패 0·기존 MCP opt-in 2 ignored |
-| 최신 -93 HTTP 회귀 | 14 통과·실패 0·위 opt-in 2 ignored |
-| 포맷·전체 targets Clippy `-D warnings` | 종료 0 |
-| `git diff --check`, Node 재현 스크립트 문법 검사 | 종료 0 |
-| 실제 중앙·PostgreSQL·Rust 직접 HTTP | 절차 통과, storyComplete=false, provider blocker 2개 |
-| 검증용 환경 정리 | 중앙/DB 종료·임시 DB 삭제, 종료 전 ONLINE 0 |
+| 검사                                             | 결과                                                 |
+| ------------------------------------------------ | ---------------------------------------------------- |
+| 전체 Rust workspace/all-targets                  | 종료 0, 145 통과·실패 0·기존 MCP opt-in 2 ignored    |
+| 최신 -93 HTTP 회귀                               | 14 통과·실패 0·위 opt-in 2 ignored                   |
+| 포맷·전체 targets Clippy `-D warnings`           | 종료 0                                               |
+| `git diff --check`, Node 재현 스크립트 문법 검사 | 종료 0                                               |
+| 실제 중앙·PostgreSQL·Rust 직접 HTTP              | 절차 통과, storyComplete=false, provider blocker 2개 |
+| 검증용 환경 정리                                 | 중앙/DB 종료·임시 DB 삭제, 종료 전 ONLINE 0          |
 
 처음 샌드박스 HTTP 실행은 Windows 10013으로 실패해 승인된 외부 loopback/ACL 환경에서 재실행했다. 첫 전체 회귀에는 기존 CLI fixture가 이전 생성 경로/최소 context를 기대해 1건 실패했으며 fixture 수정 후 해당 테스트와 전체 회귀를 재검증했다. 마지막 중앙 REQUEST_KEY_CONFLICT의 unknown 매핑은 전체 회귀 빌드가 시작된 뒤 보완했으므로 최신 HTTP 14개에서 별도로 확인했다. 실제 중앙 검증도 이 보수적인 마지막 409 분기 보완 이전에 수행했으며, 실제 Rust가 중앙 409를 받은 재현 증거로 부풀리지 않는다. 로그는 ignored rust/target/story93* 아래에 보관한다. MCP opt-in/Host는 -93 직접 HTTP 검증의 선행으로 강제하지 않았다.
 
 ## Gemini 지적 후속 검사
 
-사용자가 전달한 P2 두 건을 수정 전 실제 Rust HTTP 회귀에서 재현했다. 동시 내용 충돌은 저장소 잠금 안에서 동일 actor의 requestKey를 오류와 함께 반환하고, register_agent는 로컬 toolType 형식 검사 후 중앙 신원·세션 재검증을 메타데이터 비교보다 먼저 수행한다. `known_key` 선조회는 제거했다. [변경·재현 상세](story93-gemini-followup.md)를 참고한다.
+사용자가 전달한 P2 두 건을 수정 전 실제 Rust HTTP 회귀에서 재현했다. 동시 내용 충돌은 저장소 잠금 안에서 동일 actor의 requestKey를 오류와 함께 반환하고, register_agent는 로컬 toolType 형식 검사 후 중앙 신원·세션 재검증을 메타데이터 비교보다 먼저 수행한다. `known_key` 선조회는 제거했다. 동일 actor의 키 보존과 등록 신원 검증 순서를 회귀로 확인했다.
 
 수정 후 라이브러리 42개·세션 검증 6개·업무 HTTP 18개, 합계 66개가 통과했다. 기존 MCP opt-in 2개는 미실행이며 이전 전체 145개 결과와 합산하지 않는다. 같은 actor의 충돌/저장 오류 키 보존, 타 팀·Agent의 키 비노출, 다른 READY Agent, 응답 대기 중 해제·교체, 잘못된 toolType의 중앙 호출 0회를 검증했다. 실제 CLI 생성·재시작 키 재사용 회귀 1개도 별도로 통과했다. 전체 targets Clippy `-D warnings`·포맷·diff 검사도 통과했다. Clippy 초기 불필요한 closure 차용 지적은 제거 후 재검증했다.
 
-이번 후속에서 전체 workspace 및 실제 중앙/DB/Host를 다시 실행했다고 주장하지 않는다. 기존 실제 중앙 provider blocker는 유지한다. 수정본에 대한 Gemini 재검토 기록과 구현 커밋은 아직 없다.
+이번 후속에서 전체 workspace 및 실제 중앙/DB/Host를 다시 실행했다고 주장하지 않는다. 기존 실제 중앙 provider blocker는 유지한다. 사용자가 제공한 후속 Gemini 재검토는 신규 결함 0건이었다. 이 기록을 실제 중앙/DB 재실행으로 계산하지 않는다.
 
 ## 남은 수용 조건
 
 - -67/-71: 오프라인 수신자 저장 전 거부. 현재 고정 provider의 실제 미충족을 기록했다.
 - -68: 실제 동일 키·동일 입력 동시 생성에서 한 실행은 201/200, 최종 실행은 409 REQUEST_KEY_CONFLICT/201로 갈렸다. DB 작업은 1건이었다. 최종 provider 정책·회귀가 필요하며 Rust는 409를 임의 성공으로 바꾸지 않는다.
-- 사용자의 Gemini 교차검증과 지적 보완 후 스토리 변경만 한 커밋으로 정리.
+- 초기 Gemini 지적 2건은 보완·재검토되었다. 공식 경로 호환의 별도 검토와 실행은 아래 기록을 따른다.
 - -94 나머지 네 업무, -95 CLI 수신함 조회, -96 알림, -97 MCP 최종 DTO, -52/-66 교차 기능·Host A→B/B→A는 이 구현의 완료 범위가 아니다.
+
+## 공식 생성 경로·REJECTED 호환 검증
+
+기준 client `8199ba7`→`4188973`, 실제 중앙 `a5c7987e1253a8a17912d4ea272ff105f4f4a658`의 2026-10-30 실행이다. 초기 중앙 `02de434`와 구분한다.
+
+삭제된 /api/v1/agent/tasks 호출은 공식 경로 fixture에서 생성 실패로 재현되었다. URL만 바꾼 중간 상태에서는 거절된 기존 작업의 같은 키 재접수가 502 CENTRAL_PROTOCOL_ERROR로 실패했다. 검증한 teamId를 경로에 사용하고 REJECTED를 정상 상태로 보존하도록 수정했다. actor ID 본문·자동 retry·redirect·구 경로 fallback·ACK 규격은 변경하지 않았다.
+
+| 검증 | 당시 결과 |
+| --- | --- |
+| 전체 Rust workspace/all-targets | 159 passed / 0 failed / 2 ignored |
+| 추가 HTTP 회귀 | 20 passed / 0 failed / 2 ignored. 앞선 전체 집계와 합산하지 않음. 중앙 팀 불일치 시 POST·중앙 저장 0건 포함 |
+| MCP | 빌드·계약 export·100건 통과 |
+| build·fmt·Clippy | workspace 빌드·전체 포맷·all-targets -D warnings 통과. Windows CLI 파일 잠금 실패 후 순차 빌드로 완료 |
+| 실제 중앙·DB | 생성·prompt 원문·수신함/ACK·같은 키·내용 충돌·권한 거부·거절 후 재접수·작업 1건 유지. 같은 키 동시 요청은 이번 실행에서 201/200 |
+| 실제 수신함 | 16건 ACK + 재시작 후 1건 ACK, 기록 실패 ACK 0건·DELIVERY_UNKNOWN. 자동 수락 없음 |
+
+Java 21·전용 loopback PostgreSQL 17.11, Flyway V1~V4·Hibernate validate를 유지했다. ONLINE Agent 0건·migration 4건을 확인한 뒤 임시 중앙·DB·브로커를 종료했다. private 로그는 ignored .planning/task-create93에 보관한다. 이 실행의 passed=true는 절차 일치이며 오프라인 저장 전 거부 차이로 storyComplete=false를 유지한다. 한 번의 동시 성공으로 -68 전체 수용을 완료하지 않는다.
+
+당시 기록된 Claude Code CLI 2.1.310, claude-opus-5-5, effort high 교차검토는 팀 불일치 회귀·teamId 설명 2건을 반영한 뒤 13:53 KST 최종 no actionable findings, exit 0이었다. 최종 prompt SHA-256은 906FD5B7205209C9FA6696FCE0E63A66798AED8662D40A58BC9859E454CF5EEA다. 이 문서 통합에서 검토를 재실행한 것은 아니다.
+
+PR #26은 -94가 병합된 develop a3fb511과 통합하면서 request_http·PATCH/조회/완료 확장과 위 REJECTED·팀 검증·추가 회귀를 함께 보존했다. 위 159건·20건·실제 중앙 결과는 원래 4188973의 증거이며 충돌 통합본의 재실행으로 취급하지 않는다.
+
+재현은 위 verify-business-relay.mjs와 [검증 명령](verification.md)을 사용한다. 기존 MCP opt-in·실제 Host·최종 코드 수정 왕복은 해당 결과에 포함하지 않았다.

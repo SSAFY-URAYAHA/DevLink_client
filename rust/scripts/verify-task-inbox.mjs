@@ -49,7 +49,7 @@ async function start(p){
  assert.equal(claim.status,200);const session=(await claim.json()).data;
  assert.deepEqual(session.principal,{userId:String(p.user.userId),teamId:String(p.agent.teamId),agentId:String(p.agent.agentId)});
  timer=setInterval(()=>{fetch(`${p.mcp.brokerUrl}/v1/sessions/${session.sessionId}/heartbeat`,{method:'POST',headers:{Authorization:`Bearer ${p.mcp.localToken}`,'Content-Type':'application/json'},body:JSON.stringify({requestId:randomUUID(),instanceId})}).catch(()=>{});},5000);
- await until(()=>api(p,'/api/v1/agent/context'),value=>value.status==='ONLINE','verified presence');
+ await until(()=>api(p,'/api/v1/agents/me'),value=>value.status==='ONLINE','verified presence');
 }
 function stop(p){clearInterval(timer);timer=undefined;raw(p,['stop']);}
 async function details(p,id){return api(p,`/api/v1/tasks/${id}`);}

@@ -64,7 +64,7 @@ async fn fixture() -> (Mock, CentralState, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let app = Router::new()
-        .route("/api/v1/agent/context", get(context))
+        .route("/api/v1/agents/me", get(context))
         .with_state(mock.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let state = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)))
@@ -273,7 +273,7 @@ async fn context_redirect_never_forwards_the_agent_credential() {
     let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", source.local_addr().unwrap());
     let app = Router::new().route(
-        "/api/v1/agent/context",
+        "/api/v1/agents/me",
         get(move || async move { (StatusCode::FOUND, [("location", location)]) }),
     );
     let source_task = tokio::spawn(async move { axum::serve(source, app).await.unwrap() });

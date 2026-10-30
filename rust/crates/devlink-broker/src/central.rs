@@ -881,8 +881,17 @@ async fn session(
                                     }
 
                                 }
-                                // 원문은 출력하지 않으며 알 수 없는 메시지로 PONG 대기를 연장하지 않습니다.
-                                Err(_) => {}
+                                Err(_) => {
+                                    // A recognized task delivery with missing/invalid fields must
+                                    // fail visibly instead of disappearing as an unknown message.
+                                    // Keep unrelated message types from extending the PONG budget.
+                                    if serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|message| {
+                                        message.get("type").and_then(serde_json::Value::as_str) == Some("TASK_CREATED")
+                                    }) {
+                                        let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                                        return Outcome::ProtocolViolation;
+                                    }
+                                }
                             }
                         }
                     }

@@ -321,7 +321,7 @@ impl TaskClient {
     /// Confirm only the Agent already authenticated by the broker credential.
     pub async fn confirm_agent(&self, actor: &Principal) -> Result<Value, TaskError> {
         tokio::time::timeout(self.timeout, async {
-            let data = self.read("/api/v1/agent/context").await?;
+            let data = self.read("/api/v1/agents/me").await?;
             let agent = PublicAgent::decode(data)?;
             if agent.owner_user_id.to_string() != actor.user_id.as_str()
                 || agent.team_id.to_string() != actor.team_id.as_str()
@@ -342,8 +342,13 @@ impl TaskClient {
         tokio::time::timeout(self.timeout, async {
             // Verify the credential still represents the local actor before using
             // a provider whose team selection is implicit in that credential.
-            self.confirm_agent(actor).await?;
-            let data = self.read("/api/v1/agent/agents").await?;
+            let confirmed = self.confirm_agent(actor).await?;
+            let team_id = confirmed
+                .get("teamId")
+                .and_then(|v| v.as_str())
+                .unwrap_or(actor.team_id.as_str());
+            let path = format!("/api/v1/agents/teams/{team_id}");
+            let data = self.read(&path).await?;
             let rows = data.as_array().ok_or_else(protocol_error)?;
             let mut ids = std::collections::HashSet::new();
             let mut agents = Vec::with_capacity(rows.len());

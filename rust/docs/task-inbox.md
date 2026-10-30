@@ -2,9 +2,11 @@
 
 2026-10-30. 최신 develop의 TASK_CREATED/ACK 타입, Inbox::open/record/list_for, 중앙·세션 코드를 유지하고 닫힌 PR #16의 필요한 CLI·영속성 보완을 통합했다. 이전 PR 전체를 덮어쓰거나 별도 수신함을 병행하지 않는다. ACK는 저장 확인이며 열람·사용자 수락·편집·IN_PROGRESS 전이가 아니다.
 
+후속 -95 보완·실행·교차검토 결과는 이 문서의 마지막 절에 통합했다. 저장 규격과 ACK/수락의 구분을 유지한다.
+
 ## 수신과 기록
 
-1. 유효한 BROKER_READY 이후 양의 signed64-bit ID, event_id/prompt/created_at, 인증된 receiver_agent_id를 확인한다. READY team_id가 있으면 팀도 대조한다. 수신 payload를 사용자 신원으로 승격하지 않는다.
+1. 유효한 BROKER_READY 이후 양의 signed64-bit ID, event_id/prompt/created_at, 인증된 receiver_agent_id를 확인한다. READY team_id가 있으면 팀도 대조한다. 수신 payload를 사용자 신원으로 승격하지 않는다. type이 TASK_CREATED인데 필수 필드 누락·형식 오류로 파싱할 수 없으면 ProtocolViolation으로 연결을 종료하고 저장·ACK하지 않는다.
 2. 최대5ms/16건을 묶어 하나의 snapshot으로 저장한다. blocking writer는 Inbox당1개이고 현재 연결은 기록 중 batch1개 + 대기16건까지만 보관한다. heartbeat/control Ping/close 처리는 계속한다. 초과하면 ACK 없이 연결을 닫는 기존 재연결 정책을 따른다.
 3. 안전한 경로·기존 private 파일을 확인하고 inbox.lock을 잡는다. 임시 파일의 사용자 전용 권한 설정·검사 → 쓰기·sync_all → 원자 교체 → 최종 ACL 검사·열려 있는 write 핸들 sync_all, Unix 부모 디렉터리 sync를 거쳐야 ACK를 반환한다.
 4. ACK 직전 현재 연결 generation과 Agent를 다시 확인하고 같은 소켓으로 해당 event_id/task_id를 보낸다. 이전 generation의 완료는 새 신원/연결을 덮어쓰거나 ACK하지 않는다. 전송에 실패하면 기록을 되돌리지 않는다.
@@ -51,7 +53,7 @@ clear는 control.lock/broker.lock/inbox.lock 하에서 **해당 프로필의 모
 - 단위/실소켓: 기존 schema1 보존·schema2 이력·event/task 충돌·원자 batch·정리/기록 상호 배제·손상 거부, 느린 기록 중 heartbeat와 무선행 ACK, 오래된 generation 무ACK, 16건 burst의 기본5초 예산을 회귀로 검증한다.
 - 실제 CLI: start→수신→ACK→stop→새 instanceId start→새 event로 같은 task 재수신·ACK, 업무1건 유지와 event 이력 추가, 실행 중 clear 거부와 정지 후 정리, 제어 문자·로컬 Agent 필터를 확인한다.
 - 실제 중앙 재현: loopback Spring/PostgreSQL을 준비하고 DEVLINK_TEST_CENTRAL_URL과 절대 DEVLINK_TEST_CLI를 지정해 저장소 루트에서 node rust/scripts/verify-task-inbox.mjs를 실행한다. 합성 사용자2명·실제 Rust 수신자·확인된 세션 presence로16건 ACK_RECEIVED, 재시작 후 새 업무 ACK, 실제 로컬 기록 실패의 무ACK/DELIVERY_UNKNOWN을 점검한다.
-- 현재 재현 스크립트의 생성 경로는 Agent Bearer `POST /api/v1/tasks/{teamId}`다. 팀은 발급된 송신 Agent의 teamId를 사용한다. 이전 생성 URL만 제공하는 server snapshot은 지원하지 않으며, 최신 경로 변경의 실행 결과는 [생성 계약 검증 기록](task-create-contract-verification.md)에 구분한다.
+- 현재 재현 스크립트의 생성 경로는 Agent Bearer `POST /api/v1/tasks/{teamId}`다. 팀은 발급된 송신 Agent의 teamId를 사용한다. 이전 생성 URL만 제공하는 server snapshot은 지원하지 않으며, 최신 경로 변경의 실행 결과는 [작업 생성 호환 검증](business-relay.md#공식-생성-경로rejected-호환-검증)에 구분한다.
 - 실제 중앙의 requestKey 재조회는 기존 업무를 재전송하지 않는다. 이를 wire 재전달 검증으로 세지 않으며, 같은/새 event 재전달과 재시작 dedup은 실소켓 fixture에서 별도로 검증한다.
 
 ~~~powershell
@@ -62,3 +64,30 @@ cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check
 ~~~
 
 실제 중앙 ACK 확인과 최종 TaskEvent 연결(-71), 전체 Rust 통합(-52), 사용자 수락 후 코드 수정·결과 회신(-66), 업무 중계/조회(-93/-94/-97)는 각 범위로 구분한다. 최신 중앙이 READY 사용자·팀을 공급하더라도 -92의 모든 인증 무효화·소유권·lease 수용을 이 스토리 테스트만으로 완료 처리하지 않는다.
+
+## 2026-10-30 후속 보완·검증
+
+기준 client는 `0516473` 이후 작업 트리, 검토 시 HEAD는 `3ee8fc7`, 실제 중앙은 `0e8c2b74e14ff056cdede24711e804647cd044df`다. 아래는 해당 실행·사용자 제공 보고의 기록이며 문서 통합 과정에서 재실행하지 않았다.
+
+READY 이후 type=TASK_CREATED이지만 task_id가 빠진 입력을 조용히 무시하고 연결을 유지하는 결함을 소켓 회귀에서 재현했다. 수신 루프가 파싱 실패한 TASK_CREATED를 ProtocolViolation으로 명시적으로 종료하고 저장·ACK하지 않도록 보완했다. 관계없는 메시지는 PONG 대기 시간을 연장하지 않는다.
+
+회귀에서는 동일 event/task를 재시작 전후 다시 보내도 정확한 event_id/task_id로 ACK하고 snapshot 바이트를 바꾸지 않는지 확인했다. 새 테스트는 READY 전 전달, 잘못된 팀·수신자, task_id 누락/문자열, event_id 누락/빈 값, requester=0, Long 초과 ID, prompt 공백/null, created_at 빈 값의 12개 입력을 검증한다.
+
+| 실행 | 결과 |
+| --- | --- |
+| 전체 Rust workspace/all-targets | 168 passed / 0 failed / 2 ignored. 15개 실행 그룹이며 개별 회귀와 중복 합산하지 않음 |
+| 실제 소켓 수신·ACK 회귀 | 위 전체 실행에 5건 포함. 단위 Inbox 9건·중앙 연결 10건·CLI 2건의 개별 선행 실행도 통과 |
+| 포맷·Clippy | 전체 fmt 및 all-targets Clippy -D warnings, 스크립트 문법·diff 공백 검사 통과 |
+| 실제 중앙·DB | 16건 burst + 재시작 후 새 업무 1건 ACK_RECEIVED. 실제 로컬 기록 실패의 ACK 0건·DELIVERY_UNKNOWN |
+
+실제 중앙은 고정 소스 197개 파일의 바이트 일치를 확인해 Java 21로 격리 빌드했다. PostgreSQL 17.11의 전용 loopback DB/role devlink_relay_test를 사용하고 Flyway V1~V6·Hibernate validate를 유지했다. 합성 사용자 2명·임시 프로필만 사용했다. SQL 집계는 tasks=18, PENDING=18, ACK_RECEIVED=17, DELIVERY_UNKNOWN=1, ONLINE Agent=0, 성공 migration=6이었다.
+
+같은 requestKey 재조회는 기존 작업 반환과 snapshot 무변경만 확인한다. 중앙이 메시지를 재전송한 증거로 세지 않으며 wire 재전달은 소켓 fixture가 담당한다. 기록 실패 시험 뒤 프로필을 복구·정리하고 자신이 시작한 중앙·DB를 종료했다. 런타임 DB 비밀번호도 제거했다. 한글 경로 initdb 인코딩 및 Windows 자식 출력 대기 문제는 검증 환경 준비 실패로 구분했고 성공 시험에 합산하지 않았다.
+
+사용자 제공 Gemini 교차검토는 신규 결함 0건·추가 코드 수정 요구 없음이었다. 결과 기록 전에 변경 대상 5개와 관련 소스/증거를 포함한 manifest 19개 및 bundle 해시가 모두 일치했다. 원본 자료는 ignored target/story95의 gemini-review-bundle.md와 review-manifest.json에 보존한다. 이후 문서 정리로 문서 해시는 달라질 수 있으며 원본 검토를 새 문서의 재검토로 계산하지 않는다.
+
+보고서의 역직렬화 대상은 ClientMessage가 아니라 ServerMessage로 정정한다. 제어 Ping/Pong은 JSON heartbeat 응답으로 인정하지 않는다. 현재 ping_id와 일치하고 기한 내 도착한 JSON PONG만 대기를 해제한다.
+
+공개 가능한 실행 증거는 target/story95의 workspace-tests.log, clippy.log, actual-central.log, db-evidence.json, source-verification.json에 있다. private DB·서버 로그는 검토 묶음에 포함하지 않는다. 재현은 위 명령 및 저장소 루트의 node rust/scripts/verify-task-inbox.mjs를 사용한다.
+
+Rust 수신함·ACK 후속 보완/검증/사용자 제공 교차검토까지의 결과다. 중앙 최종 전달 이력 전체 수용(-71), 오프라인 사전 거부(-67), 인증·세션 전체 수용(-92), MCP 최종 DTO(-97), 전체 통합(-52), 실제 Host 양방향(-66)·Ubuntu 실행은 별도다. 외부 이슈 상태나 커밋·푸시는 변경하지 않았다.

@@ -216,7 +216,7 @@ impl Fixture {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = Router::new()
-            .route("/api/v1/agent/context", get(context))
+            .route("/api/v1/agents/me", get(context))
             .route("/api/v1/teams/1/tasks", get(list))
             .route("/api/v1/tasks/{id}", get(result))
             .route("/api/v1/tasks/{id}/status", patch(status))

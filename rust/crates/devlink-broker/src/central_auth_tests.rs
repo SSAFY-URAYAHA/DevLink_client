@@ -49,7 +49,7 @@ async fn auth_denial_discards_ack_for_an_already_accepted_pending_write() {
     let context_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let context_origin = format!("ws://{}", context_listener.local_addr().unwrap());
     let app = Router::new().route(
-        "/api/v1/agent/context",
+        "/api/v1/agents/me",
         get(move || {
             let denied = remote_denied.clone();
             async move {

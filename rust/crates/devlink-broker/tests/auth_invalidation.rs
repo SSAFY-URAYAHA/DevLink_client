@@ -53,7 +53,7 @@ impl Fixture {
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let rest_origin = format!("ws://{}", http.local_addr().unwrap());
         let app = Router::new().route(
-            "/api/v1/agent/context",
+            "/api/v1/agents/me",
             get(move |headers: HeaderMap| {
                 let mode = remote_mode.clone();
                 async move {

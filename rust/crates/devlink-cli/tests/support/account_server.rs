@@ -439,7 +439,7 @@ impl Fixture {
             )
             .route("/api/v1/agents/{id}", get(agent_get))
             .route("/api/v1/agents/{id}/token", post(agent_token))
-            .route("/api/v1/agent/context", get(agent_context))
+            .route("/api/v1/agents/me", get(agent_context))
             .route("/ws/broker", get(websocket))
             .route("/api/v1/teams", get(team_list).post(team_create))
             .route("/api/v1/teams/join", post(team_join))

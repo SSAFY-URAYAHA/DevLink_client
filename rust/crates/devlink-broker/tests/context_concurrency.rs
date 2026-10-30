@@ -86,7 +86,7 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let app = Router::new()
-            .route("/api/v1/agent/context", get(context))
+            .route("/api/v1/agents/me", get(context))
             .with_state(gate.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = CentralState::new(Arc::new(RwLock::new(ConnectionStatus::Connecting)))
