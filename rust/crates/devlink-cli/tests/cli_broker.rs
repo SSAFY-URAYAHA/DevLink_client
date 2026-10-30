@@ -57,7 +57,9 @@ async fn serve_context_request(stream: &mut tokio::net::TcpStream, agent: Option
     assert!(!headers.contains("cookie:") && !headers.contains("origin:"));
     let body = match agent {
         Some(id) => {
-            serde_json::json!({"success":true,"data":{"agentId":id,"ownerUserId":3,"teamId":1}})
+            serde_json::json!({"success":true,"data":{"agentId":id,"ownerUserId":3,"teamId":1,
+                "name":"Existing Agent","roleDescription":null,"toolType":"CODEX","projectName":"CLI fixture",
+                "status":"ONLINE","lastSeenAt":null,"createdAt":"2026-10-29T00:00:00"}})
                 .to_string()
         }
         None => serde_json::json!({"success":false,"code":"AUTHENTICATION_REQUIRED"}).to_string(),
@@ -113,7 +115,7 @@ async fn cli_creates_tasks_with_agent_bearer_and_reuses_request_key_after_restar
                     if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
                 };
                 let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap().to_lowercase();
-                assert!(headers.starts_with("post /api/v1/tasks/1 http/1.1\r\n"));
+                assert!(headers.starts_with("post /api/v1/agent/tasks http/1.1\r\n"));
                 assert!(headers.contains(&format!("authorization: bearer {TOKEN}\r\n")));
                 assert!(!headers.contains("cookie:") && !headers.contains("origin:"));
                 let size: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
@@ -123,7 +125,7 @@ async fn cli_creates_tasks_with_agent_bearer_and_reuses_request_key_after_restar
                     assert!(count > 0); bytes.extend_from_slice(&chunk[..count]);
                 }
                 let command: serde_json::Value = serde_json::from_slice(&bytes[header_end..header_end+size]).unwrap();
-                assert_eq!(command["requesterAgentId"],12); assert_eq!(command["receiverAgentId"],13);
+                assert!(command.get("requesterAgentId").is_none()); assert_eq!(command["receiverAgentId"],13);
                 let key = command["requestKey"].as_str().unwrap().to_string();
                 let mut tasks = saved.lock().await;
                 let replayed = tasks.contains_key(&key);

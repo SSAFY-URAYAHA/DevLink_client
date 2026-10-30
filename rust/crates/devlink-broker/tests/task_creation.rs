@@ -1,9 +1,9 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use devlink_broker::{
     central::{CentralIdentity, CentralState, ConnectionStatus},
@@ -37,6 +37,8 @@ const SECRET: &str = "untrusted-central-message-do-not-expose";
 #[derive(Clone)]
 struct MockState {
     mode: Arc<AtomicU8>,
+    agent_mode: Arc<AtomicU8>,
+    agent_calls: Arc<AtomicUsize>,
     calls: Arc<Mutex<Vec<Value>>>,
     saved: Arc<Mutex<HashMap<String, u64>>>,
     active: Arc<AtomicUsize>,
@@ -46,12 +48,10 @@ struct MockState {
 }
 
 async fn central_create(
-    Path(team): Path<u64>,
     State(state): State<MockState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    assert_eq!(team, 1);
     assert_eq!(
         headers.get("authorization").unwrap(),
         &format!("Bearer {AGENT}")
@@ -66,6 +66,8 @@ async fn central_create(
             .any(|record| record["command"]["requestKey"] == body["requestKey"]),
         "key was not persisted before HTTP"
     );
+    assert!(body.get("requesterAgentId").is_none());
+    assert!(body.get("teamId").is_none());
     state.calls.lock().await.push(body.clone());
     let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
     state.max_active.fetch_max(active, Ordering::SeqCst);
@@ -81,6 +83,20 @@ async fn central_create(
     }
     state.active.fetch_sub(1, Ordering::SeqCst);
     match mode {
+        13 => (StatusCode::CONFLICT, Json(json!({"success":false,"code":"DUPLICATE_REQUEST","message":SECRET}))).into_response(),
+        16 => (StatusCode::CONFLICT, Json(json!({"success":false,"code":"REQUEST_KEY_CONFLICT","message":SECRET}))).into_response(),
+        14 => (StatusCode::OK, Json(json!({"success":false,"code":"RECEIVER_OFFLINE","message":SECRET}))).into_response(),
+        15 => {
+            let stream = futures_util::stream::unfold(0, |part| async move {
+                match part {
+                    0 => Some((Ok::<_, std::io::Error>("{\"success\":"), 1)),
+                    1 => { sleep(Duration::from_millis(500)).await; Some((Ok("true,\"data\":null}"), 2)) },
+                    _ => None,
+                }
+            });
+            Response::builder().status(201).header("content-type", "application/json")
+                .body(axum::body::Body::from_stream(stream)).unwrap()
+        },
         11 => (StatusCode::CREATED, Json(json!({"success":true,"data":{
             "taskId":task_id,"receiverAgentId":body["receiverAgentId"]},"code":null,"message":null}))).into_response(),
         9 => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"success":false,"data":{
@@ -99,6 +115,54 @@ async fn central_create(
             "code":null,"message":null
         }))).into_response(),
     }
+}
+
+fn public_agent(id: u64) -> Value {
+    json!({"agentId":id,"teamId":1,"ownerUserId":3,"name":"Existing Agent",
+        "roleDescription":"Developer","toolType":"CODEX","projectName":"DevLink",
+        "status":"ONLINE","lastSeenAt":"2026-10-30T01:00:00","createdAt":"2026-10-29T00:00:00",
+        "unexpectedCredential":SECRET})
+}
+async fn central_agent(State(state): State<MockState>, headers: HeaderMap) -> Response {
+    assert_eq!(headers["authorization"], format!("Bearer {AGENT}"));
+    assert!(!headers.contains_key("cookie"));
+    state.agent_calls.fetch_add(1, Ordering::SeqCst);
+    let mode = state.agent_mode.load(Ordering::SeqCst);
+    if mode == 1 {
+        sleep(Duration::from_millis(500)).await;
+    }
+    if mode == 2 {
+        return (StatusCode::UNAUTHORIZED, SECRET).into_response();
+    }
+    if mode == 3 {
+        return (StatusCode::FORBIDDEN, SECRET).into_response();
+    }
+    if mode == 6 {
+        return (StatusCode::FOUND, [("location", state.redirect)], SECRET).into_response();
+    }
+    let mut agent = public_agent(12);
+    if mode == 4 {
+        agent["ownerUserId"] = json!(999);
+    }
+    if mode == 5 {
+        agent["agentId"] = json!(99);
+    }
+    if mode == 9 {
+        agent["agentId"] = json!(99);
+        agent["name"] = json!("Other Agent");
+    }
+    Json(json!({"success":true,"data":agent})).into_response()
+}
+async fn central_agents(State(state): State<MockState>, headers: HeaderMap) -> Response {
+    assert_eq!(headers["authorization"], format!("Bearer {AGENT}"));
+    state.agent_calls.fetch_add(1, Ordering::SeqCst);
+    let mut agent = public_agent(i64::MAX as u64);
+    match state.agent_mode.load(Ordering::SeqCst) {
+        7 => agent["teamId"] = json!(999),
+        8 => agent["agentId"] = json!(9223372036854775808_u64),
+        _ => {}
+    }
+    Json(json!({"success":true,"data":[public_agent(12),agent]})).into_response()
 }
 
 struct Central {
@@ -124,6 +188,8 @@ impl Central {
         });
         let state = MockState {
             mode: Arc::new(AtomicU8::new(0)),
+            agent_mode: Arc::default(),
+            agent_calls: Arc::default(),
             calls: Arc::default(),
             saved: Arc::default(),
             active: Arc::default(),
@@ -134,7 +200,9 @@ impl Central {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new()
-            .route("/api/v1/tasks/{team}", post(central_create))
+            .route("/api/v1/agent/tasks", post(central_create))
+            .route("/api/v1/agent/context", get(central_agent))
+            .route("/api/v1/agent/agents", get(central_agents))
             .with_state(state.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -197,12 +265,18 @@ impl Broker {
             TaskClient::with_timeout(&format!("ws://{}", remote.address), AGENT, request_timeout)
                 .unwrap();
         let cancel = CancellationToken::new();
-        let app =
-            session_api::router(Arc::new(LOCAL.into()), sessions.clone()).merge(task_api::router(
+        let app = session_api::router(Arc::new(LOCAL.into()), sessions.clone())
+            .merge(task_api::router(
+                Arc::new(LOCAL.into()),
+                sessions.clone(),
+                task_client.clone(),
+                requests,
+                cancel.clone(),
+            ))
+            .merge(devlink_broker::agent_api::router(
                 Arc::new(LOCAL.into()),
                 sessions.clone(),
                 task_client,
-                requests,
                 cancel.clone(),
             ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -274,6 +348,340 @@ fn request(session: &Value, id: &str) -> Value {
     context["sessionId"] = session["sessionId"].clone();
     json!({"requestId":id,"mcpRequestId":27,"operation":"create_task",
         "arguments":{"recipientAgentId":"13","title":"로그인 수정","description":"오류 메시지 수정","taskContext":"작업 맥락"},"context":context})
+}
+
+fn agent_request(session: &Value, operation: &str, args: Value) -> Value {
+    let mut body = request(session, &uuid::Uuid::new_v4().to_string());
+    body["operation"] = json!(operation);
+    body["arguments"] = args;
+    body
+}
+
+#[tokio::test]
+async fn register_confirms_existing_agent_and_list_preserves_long_ids_without_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = Central::start(&dir.path().join("config.json")).await;
+    let broker = Broker::start(
+        &dir.path().join("config.json"),
+        &remote,
+        Duration::from_secs(1),
+    )
+    .await;
+    let session = broker.claim("host", false).await;
+    let body = agent_request(
+        &session,
+        "register_agent",
+        json!({"name":"Existing Agent","toolType":"codex","role":"Developer"}),
+    );
+    for _ in 0..2 {
+        let (status, result) = broker.post("/v1/agents/register", &body).await;
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["data"]["agentId"], "12");
+        assert_eq!(result["data"]["ownerUserId"], "3");
+        assert!(result["data"].get("unexpectedCredential").is_none());
+    }
+    let list = agent_request(&session, "list_agents", json!({}));
+    assert_eq!(
+        broker.post("/v1/agents/list", &list).await.1["error"]["code"],
+        "AGENT_UNREGISTERED"
+    );
+    let (_, bound) = broker
+        .post(
+            &format!(
+                "/v1/sessions/{}/bind",
+                session["sessionId"].as_str().unwrap()
+            ),
+            &json!({"requestId":"bind","instanceId":"host","agentId":"12"}),
+        )
+        .await;
+    let list = agent_request(&bound["data"], "list_agents", json!({}));
+    let (status, result) = broker.post("/v1/agents/list", &list).await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(
+        result["data"]["agents"][1]["agentId"],
+        "9223372036854775807"
+    );
+    assert_eq!(result["data"]["agents"][0]["toolType"], "CODEX");
+    assert!(remote.state.calls.lock().await.is_empty());
+    assert!(!TaskRequests::path(&dir.path().join("config.json")).exists());
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn agent_providers_reject_spoofing_metadata_mismatch_and_central_denials() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_millis(100)).await;
+    let session = broker.claim("host", true).await;
+    let before = remote.state.agent_calls.load(Ordering::SeqCst);
+    for field in ["userId", "teamId", "agentId"] {
+        let mut body = agent_request(&session, "register_agent", json!({}));
+        body["context"][field] = json!("999");
+        assert_eq!(broker.post("/v1/agents/register", &body).await.0, 403);
+    }
+    assert_eq!(before, remote.state.agent_calls.load(Ordering::SeqCst));
+    for args in [
+        json!({"name":"new name"}),
+        json!({"role":"new role"}),
+        json!({"toolType":"claude_code"}),
+        json!({"teamId":"999"}),
+    ] {
+        assert_eq!(
+            broker
+                .post(
+                    "/v1/agents/register",
+                    &agent_request(&session, "register_agent", args)
+                )
+                .await
+                .0,
+            400
+        );
+    }
+    for (mode, code) in [
+        (1, "CENTRAL_TIMEOUT"),
+        (2, "CENTRAL_UNAUTHENTICATED"),
+        (3, "FORBIDDEN"),
+        (4, "FORBIDDEN"),
+        (5, "FORBIDDEN"),
+        (6, "CENTRAL_PROTOCOL_ERROR"),
+    ] {
+        remote.state.agent_mode.store(mode, Ordering::SeqCst);
+        let (status, result) = broker
+            .post(
+                "/v1/agents/register",
+                &agent_request(&session, "register_agent", json!({})),
+            )
+            .await;
+        assert_ne!(status, 401);
+        assert_eq!(result["error"]["code"], code, "{mode}: {result}");
+    }
+    for mode in [7, 8] {
+        remote.state.agent_mode.store(mode, Ordering::SeqCst);
+        let (_, result) = broker
+            .post(
+                "/v1/agents/list",
+                &agent_request(&session, "list_agents", json!({})),
+            )
+            .await;
+        assert_eq!(result["error"]["code"], "CENTRAL_PROTOCOL_ERROR");
+    }
+    assert_eq!(remote.trapped.load(Ordering::SeqCst), 0);
+    assert!(remote.state.calls.lock().await.is_empty());
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn canonical_prompt_is_opaque_actor_fields_are_forbidden_and_conflicts_keep_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_secs(1)).await;
+    let session = broker.claim("host", true).await;
+    let prompt = "  Exact prompt\n한글\n\"quoted\"  ";
+    let mut body = request(&session, "canonical");
+    body["arguments"] = json!({"receiverAgentId":"9223372036854775807","prompt":prompt});
+    let (status, result) = broker.post("/v1/tasks/create", &body).await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["data"]["receiverAgentId"], "9223372036854775807");
+    assert_eq!(remote.state.calls.lock().await[0]["prompt"], prompt);
+    body["arguments"]["prompt"] = json!("changed");
+    let (status, conflict) = broker.post("/v1/tasks/create", &body).await;
+    assert_eq!(status, 409);
+    assert_eq!(conflict["requestKey"], result["requestKey"]);
+    for id in ["0", "01", "+1", " 1", "9223372036854775808"] {
+        body["arguments"]["receiverAgentId"] = json!(id);
+        assert_eq!(broker.post("/v1/tasks/create", &body).await.0, 400);
+    }
+    body["arguments"] = json!({"receiverAgentId":"13","prompt":"prompt","requesterAgentId":"999"});
+    assert_eq!(broker.post("/v1/tasks/create", &body).await.0, 400);
+    assert_eq!(remote.state.calls.lock().await.len(), 1);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn concurrent_different_payloads_preserve_the_winning_request_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_secs(1)).await;
+    let session = broker.claim("host", true).await;
+    for index in 0..4 {
+        let first = request(&session, &format!("same-id-{index}"));
+        let mut second = first.clone();
+        second["arguments"]["description"] = json!("different concurrent input");
+        let (left, right) = tokio::join!(
+            broker.post("/v1/tasks/create", &first),
+            broker.post("/v1/tasks/create", &second),
+        );
+        let (success, conflict) = if left.0 == 200 {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        assert_eq!(success.0, 200, "{:?}", success.1);
+        assert_eq!(conflict.0, 409, "{:?}", conflict.1);
+        assert_eq!(conflict.1["error"]["code"], "REQUEST_KEY_CONFLICT");
+        assert!(success.1["requestKey"].is_string());
+        assert_eq!(conflict.1["requestKey"], success.1["requestKey"]);
+    }
+    assert_eq!(remote.state.calls.lock().await.len(), 4);
+    assert_eq!(remote.state.saved.lock().await.len(), 4);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn registration_rejects_invalid_tool_before_central_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_secs(1)).await;
+    let session = broker.claim("host", false).await;
+    for tool in ["invalid", "CODEX", "", "claude-code"] {
+        let (_, response) = broker
+            .post(
+                "/v1/agents/register",
+                &agent_request(&session, "register_agent", json!({"toolType":tool})),
+            )
+            .await;
+        assert_eq!(response["error"]["code"], "VALIDATION_FAILED");
+    }
+    assert_eq!(remote.state.agent_calls.load(Ordering::SeqCst), 0);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn unbound_registration_prioritizes_ready_identity_over_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_secs(1)).await;
+    let session = broker.claim("host", false).await;
+    remote.state.agent_mode.store(9, Ordering::SeqCst);
+    let (status, result) = broker
+        .post(
+            "/v1/agents/register",
+            &agent_request(
+                &session,
+                "register_agent",
+                json!({"name":"Existing Agent","toolType":"codex"}),
+            ),
+        )
+        .await;
+    assert_eq!(status, 403, "{result}");
+    assert_eq!(result["error"]["code"], "FORBIDDEN");
+    assert_eq!(
+        broker.central.presence().await,
+        Some(devlink_broker::protocol::PresenceStatus::Offline)
+    );
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn concurrent_insert_conflict_is_unknown_and_never_requeried_or_rekeyed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_millis(100)).await;
+    let session = broker.claim("host", true).await;
+    for (mode, code) in [
+        (13, "CENTRAL_RESULT_UNKNOWN"),
+        (14, "CENTRAL_PROTOCOL_ERROR"),
+        (15, "CENTRAL_TIMEOUT"),
+        (16, "REQUEST_KEY_CONFLICT"),
+    ] {
+        remote.state.mode.store(mode, Ordering::SeqCst);
+        let body = request(&session, &format!("collision-{mode}"));
+        let (_, result) = broker.post("/v1/tasks/create", &body).await;
+        assert_eq!(result["error"]["code"], code, "{result}");
+        assert_eq!(result["error"]["outcome"], "unknown");
+        assert!(result["requestKey"].is_string());
+        let calls = remote.state.calls.lock().await;
+        assert_eq!(calls.len(), usize::from(mode - 12));
+        assert_eq!(calls.last().unwrap()["requestKey"], result["requestKey"]);
+    }
+    // The redirect trap would catch any unsupported recovery fetch.
+    assert_eq!(remote.trapped.load(Ordering::SeqCst), 0);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn pending_agent_confirmation_cannot_revive_a_released_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_secs(1)).await;
+    let session = broker.claim("host", false).await;
+    remote.state.agent_mode.store(1, Ordering::SeqCst);
+    let body = agent_request(
+        &session,
+        "register_agent",
+        json!({"name":"metadata mismatch","toolType":"codex"}),
+    );
+    let confirm = broker.post("/v1/agents/register", &body);
+    let release = async {
+        timeout(Duration::from_secs(2), async {
+            while remote.state.agent_calls.load(Ordering::SeqCst) == 0 {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        broker
+            .client
+            .delete(format!(
+                "{}/v1/sessions/{}",
+                broker.url,
+                session["sessionId"].as_str().unwrap()
+            ))
+            .bearer_auth(LOCAL)
+            .json(&json!({"requestId":"release","instanceId":"host"}))
+            .send()
+            .await
+            .unwrap();
+    };
+    let ((status, result), _) = tokio::join!(confirm, release);
+    assert_eq!(status, 409);
+    assert_eq!(result["error"]["code"], "SESSION_EXPIRED");
+    assert_eq!(
+        broker.central.presence().await,
+        Some(devlink_broker::protocol::PresenceStatus::Offline)
+    );
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn pending_registration_prioritizes_replacement_over_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let remote = Central::start(&path).await;
+    let broker = Broker::start(&path, &remote, Duration::from_secs(1)).await;
+    let session = broker.claim("host", true).await;
+    remote.state.agent_mode.store(1, Ordering::SeqCst);
+    let body = agent_request(
+        &session,
+        "register_agent",
+        json!({"name":"metadata mismatch","toolType":"codex"}),
+    );
+    let confirm = broker.post("/v1/agents/register", &body);
+    let replace = async {
+        timeout(Duration::from_secs(2), async {
+            while remote.state.agent_calls.load(Ordering::SeqCst) == 0 {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        broker.claim("replacement", true).await;
+    };
+    let ((status, result), _) = tokio::join!(confirm, replace);
+    assert_eq!(status, 409, "{result}");
+    assert_eq!(result["error"]["code"], "SESSION_REPLACED");
+    assert_eq!(
+        broker.central.presence().await,
+        Some(devlink_broker::protocol::PresenceStatus::Online)
+    );
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -358,7 +766,7 @@ async fn authenticated_creation_maps_actor_payload_ids_and_delivery_without_wait
     assert_eq!(result["data"]["delivery"]["status"], "ACK_PENDING");
     assert_eq!(result["requestKey"], result["data"]["requestKey"]);
     let sent = remote.state.calls.lock().await[0].clone();
-    assert_eq!(sent["requesterAgentId"], 12);
+    assert!(sent.get("requesterAgentId").is_none());
     assert_eq!(sent["receiverAgentId"], 13);
     assert_ne!(sent["requestKey"], "create-1");
     let prompt: Value = serde_json::from_str(sent["prompt"].as_str().unwrap()).unwrap();
@@ -685,7 +1093,7 @@ async fn actual_mcp_tools_use_rust_sessions_and_mock_central() {
         let calls = remote.state.calls.lock().await;
         assert_eq!(calls.len() - before, expected_calls, "{scenario}");
         for sent in &calls[before..] {
-            assert_eq!(sent["requesterAgentId"], 12);
+            assert!(sent.get("requesterAgentId").is_none());
             assert_eq!(sent["receiverAgentId"], 13);
             let prompt: Value = serde_json::from_str(sent["prompt"].as_str().unwrap()).unwrap();
             assert_eq!(prompt["title"], "MCP integration");

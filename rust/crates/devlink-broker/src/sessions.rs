@@ -491,7 +491,12 @@ impl Registry {
         Ok(())
     }
 
-    fn authorize(&self, id: &Identifier, expected: &Principal) -> Result<Principal, SessionError> {
+    fn authorize_context(
+        &self,
+        id: &Identifier,
+        expected: &Principal,
+        allow_unbound: bool,
+    ) -> Result<Principal, SessionError> {
         if self.closed {
             return Err(SessionError::Expired);
         }
@@ -499,7 +504,7 @@ impl Registry {
         if entry.replaced {
             return Err(SessionError::Replaced);
         }
-        if entry.view.principal.agent_id.is_none() {
+        if entry.view.principal.agent_id.is_none() && !allow_unbound {
             return Err(SessionError::AgentUnregistered);
         }
         if &entry.view.principal != expected {
@@ -657,13 +662,48 @@ impl SessionManager {
         id: &Identifier,
         expected: &Principal,
     ) -> Result<Principal, SessionError> {
+        self.authorize_context(id, expected, false).await
+    }
+
+    /// Only register_agent may confirm the current bootstrap Agent before bind.
+    pub async fn authorize_registration(
+        &self,
+        id: &Identifier,
+        expected: &Principal,
+    ) -> Result<Principal, SessionError> {
+        self.authorize_context(id, expected, true).await
+    }
+
+    pub async fn verify_registration_agent(
+        &self,
+        id: &Identifier,
+        expected: &Principal,
+        agent: &Identifier,
+    ) -> Result<(), SessionError> {
+        self.authorize_registration(id, expected).await?;
+        let actual = self.resolve(Some(agent)).await?;
+        if !actual.same_user_team(expected) {
+            return Err(SessionError::Identity(IdentityError::Forbidden));
+        }
+        self.authorize_registration(id, expected).await?;
+        Ok(())
+    }
+
+    async fn authorize_context(
+        &self,
+        id: &Identifier,
+        expected: &Principal,
+        allow_unbound: bool,
+    ) -> Result<Principal, SessionError> {
         // Validate local ownership and caller context before resolving a legacy
         // reconnect. Unrelated/stale requests must not trigger central IO.
         {
             let mut registry = self.registry.lock().await;
             self.with_context(&mut registry, |registry, _| {
                 registry.expire(Instant::now());
-                registry.authorize(id, expected).map(|_| ())
+                registry
+                    .authorize_context(id, expected, allow_unbound)
+                    .map(|_| ())
             })
             .await?;
         }
@@ -686,7 +726,7 @@ impl SessionManager {
             // Recheck after the await: release, replacement, expiry or a central
             // subject change may have happened while resolving identity.
             registry.expire(Instant::now());
-            let principal = registry.authorize(id, expected)?;
+            let principal = registry.authorize_context(id, expected, allow_unbound)?;
             check_current_principal(&principal, current)?;
             Ok(principal)
         })

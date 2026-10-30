@@ -125,6 +125,12 @@ pub async fn run(path: &Path) -> Result<()> {
             sessions.clone(),
         ))
         // 작업 생성 API 라우터 병합 (/v1/tasks/create)
+        .merge(crate::agent_api::router(
+            mcp_token.clone(),
+            sessions.clone(),
+            task_client.clone(),
+            cancel.clone(),
+        ))
         .merge(crate::task_api::router(
             mcp_token,
             sessions,
