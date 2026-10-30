@@ -1,5 +1,9 @@
 # 로컬 검증 기록
 
+## 2026-10-30: 중앙 02de434 확장 READY·실제 세션 재검증
+
+클라이언트 `d4c3754`와 중앙 `02de43468e9dd208a4a3cbc9bf142858e315e156`의 격리 빌드로 검증했다. 실제 Bearer WebSocket READY의 `connection_id/agent_id/user_id/team_id`와 발급 토큰 신원 일치를 확인했고, 실제 CLI·MCP SDK·PostgreSQL 17.11의 세션 4경로·소유권·재시작 복구·생산 lease 90초 만료·SQL ONLINE/OFFLINE/last_seen_at·토큰 교체 거부가 통과했다. READY 관련 회귀 8개도 같은 작업 세션에서 통과했다. 임시 서버·DB를 종료하고 최종 OFFLINE 및 임시 실행 환경 제거를 확인했다. 기능 소스 수정은 없으며 기록만 갱신했다. 실제 Host·업무 목록 성공·전체 MVP·운영 마이그레이션 검증과는 구분한다. [세부 증거와 실행 범위](session-story-verification.md)의 2026-10-30 절을 따른다.
+
 ## 2026-10-29: Gemini 지적 4건 후속 보완
 
 기준 e69f363의 Gemini 리뷰를 재현해 동시 context 보완/거부 처리, legacy 재접속 즉시 업무 인가, heartbeat 로컬 오류 우선, AuthFailed 후 WS 수신·ACK 차단을 수정했다. 추가로 잠금 대기 중 90초 만료 경계를 넘는 heartbeat의 부활을 막았다. 최종 Rust 전체 129개, SDK 명시 2개, MCP 100개, 별도 DELETE wire 1개와 포맷·Clippy·diff 검사가 통과했다. 실제 중앙·DB 재실행과 수정본에 대한 Gemini/Opus 재승인은 하지 않았다. 변경은 rust/에만 있으며 커밋하지 않았다. [후속 수정 상세](session-story-verification.md)의 마지막 절을 따른다.

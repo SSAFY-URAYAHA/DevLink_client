@@ -1,5 +1,7 @@
 # READY 신원과 로컬 세션
 
+2026-10-30 실제 연동 확인: 중앙 `02de43468e9dd208a4a3cbc9bf142858e315e156`은 `connection_id/agent_id/user_id/team_id`를 모두 포함한 READY를 전송한다. 실제 WebSocket에서 필드·타입·토큰 신원 일치를 검사했고, 현재 Rust CLI·MCP SDK·격리 PostgreSQL 17.11로 세션·소유권·90초 lease·DB presence·재시작 복구·토큰 교체 거부가 통과했다. READY 확장에 따른 Rust 기능 수정은 필요하지 않았다. 기존 실시간 context 조회와 READY 신원 대조도 유지한다. 아래의 중앙 READY 신원 누락 설명은 이전 커밋에 관한 기록이며 현재 서버의 차단 사유가 아니다. [상세 검증 결과](session-story-verification.md)의 2026-10-30 절을 따른다.
+
 2026-10-29 후속 구현: 기본 CLI는 기존 `GET /api/v1/agent/context`를 같은 중앙 Agent Bearer로 조회해 검증된 신원을 공급한다. 아래의 READY 필드 누락에 따른 차단 설명은 이전 기록이다. 중앙 `30b7d70`의 READY 자체는 변경하지 않는다. 실제 중앙/DB 검증 결과는 [세션 검증 기록](session-story-verification.md)의 최신 항목을 따른다.
 
 ## 현재 운영 경로: READY + 실시간 context 조회

@@ -1,6 +1,6 @@
 # 로컬 세션 provider 스토리 — 구현 및 증거 경계
 
-최신 상태(2026-10-29): 기존 `/api/v1/agent/context` 공급부를 연결했고 실제 중앙 `30b7d70`·PostgreSQL·CLI·SDK 세션 검증이 통과했다. 아래의 중앙 신원 공급 blocked 및 실제 DB 미검증 설명은 이전 작업 시점 기록이다. 최신 결과는 문서 마지막의 실연동 절이 우선한다. -91 bootstrap 자동화·실제 Host·최종 A→B/B→A·Opus 검토·커밋은 별도 미완료다.
+최신 상태(2026-10-30): 중앙 `02de434`의 확장 READY와 현재 클라이언트 `d4c3754`로 실제 WebSocket 신원·CLI/SDK 세션·PostgreSQL presence·생산 lease 90초 만료 검증이 통과했다. 기존 `/api/v1/agent/context` 공급부도 유지한다. 아래의 blocked·미검증·미커밋 표현은 각 실행 시점의 기록이며 문서 마지막의 2026-10-30 결과가 우선한다. 이번 검증은 실제 Codex/Claude Host·전체 업무 왕복·-91 bootstrap 자동화의 재검증이나 지정 검토를 포함하지 않는다.
 
 2026-10-29. ADD05 / mvp-gap-20261029의 진행 가능한 로컬 범위를 기존 구현 위에 보완한다. 작업 목록·완료·결과 API, MCP 복구 알고리즘, 중앙 도메인과 Agent 생성은 추가하지 않는다.
 
@@ -208,3 +208,44 @@ node --test rust/crates/devlink-broker/tests/support/session-delete-wire.test.mj
 종료 직전 SQL에서 `status=OFFLINE`, `last_seen_at IS NOT NULL=true`를 다시 읽었다. 이번에 시작한 중앙 PID와 jar 경로를 대조해 종료하고 전용 data 경로의 pg_ctl로 DB를 정상 종료했다. 검증한 임시 경로 안의 DB·자격·PostgreSQL 바이너리/zip을 제거했으며 기존 프로세스는 건드리지 않았다. 정리 결과는 ignored `rust/target/session-central/final-cleanup-result.json`에 저장했다. 최초 환경 시작은 자동 승인 검토의 사용량 제한으로 실행되지 않았고 사용자 재시도 요청 뒤 정상 실행했다. 이를 기능 테스트 실패로 합산하지 않는다.
 
 이번 최종 연동 확인에서 기능 소스 수정이나 커밋은 하지 않았고 이 문서에 검증 결과만 추가했다.
+
+## 2026-10-30 중앙 02de434 확장 READY 실연동 재검증
+
+기준은 클라이언트 `d4c3754`, 중앙 `02de43468e9dd208a4a3cbc9bf142858e315e156`이다. 중앙 원본 develop의 작업 트리가 깨끗한 것을 확인한 뒤 해당 커밋을 `git archive`로 추출하여 `rust/target/ready-02de434/server`에서 Java 21·기존 Gradle 캐시로 격리 빌드했다. 서버 jar SHA-256은 `C9AFB406931BD624231C29D02350616F12C97C4BD21D7DD9AA76A591A6E5DA2D`이다. 현재 Rust CLI와 MCP 소스도 다시 빌드했다.
+
+전용 PostgreSQL 17.11 클러스터·역할·DB와 무작위 loopback 포트를 사용했다. 기존 서버·DB는 변경하지 않았다. 합성 사용자를 실제 세션·CSRF API로 가입/로그인시켜 팀·Agent·연결 토큰을 발급했다. 이 테스트 서버에서만 Hibernate `ddl-auto=update`, Flyway 비활성화를 사용했으므로 운영 스키마 마이그레이션 검증은 포함하지 않는다.
+
+기존 `rust/scripts/verify-sessions.mjs`의 검사 흐름을 보존한 실행용 사본에 READY wire probe를 추가했다. probe는 Java 표준 WebSocket으로 같은 Agent 토큰을 사용해 브로커 기동 전에 실제 첫 메시지를 읽고 종료한다. 토큰은 자식 프로세스의 표준입력으로만 넘겼으며 파일·명령행·출력에 기록하지 않았다. 신원 ID가 포함된 READY 형식 자체는 다음과 같으며 ID 값은 예시다.
+
+```json
+{
+  "type": "BROKER_READY",
+  "payload": {
+    "connection_id": "central-session-id",
+    "agent_id": 12,
+    "user_id": 3,
+    "team_id": 1
+  }
+}
+```
+
+| 검사 | 결과 |
+| --- | --- |
+| 실제 READY wire | `type/payload` 및 payload 4개 필드 일치. connection_id는 비어 있지 않은 문자열, 나머지는 양의 숫자. 발급한 Agent·로그인 사용자·팀과 모두 일치 |
+| 세션 생성·bind | 실제 중앙 신원의 문자열 Principal 일치, 다른 Agent bind 거부, 정상 bind 성공 |
+| 소유권 | fresh 교체, 같은 instance recover 멱등, 늦은 recover 충돌, 이전 owner heartbeat/DELETE 거부, 현재 owner 갱신 성공 |
+| DB presence | bind 후 ONLINE·last_seen_at 기록, DELETE 및 실제 MCP SDK 종료 후 OFFLINE |
+| 브로커 재시작 | 이전 세션 heartbeat 만료, 첫 recover 성공, 뒤늦은 이전 owner recover 충돌 |
+| 생산 lease | 실제 91초 대기 후 DB OFFLINE·SESSION_EXPIRED, 명시 recover 후 ONLINE |
+| 실제 중앙 토큰 교체 | DB OFFLINE 및 기존 자격 heartbeat 거부 |
+| 빌드 | 중앙 bootJar·현재 Rust CLI·MCP TypeScript 빌드 모두 종료 0 |
+| READY 회귀 | `cargo test --offline --locked -p devlink-broker ready -- --test-threads=1`의 lib 6개·agent_context 1개·session_api 1개 통과 |
+| 실행 결과 | wire probe `actualReadyVerified=true`; 세션 검증 `passed/actualCentral/actualPostgres/actualSdkSession=true`, 종료 0 |
+
+READY 회귀 최초 제한 환경 실행에서는 loopback WebSocket accept가 시간 초과했다. 동일 코드를 제한 밖에서 재실행해 8개 모두 통과했다. PostgreSQL의 최초 한글 경로 초기화도 UTF-8 경로 오류로 실패하여 무작위 영문 임시 경로에서 다시 초기화했다. 이 준비 단계 실패를 서버/Rust 기능 결함이나 최종 통과 결과로 섞지 않는다.
+
+실제 MCP SDK 검증의 `list_agents`는 Rust 로컬 provider 미제공으로 예상한 `BROKER_PROTOCOL_ERROR`를 반환한다. adapter의 bound 상태와 DB presence로 세션 성공만 판정했다. 중앙에 Agent 목록 API가 존재한다는 사실과 Rust 목록 도구 연결 성공은 별개다. 실제 Codex/Claude Host, 중앙 프로세스 재시작, 두 브로커의 경쟁 연결 전체 시나리오, 업무 생성·수락·완료·결과 왕복, -52/-66 및 지정 Opus 검토는 이번 검사에 포함하지 않는다.
+
+최종 SQL은 `status=OFFLINE`, `last_seen_at IS NOT NULL=true`였다. 이번에 만든 서버의 PID·jar 경로를 대조해 종료하고 전용 클러스터를 정상 종료했다. 안전 경로를 검사한 뒤 임시 DB·PostgreSQL 바이너리·다운로드 zip을 제거했다. 원본 서버 저장소와 클라이언트 기능 소스는 수정하지 않았으며 커밋·Push하지 않았다.
+
+ignored 실행 증거는 `rust/target/ready-02de434/`에 남겼다: `verification.log`, `runtime.json`, `db-at-end.json`, `cleanup-result.json`, `server-build.log`, `ReadyProbe.java`, `prepare-verifier.mjs`, `verify-actual-ready.mjs`, `setup.ps1`, `run-verification.ps1`, `cleanup.ps1`. 이번 검증으로 현재 서버의 READY 신원 누락을 이유로 기존 세션 업무를 보류할 필요가 없음을 확인했다. -93/-94/-95의 업무 API 구현·수용 완료를 의미하지 않는다.
