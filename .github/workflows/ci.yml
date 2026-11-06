@@ -1,81 +1,88 @@
-name: CI
+name: Review 171 packaging
 
+# v* 태그를 push하면 OS별 번들을 만들고 GitHub Release를 생성한다.
+# workflow_dispatch는 브랜치에서 실행하면 artifact만 만들고, 태그를 골라 실행하면 Release까지 만든다.
 on:
   push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  rust:
-    name: Rust 브로커·CLI (${{ matrix.os }})
+  package:
+    name: 패키징 (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      # 인자 없이 실행하면 rust-toolchain.toml의 stable + rustfmt·clippy를 설치한다.
+      # 인자 없이 실행하면 rust-toolchain.toml의 stable을 설치한다. Windows에서는
+      # stable-x86_64-pc-windows-msvc가 되며 패키징 스크립트도 이 도구 체인을 쓴다.
       - name: Rust toolchain 설치
+        working-directory: rust
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: 형식 검사
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # 기존 로컬 검증과 같이 테스트를 직렬로 실행한다. 실패한 바이너리가 있어도
-      # 나머지를 모두 실행해 OS별 실패를 한 번에 드러낸다.
-      # setup은 설정 경로의 상위 심볼릭 링크를 거부하므로, macOS 기본 TMPDIR(/var → /private/var)
-      # 대신 링크가 없는 runner 임시 디렉터리를 쓴다.
-      - name: 테스트
-        if: runner.os != 'Windows'
-        env:
-          TMPDIR: ${{ runner.temp }}
-        run: cargo test --workspace --all-targets --locked --no-fail-fast -- --test-threads=1
-      # 관리자 runner의 새 파일 소유자를 현재 사용자로 보정해 일반 사용자 환경과 맞춘다.
-      - name: 테스트 (Windows, 소유자 보정)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ${{ github.workspace }}/.github/scripts/invoke-as-user-owner.ps1 cargo test --workspace --all-targets --locked --no-fail-fast '--' --test-threads=1
-
-  mcp-server:
-    name: MCP 서버 (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: packages/mcp-server
-    steps:
-      - uses: actions/checkout@v4
+          key: release
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: packages/mcp-server/package-lock.json
-      - name: 의존성 설치
-        run: npm ci
-      # 빌드, contracts/ 계약 대조, node --test 회귀를 함께 실행한다.
-      - name: 빌드·계약 대조·테스트
-        if: runner.os != 'Windows'
-        run: npm test
-      - name: 빌드·계약 대조·테스트 (Windows, 소유자 보정)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ${{ github.workspace }}/.github/scripts/invoke-as-user-owner.ps1 npm test
+      # 태그 실행이면 태그와 소스 버전(Cargo.toml·package.json)이 같은지 스크립트가 확인한다.
+      # 스크립트는 번들의 devlink --version과 MCP initialize 응답까지 확인한 뒤 압축한다.
+      - name: 번들 만들기
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          args=(--out-dir dist)
+          if [ "$REF_TYPE" = tag ]; then args+=(--expect-version "$REF_NAME"); fi
+          node .github/scripts/package-release.mjs "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devlink-${{ runner.os }}
+          path: |
+            dist/devlink-*.zip
+            dist/devlink-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: package
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: devlink-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS 만들기
+        run: node .github/scripts/package-release.mjs --checksums dist
+      # 태그에 '-'가 있으면(v0.2.0-rc.1 등) 사전 릴리스로 표시한다.
+      - name: Release 만들기
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$TAG" dist/devlink-* dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "DevLink $TAG" --generate-notes "${flags[@]}"
